@@ -67,3 +67,4 @@ describe("UndoStack (FR-SAFE-03)", () => {
     expect(inverses[2]).toEqual({ type: "scroll", handle: null, direction: "up", amount: 400 });
   });
 });
+

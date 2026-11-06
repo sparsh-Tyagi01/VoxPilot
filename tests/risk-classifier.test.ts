@@ -103,3 +103,4 @@ describe("RiskClassifier (FR-SAFE-01, FR-SAFE-02)", () => {
     expect(classifier.classify(plan)).toBe(RiskTier.R3);
   });
 });
+

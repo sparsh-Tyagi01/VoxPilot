@@ -43,3 +43,4 @@ describe("Macros (FR-MACRO-01 to 03)", () => {
     expect(nonMatch).toBeNull();
   });
 });
+

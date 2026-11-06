@@ -53,3 +53,4 @@ describe("PlanValidator (FR-SAFE-01)", () => {
     expect(() => validator.validate(invalidPlan)).toThrow(ValidationError);
   });
 });
+
