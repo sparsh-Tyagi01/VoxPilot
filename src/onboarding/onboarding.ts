@@ -64,6 +64,13 @@ btnRequestMic.addEventListener("click", async () => {
     micStatusText.textContent = "✓ Microphone permission granted!";
     micStatusText.style.color = "#10b981";
 
+    if (window.location.hash.includes("mic")) {
+      micStatusText.textContent = "✓ Microphone permission granted! Closing tab and returning to VoxPilot…";
+      await sleep(1000);
+      window.close();
+      return;
+    }
+
     // Brief delay so user can read the success message
     await sleep(800);
     goToStep(2);
@@ -226,12 +233,20 @@ for (let i = 1; i < NUM_STEPS; i++) {
   if (panel) panel.hidden = true;
 }
 
-// Check if already onboarded
-(async () => {
-  const { onboarding_complete } = await chrome.storage.local.get("onboarding_complete");
-  if (onboarding_complete) {
-    // Skip to done
-    goToStep(3);
-  }
-})();
+// Check if directed to mic permission request
+if (window.location.hash.includes("mic")) {
+  goToStep(1);
+  setTimeout(() => {
+    btnRequestMic.click();
+  }, 200);
+} else {
+  // Check if already onboarded
+  (async () => {
+    const { onboarding_complete } = await chrome.storage.local.get("onboarding_complete");
+    if (onboarding_complete) {
+      // Skip to done
+      goToStep(3);
+    }
+  })();
+}
 

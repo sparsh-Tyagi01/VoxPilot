@@ -45,6 +45,28 @@ const btnSettings  = document.getElementById("btn-settings") as HTMLButtonElemen
 const btnPrivacy   = document.getElementById("btn-privacy") as HTMLButtonElement;
 const btnHelp      = document.getElementById("btn-help") as HTMLButtonElement;
 
+// Permission banner references
+const permissionBanner = document.getElementById("permission-banner") as HTMLElement;
+const permissionBannerText = document.getElementById("permission-banner-text") as HTMLElement;
+const btnGrantPermission = document.getElementById("btn-grant-permission") as HTMLButtonElement;
+
+function showPermissionBanner(text?: string): void {
+  if (permissionBanner) {
+    if (text && permissionBannerText) permissionBannerText.textContent = text;
+    permissionBanner.style.display = "flex";
+  }
+}
+
+function hidePermissionBanner(): void {
+  if (permissionBanner) {
+    permissionBanner.style.display = "none";
+  }
+}
+
+btnGrantPermission?.addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/onboarding/onboarding.html#mic") });
+});
+
 // Audio meter references
 const audioMeterWrap = document.getElementById("audio-meter-wrap") as HTMLElement;
 const audioMeterText = document.getElementById("audio-meter-text") as HTMLElement;
@@ -270,23 +292,114 @@ let currentListeningState = false;
 let webSpeechRecognition: any = null;
 let isWebSpeechRunning = false;
 
+// Direct in-panel Web Audio Analyser (60 FPS real-time reactivity)
+let panelAudioContext: AudioContext | null = null;
+let panelMediaStream: MediaStream | null = null;
+let panelAnalyser: AnalyserNode | null = null;
+let panelAnimFrameId: number | null = null;
+
 function updateAudioMeter(level: number, isSpeech: boolean): void {
   if (!audioMeterWrap || audioMeterWrap.style.display === "none") return;
 
-  const active = isSpeech || level > 0.012;
+  const active = isSpeech || level > 0.04;
   audioMeterStatus?.classList.toggle("speech", active);
   audioBars?.classList.toggle("speech", active);
   if (audioMeterText) {
     audioMeterText.textContent = active ? "Hearing speech..." : "Listening (mic active)";
   }
 
-  // Dynamic bar visualization
-  const scaled = Math.min(1, Math.max(0, level * 16));
+  // Dynamic bar visualization: responsive waveform
+  const scaled = Math.min(1, Math.max(0, level));
   barSpans.forEach((bar, idx) => {
-    const multiplier = [0.6, 1.0, 1.5, 1.9, 1.4, 0.9, 0.5][idx] ?? 1.0;
-    const h = Math.max(3, Math.min(18, Math.round(scaled * 18 * multiplier)));
+    const multipliers = [0.6, 1.1, 1.6, 2.2, 1.7, 1.0, 0.6];
+    const mult = multipliers[idx] ?? 1.0;
+    const h = Math.max(3, Math.min(18, Math.round(3 + scaled * 15 * mult)));
     bar.style.height = `${h}px`;
   });
+}
+
+/**
+ * Start direct microphone capture inside the panel to drive the 60 FPS VU meter.
+ */
+async function startPanelAudioCapture(): Promise<boolean> {
+  stopPanelAudioCapture();
+
+  try {
+    panelMediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+    hidePermissionBanner();
+  } catch (err: unknown) {
+    console.warn("[Panel] Microphone access not permitted:", err);
+    showPermissionBanner("Microphone access is required. Click below to allow in a tab.");
+    return false;
+  }
+
+  try {
+    panelAudioContext = new AudioContext();
+    if (panelAudioContext.state === "suspended") {
+      await panelAudioContext.resume();
+    }
+
+    const source = panelAudioContext.createMediaStreamSource(panelMediaStream);
+    panelAnalyser = panelAudioContext.createAnalyser();
+    panelAnalyser.fftSize = 64;
+    panelAnalyser.smoothingTimeConstant = 0.3;
+    source.connect(panelAnalyser);
+
+    const freqData = new Uint8Array(panelAnalyser.frequencyBinCount);
+
+    function tick() {
+      if (!panelAnalyser) return;
+      panelAnalyser.getByteFrequencyData(freqData);
+
+      // Compute energy across frequency bins
+      let sum = 0;
+      for (let i = 0; i < freqData.length; i++) {
+        sum += freqData[i] ?? 0;
+      }
+      const avg = sum / freqData.length; // 0..255
+      const level = Math.min(1, avg / 60); // highly responsive to human voice
+
+      updateAudioMeter(level, level > 0.05);
+
+      panelAnimFrameId = requestAnimationFrame(tick);
+    }
+
+    tick();
+    return true;
+  } catch (err: unknown) {
+    console.error("[Panel] Error setting up panel AudioContext:", err);
+    return false;
+  }
+}
+
+/**
+ * Stop direct microphone capture and audio analyser.
+ */
+function stopPanelAudioCapture(): void {
+  if (panelAnimFrameId !== null) {
+    cancelAnimationFrame(panelAnimFrameId);
+    panelAnimFrameId = null;
+  }
+  if (panelMediaStream) {
+    panelMediaStream.getTracks().forEach((track) => track.stop());
+    panelMediaStream = null;
+  }
+  if (panelAudioContext) {
+    panelAudioContext.close().catch(() => {});
+    panelAudioContext = null;
+  }
+  panelAnalyser = null;
+  barSpans.forEach((bar) => { bar.style.height = "4px"; });
+  if (audioBars) audioBars.classList.remove("speech");
+  if (audioMeterStatus) audioMeterStatus.classList.remove("speech");
 }
 
 function startWebSpeech(): void {
@@ -320,7 +433,7 @@ function startWebSpeech(): void {
       if (spoken) {
         transcriptBox.textContent = spoken;
         transcriptBox.classList.remove("empty");
-        updateAudioMeter(0.2, true);
+        updateAudioMeter(0.3, true);
       }
 
       if (final.trim()) {
@@ -335,6 +448,9 @@ function startWebSpeech(): void {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     webSpeechRecognition.onerror = (event: any) => {
       console.warn("[Panel WebSpeech] Notice:", event.error);
+      if (event.error === "not-allowed") {
+        showPermissionBanner("Microphone access is blocked. Click below to allow.");
+      }
     };
 
     webSpeechRecognition.onend = () => {
@@ -381,10 +497,11 @@ function updateToggleBtn(listening: boolean): void {
   }
 
   if (listening) {
+    void startPanelAudioCapture();
     startWebSpeech();
   } else {
+    stopPanelAudioCapture();
     stopWebSpeech();
-    barSpans.forEach((bar) => { bar.style.height = "4px"; });
   }
 }
 
@@ -580,13 +697,25 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
 // ─── Button Handlers ──────────────────────────────────────────────────────────
 
 toggleBtn.addEventListener("click", async () => {
-  // Chrome MV3 requirement: request microphone permission from a visible page first
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((track) => track.stop());
-  } catch (err: unknown) {
-    console.warn("[Panel] Microphone permission prompt was denied or dismissed:", err);
+  if (currentListeningState) {
+    // If currently listening, toggle off
+    stopPanelAudioCapture();
+    chrome.runtime.sendMessage({ type: "TOGGLE_LISTENING" }).catch(console.error);
+    return;
   }
+
+  // Before toggling on: verify microphone permission
+  try {
+    const testStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    testStream.getTracks().forEach((track) => track.stop());
+    hidePermissionBanner();
+  } catch (err: unknown) {
+    console.warn("[Panel] Microphone permission needed:", err);
+    showPermissionBanner("Microphone access is required. Please click below to allow in a tab.");
+    chrome.tabs.create({ url: chrome.runtime.getURL("src/onboarding/onboarding.html#mic") });
+    return;
+  }
+
   chrome.runtime.sendMessage({ type: "TOGGLE_LISTENING" }).catch(console.error);
 });
 
@@ -667,6 +796,22 @@ async function init(): Promise<void> {
   }
 
   await loadAuditLog();
+
+  // Check microphone permission state on startup
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: "microphone" as PermissionName }).then((res) => {
+      if (res.state === "denied") {
+        showPermissionBanner("Microphone access is blocked in settings. Click below to grant access.");
+      } else if (res.state === "prompt") {
+        showPermissionBanner("Microphone access is required. Click below to allow.");
+      } else {
+        hidePermissionBanner();
+      }
+      res.onchange = () => {
+        if (res.state === "granted") hidePermissionBanner();
+      };
+    }).catch(() => {});
+  }
 }
 
 init().catch(console.error);

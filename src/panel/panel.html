@@ -308,6 +308,41 @@
       background: var(--success);
     }
 
+    /* ─── Permission Alert Banner ─── */
+    .permission-banner {
+      margin: 10px 16px 4px;
+      padding: 10px 12px;
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid var(--danger);
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .permission-banner-text {
+      font-size: 12px;
+      color: #fca5a5;
+      line-height: 1.4;
+    }
+
+    .btn-permission {
+      background: var(--danger);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      transition: opacity 0.15s;
+    }
+
+    .btn-permission:hover {
+      opacity: 0.9;
+    }
+
     /* ─── Hidden state ─── */
     [hidden] { display: none !important; }
   </style>
@@ -322,6 +357,12 @@
       <span id="status-text">Idle</span>
     </div>
   </header>
+
+  <!-- Microphone Permission Alert Banner -->
+  <div class="permission-banner" id="permission-banner" style="display: none;">
+    <div class="permission-banner-text" id="permission-banner-text">🎙️ Microphone access is required to use VoxPilot.</div>
+    <button class="btn-permission" id="btn-grant-permission" type="button">Allow Microphone</button>
+  </div>
 
   <!-- Main Toggle -->
   <button class="toggle-btn" id="toggle-btn" type="button" aria-pressed="false">
