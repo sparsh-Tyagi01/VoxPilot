@@ -373,6 +373,38 @@ export interface AuditLogResponseMsg extends BaseMessage {
   entries: AuditEntry[];
 }
 
+// ─── Settings / Model Management ─────────────────────────────────────────────
+
+/** Settings page notifies SW that the model profile changed. */
+export interface ProfileChangedMsg extends BaseMessage {
+  type: "PROFILE_CHANGED";
+  profile: string;
+}
+
+/** Onboarding requests SW to start model download with a given profile. */
+export interface StartModelDownloadMsg extends BaseMessage {
+  type: "START_MODEL_DOWNLOAD";
+  profile: string;
+}
+
+// ─── Tab / Navigation ────────────────────────────────────────────────────────
+
+/** Content script requests a tab operation (requires chrome.tabs API, only in SW). */
+export interface TabOperationMsg extends BaseMessage {
+  type: "TAB_OPERATION";
+  operation: "open" | "close" | "switch";
+  url?: string;
+  index?: number;
+}
+
+// ─── TTS ─────────────────────────────────────────────────────────────────────
+
+/** Content script requests TTS (from a "read" action summary or "ask" response). */
+export interface SpeakMsg extends BaseMessage {
+  type: "SPEAK";
+  text: string;
+}
+
 // ─── Discriminated Union ──────────────────────────────────────────────────────
 
 /** All possible VoxPilot inter-component messages. */
@@ -433,7 +465,14 @@ export type VoxPilotMessage =
   | VaultFillResponseMsg
   | VaultPassphraseRequestMsg
   | VaultPassphraseResponseMsg
-  | VaultUnlockFailedMsg;
+  | VaultUnlockFailedMsg
+  /* Settings / Model management */
+  | ProfileChangedMsg
+  | StartModelDownloadMsg
+  /* Tab / Navigation */
+  | TabOperationMsg
+  /* TTS */
+  | SpeakMsg;
 
 /** Utility: extract a message type by its `type` discriminant. */
 export type MessageByType<T extends VoxPilotMessage["type"]> = Extract<

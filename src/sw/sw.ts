@@ -92,6 +92,20 @@ function broadcastToPanel(msg: VoxPilotMessage): void {
   });
 }
 
+/**
+ * Send a message to the offscreen document.
+ * The offscreen doc receives all chrome.runtime messages (it has no other comms path).
+ */
+async function relayToOffscreen(msg: VoxPilotMessage): Promise<void> {
+  // Ensure offscreen is active before sending
+  await ensureOffscreenDocument();
+  // Offscreen receives via chrome.runtime.onMessage — no targetId needed
+  await chrome.runtime.sendMessage(msg).catch(() => {
+    // Offscreen may have restarted — not fatal for best-effort relay
+    console.warn("[SW] Could not relay to offscreen:", (msg as { type: string }).type);
+  });
+}
+
 // ─── Offscreen Document Lifecycle ─────────────────────────────────────────────
 
 const OFFSCREEN_URL = "src/offscreen/offscreen.html";
@@ -623,6 +637,79 @@ async function handleMessage(
     case "VAULT_PASSPHRASE_RESPONSE": {
       // This is handled inside the VAULT_FILL_REQUEST listener above via onMessage.
       // If it arrives outside that context, acknowledge and discard.
+      sendResponse({ ok: true });
+      break;
+    }
+
+    // ─── Settings / Model Management ─────────────────────────────────────────
+
+    case "PROFILE_CHANGED": {
+      // User changed model profile in settings — persist and notify offscreen.
+      await chrome.storage.local.set({ selected_profile: msg.profile });
+      // Forward to offscreen so LLM/STT workers can reload on next request.
+      await relayToOffscreen({ type: "PROFILE_CHANGED", profile: msg.profile });
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "START_MODEL_DOWNLOAD": {
+      // Onboarding requested model download — relay to offscreen to begin.
+      await relayToOffscreen({ type: "START_MODEL_DOWNLOAD", profile: msg.profile });
+      sendResponse({ ok: true });
+      break;
+    }
+
+    // ─── Tab / Navigation Operations ─────────────────────────────────────────
+
+    case "TAB_OPERATION": {
+      // Content script relays tab operations here because it lacks chrome.tabs access.
+      try {
+        switch (msg.operation) {
+          case "open": {
+            const url = msg.url ?? "about:newtab";
+            const newTab = await chrome.tabs.create({ url, index: msg.index });
+            sendResponse({ ok: true, tabId: newTab.id });
+            break;
+          }
+          case "close": {
+            const tabState = await getSessionState();
+            if (tabState.activeTabId !== null) {
+              await chrome.tabs.remove(tabState.activeTabId);
+            }
+            sendResponse({ ok: true });
+            break;
+          }
+          case "switch": {
+            if (msg.index !== undefined) {
+              const tabs = await chrome.tabs.query({ currentWindow: true });
+              const target = tabs[msg.index];
+              if (target?.id) {
+                await chrome.tabs.update(target.id, { active: true });
+                sendResponse({ ok: true });
+              } else {
+                sendResponse({ ok: false, error: `No tab at index ${msg.index}` });
+              }
+            } else {
+              sendResponse({ ok: false, error: "TAB_OPERATION switch requires an index" });
+            }
+            break;
+          }
+          default: {
+            sendResponse({ ok: false, error: `Unknown tab operation: ${String(msg.operation)}` });
+          }
+        }
+      } catch (err: unknown) {
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      break;
+    }
+
+    // ─── TTS / Speech ─────────────────────────────────────────────────────────
+
+    case "SPEAK": {
+      // Content script requests TTS (from a "read" action summary or "ask" response).
+      // Forward to offscreen where the TTS engine runs.
+      await relayToOffscreen({ type: "SPEAK", text: msg.text });
       sendResponse({ ok: true });
       break;
     }
