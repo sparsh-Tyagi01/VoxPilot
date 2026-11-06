@@ -42,16 +42,14 @@ export interface TTSConfig {
  */
 export class TTS {
   private readonly config: Required<TTSConfig>;
-  private currentUtterance: SpeechSynthesisUtterance | null = null;
   private currentResolve: (() => void) | null = null;
-  private currentReject: ((err: Error) => void) | null = null;
 
   constructor(config: TTSConfig = {}) {
     this.config = {
       rate: 1.1,
       pitch: 1.0,
       volume: 0.9,
-      voiceURI: null,
+      voiceURI: "" as string | null,
       ...config,
     };
   }
@@ -89,16 +87,12 @@ export class TTS {
       }
 
       utterance.onend = () => {
-        this.currentUtterance = null;
         this.currentResolve = null;
-        this.currentReject = null;
         resolve();
       };
 
       utterance.onerror = (event: SpeechSynthesisErrorEvent) => {
-        this.currentUtterance = null;
         this.currentResolve = null;
-        this.currentReject = null;
 
         // 'interrupted' is not a real error — it means stop() was called
         if (event.error === "interrupted" || event.error === "canceled") {
@@ -108,9 +102,7 @@ export class TTS {
         }
       };
 
-      this.currentUtterance = utterance;
       this.currentResolve = resolve;
-      this.currentReject = reject;
 
       speechSynthesis.speak(utterance);
     });
@@ -126,9 +118,7 @@ export class TTS {
     }
     // Resolve the pending promise (stop is not an error)
     this.currentResolve?.();
-    this.currentUtterance = null;
     this.currentResolve = null;
-    this.currentReject = null;
   }
 
   /**

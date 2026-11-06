@@ -13,7 +13,7 @@
  * - Extension CSS is fully isolated from page CSS (shadow DOM boundary)
  */
 
-import type { ElementHandle, AgentPlan, AgentState } from "@shared/types.js";
+import type { ElementHandle, AgentPlan } from "@shared/types.js";
 import { BadgeRenderer } from "./badges.js";
 import { ConfirmationDialog } from "./confirmation.js";
 

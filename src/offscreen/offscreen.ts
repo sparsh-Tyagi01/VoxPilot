@@ -86,7 +86,7 @@ async function startAudioPipeline(): Promise<void> {
       type: "OFFSCREEN_ERROR",
       source: "audio",
       message: `Failed to start audio pipeline: ${message}`,
-      stack,
+      ...(stack !== undefined ? { stack } : {}),
     });
   }
 }

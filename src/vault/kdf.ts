@@ -44,7 +44,7 @@ export async function deriveKey(passphrase: string, salt: Uint8Array): Promise<C
   return crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt,
+      salt: salt.buffer as ArrayBuffer,
       iterations: PBKDF2_ITERATIONS,
       hash: PBKDF2_HASH,
     },

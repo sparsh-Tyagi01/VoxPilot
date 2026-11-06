@@ -44,7 +44,6 @@ const btnHelp      = document.getElementById("btn-help") as HTMLButtonElement;
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let currentPlan: AgentPlan | null = null;
-let isListening = false;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -71,7 +70,7 @@ function updateStatus(state: string, error?: string): void {
 
 /** Update the toggle button appearance. */
 function updateToggleBtn(listening: boolean): void {
-  isListening = listening;
+  void listening; // tracking reserved
   toggleBtn.setAttribute("aria-pressed", String(listening));
   toggleBtn.classList.toggle("active", listening);
   toggleIcon.textContent = listening ? "⏹️" : "🎙️";
@@ -93,7 +92,7 @@ function showPlan(plan: AgentPlan): void {
   for (const action of plan.actions) {
     const li = document.createElement("li");
     li.className = "plan-action";
-    li.textContent = describeAction(action);
+    li.textContent = describeAction(action as unknown as Record<string, unknown> & { type: string });
     planActionsEl.appendChild(li);
   }
 

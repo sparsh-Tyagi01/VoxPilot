@@ -25,7 +25,7 @@ import {
   CONTENT_SCRIPT_TIMEOUT_MS,
   OFFSCREEN_KEEPALIVE_INTERVAL_MS,
 } from "@shared/constants.js";
-import type { VoxPilotMessage, SessionStateUpdateMsg } from "@shared/messages.js";
+import type { VoxPilotMessage } from "@shared/messages.js";
 import { AgentState } from "@shared/types.js";
 import type { SessionState } from "@shared/types.js";
 
@@ -101,8 +101,11 @@ const OFFSCREEN_REASON: chrome.offscreen.Reason = chrome.offscreen?.Reason?.AUDI
  */
 async function ensureOffscreenDocument(): Promise<void> {
   // Check if offscreen is already open using the contexts API
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const getContexts = (chrome.runtime as any).getContexts as ((q: unknown) => Promise<unknown[]>) | undefined;
+  if (!getContexts) { return; }
+  const contexts = await getContexts({
+    contextTypes: ["OFFSCREEN_DOCUMENT"],
     documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
   });
 

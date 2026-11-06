@@ -112,15 +112,18 @@ export class UndoStack {
           break;
         case "scroll":
           // Invert scroll direction
-          inverse.push({
+          const scrollAction: Parameters<typeof inverse.push>[0] = {
             type: "scroll",
             handle: action.handle,
             direction: action.direction === "down" ? "up"
               : action.direction === "up" ? "down"
               : action.direction === "right" ? "left"
               : "right",
-            amount: action.amount,
-          });
+          };
+          if (action.amount !== undefined) {
+            (scrollAction as { amount?: number }).amount = action.amount;
+          }
+          inverse.push(scrollAction);
           break;
         // click, navigate, tab, read, fill_from_vault, ask, done — no reliable inverse
         default:

@@ -17,7 +17,7 @@
  */
 
 import Ajv, { type ValidateFunction } from "ajv";
-import addFormats from "ajv-formats";
+// import addFormats from "ajv-formats"; // TODO: add ajv-formats to devDependencies
 import { AGENT_PLAN_SCHEMA } from "@shared/schema.js";
 import type { AgentPlan } from "@shared/types.js";
 

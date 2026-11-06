@@ -27,11 +27,14 @@ export class BadgeRenderer {
   private container: HTMLElement;
   private badgeEls: HTMLElement[] = [];
 
-  constructor(private readonly shadowRoot: ShadowRoot) {
+  private readonly root: ShadowRoot;
+
+  constructor(shadowRoot: ShadowRoot) {
+    this.root = shadowRoot;
     // Inject badge styles
     const style = document.createElement("style");
     style.textContent = this.getBadgeStyles();
-    shadowRoot.appendChild(style);
+    this.root.appendChild(style);
 
     // Container for all badges
     this.container = document.createElement("div");

@@ -20,6 +20,9 @@
     "vite": "^5.0.0"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "@mlc-ai/web-llm": "^0.2.87",
+    "@ricky0123/vad-web": "^0.0.19",
     "ajv": "^8.17.1",
     "canvas": "^3.2.3"
   }

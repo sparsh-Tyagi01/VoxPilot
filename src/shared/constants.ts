@@ -135,7 +135,10 @@ export const MODEL_PROFILE_CONFIG: Record<
   ModelProfile,
   {
     label: string;
+    /** WebLLM MLC model ID for LLM inference. */
     modelId: string;
+    /** HuggingFace repo for the STT (Whisper) ONNX model. */
+    sttModelId: string;
     /** Approximate VRAM/RAM required (MB) */
     memoryMb: number;
     /** Approximate tokens/second on a modern laptop GPU */
@@ -146,6 +149,7 @@ export const MODEL_PROFILE_CONFIG: Record<
   [ModelProfile.Fast]: {
     label: "Fast (1B)",
     modelId: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+    sttModelId: "onnx-community/whisper-tiny",
     memoryMb: 700,
     tps: 60,
     description: "Fastest response, works on all devices",
@@ -153,6 +157,7 @@ export const MODEL_PROFILE_CONFIG: Record<
   [ModelProfile.Balanced]: {
     label: "Balanced (3B)",
     modelId: "Llama-3.2-3B-Instruct-q4f16_1-MLC",
+    sttModelId: "onnx-community/whisper-base",
     memoryMb: 1_800,
     tps: 30,
     description: "Good balance of speed and accuracy",
@@ -160,6 +165,7 @@ export const MODEL_PROFILE_CONFIG: Record<
   [ModelProfile.Powerful]: {
     label: "Powerful (8B)",
     modelId: "Llama-3.1-8B-Instruct-q4f16_1-MLC",
+    sttModelId: "onnx-community/whisper-base",
     memoryMb: 5_000,
     tps: 12,
     description: "Best accuracy, requires a capable GPU",

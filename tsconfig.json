@@ -39,7 +39,9 @@
 
     /* ─── Source Maps ────────────────────────────────────────────────────────── */
     "sourceMap": true,
-    "declarationMap": true,
+
+    /* ─── Skip lib check for 3rd-party type conflicts ─────────────────────── */
+    "skipLibCheck": true,
 
     /* ─── Path Aliases ───────────────────────────────────────────────────────── */
     "baseUrl": ".",

@@ -18,7 +18,7 @@
  * - No vault access from LLM or content scripts — only from SW/settings context
  */
 
-import { deriveKey, generateSalt, generateIV, toBase64, fromBase64, SALT_BYTES } from "./kdf.js";
+import { deriveKey, generateSalt, generateIV, toBase64, fromBase64 } from "./kdf.js";
 import type { VaultField, VaultFieldKey } from "@shared/types.js";
 import { VAULT_AUTO_LOCK_MS } from "@shared/constants.js";
 
@@ -230,7 +230,7 @@ export class VaultService {
     const plaintext = new TextEncoder().encode(JSON.stringify(this.data));
 
     const ciphertextBuffer = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
+      { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
       this.key,
       plaintext
     );
@@ -252,9 +252,9 @@ export class VaultService {
     const iv = fromBase64(blob.iv);
 
     const plaintextBuffer = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
+      { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
       this.key,
-      ciphertext
+      ciphertext.buffer as ArrayBuffer
     );
 
     const json = new TextDecoder().decode(plaintextBuffer);

@@ -68,7 +68,7 @@ export class ConfirmationDialog {
             ${plan.actions
               .filter((a) => a.type !== "done")
               .slice(0, 5)
-              .map((a) => `<div class="vp-confirm-action-item">• ${this.describeAction(a)}</div>`)
+              .map((a) => `<div class="vp-confirm-action-item">• ${this.describeAction(a as unknown as Record<string, unknown> & { type: string })}</div>`)
               .join("")}
             ${plan.actions.length > 6 ? `<div class="vp-confirm-action-item vp-muted">…and ${plan.actions.length - 5} more</div>` : ""}
           </div>

@@ -48,6 +48,15 @@ export class IntentRouter {
    * @param transcript Normalized (trimmed) transcript text
    * @returns An AgentPlan if matched, or null to fall through to LLM
    */
+  /**
+   * Check if the transcript is a global kill-switch command (FR-SAFE-04).
+   * Returns true for: stop, abort, cancel, quit, exit, never mind, etc.
+   */
+  isKillCommand(transcript: string): boolean {
+    const normalised = transcript.trim().toLowerCase();
+    return /^(?:stop|abort|cancel|quit|exit|never\s*mind|stop\s+that|stop\s+it)$/.test(normalised);
+  }
+
   route(transcript: string): AgentPlan | null {
     const normalized = transcript.trim().toLowerCase();
 

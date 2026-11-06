@@ -187,6 +187,19 @@ export interface TtsDoneMsg extends BaseMessage {
   type: "TTS_DONE";
 }
 
+/** Offscreen reports STT/LLM model download progress. */
+export interface ModelLoadProgressMsg extends BaseMessage {
+  type: "MODEL_LOAD_PROGRESS";
+  stt?: { loaded: number; total: number };
+  llm?: { loaded: number; total: number; text?: string };
+}
+
+/** Offscreen streams a single LLM output token to the panel. */
+export interface LlmTokenMsg extends BaseMessage {
+  type: "LLM_TOKEN";
+  delta: string;
+}
+
 /** Offscreen requests SW to relay an action to the content script. */
 export interface RelayActionMsg extends BaseMessage {
   type: "RELAY_ACTION";
@@ -217,6 +230,23 @@ export interface ShowBadgesMsg extends BaseMessage {
 /** SW instructs content script to hide all badges. */
 export interface HideBadgesMsg extends BaseMessage {
   type: "HIDE_BADGES";
+}
+
+/** SW instructs content script to highlight a specific element. */
+export interface HighlightElementMsg extends BaseMessage {
+  type: "HIGHLIGHT_ELEMENT";
+  handle: string;
+}
+
+/** SW instructs content script to show/update listening state indicator. */
+export interface ShowListeningMsg extends BaseMessage {
+  type: "SHOW_LISTENING";
+  agentState: import("./types.js").AgentState;
+}
+
+/** SW pings a content script to check if it's alive. */
+export interface PingMsg extends BaseMessage {
+  type: "PING";
 }
 
 /** SW instructs content script to show a confirmation prompt. */
@@ -297,12 +327,17 @@ export type VoxPilotMessage =
   | RequestSnapshotMsg
   | OffscreenErrorMsg
   | TtsDoneMsg
+  | ModelLoadProgressMsg
+  | LlmTokenMsg
   | RelayActionMsg
   /* SW → Content */
   | CaptureSnapshotMsg
   | ExecuteInPageMsg
   | ShowBadgesMsg
   | HideBadgesMsg
+  | HighlightElementMsg
+  | ShowListeningMsg
+  | PingMsg
   | ShowConfirmationMsg
   | HideConfirmationMsg
   /* Content → SW */

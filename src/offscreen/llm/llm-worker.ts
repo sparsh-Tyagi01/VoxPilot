@@ -1,197 +1,256 @@
 /**
  * @file src/offscreen/llm/llm-worker.ts
- * @description LLM Web Worker for on-device agent planning using WebLLM + Llama 3.2.
+ * @description LLM Web Worker — Llama 3.2 1B via @mlc-ai/web-llm (WebGPU).
  *
- * This worker runs in a separate thread and handles:
- * 1. Model loading with progress reporting (weights can be 700MB+)
- * 2. Constrained JSON decoding (grammar-based generation ensures valid AgentPlan)
- * 3. Plan generation from a system prompt + DOM snapshot context
+ * This worker owns the WebLLM engine lifecycle. It receives planning requests
+ * (system prompt + user message) and streams back a constrained JSON AgentPlan.
  *
- * Production implementation will use:
- * - Library: @mlc-ai/web-llm
- * - Models: Llama-3.2-1B/3B/8B-Instruct (MLC quantized)
- * - Constrained decoding: WebLLM grammar mode (BNF grammar from JSON Schema)
+ * SRS references:
+ * - FR-MODEL-02: Llama 3.2 1B Instruct q4f16_1 via WebLLM
+ * - FR-PLAN-01: LLM produces constrained JSON conforming to Appendix A schema
+ * - FR-PLAN-02: Constrained decoding (JSON grammar) prevents hallucinated action types
+ * - NFR-PERF-01: LLM path ≤2.5s p50, ≤4.0s p95 (Tier-1 hardware)
+ * - NFR-PRV-01: All inference on-device; no external API calls
+ * - IR-COM-01: Only network traffic is model download from HuggingFace
  *
- * PostMessage interface:
+ * PostMessage API:
  *
- * Input messages (main thread → worker):
- * ```ts
- * { type: 'load', modelId: string }
- * { type: 'plan', prompt: string, schema: object }
- * { type: 'abort' }
- * ```
+ * Input  → { type: 'load',     modelId: string }
+ * Input  → { type: 'generate', messages: ChatMessage[]; grammar?: string; requestId: string }
+ * Input  → { type: 'abort',    requestId: string }
  *
- * Output messages (worker → main thread):
- * ```ts
- * { type: 'ready' }
- * { type: 'result', plan: AgentPlan }
- * { type: 'token', text: string }  // streaming token
- * { type: 'error', message: string }
- * { type: 'progress', loaded: number, total: number, modelId: string }
- * ```
+ * Output ← { type: 'ready' }
+ * Output ← { type: 'progress', loaded: number; total: number; text: string }
+ * Output ← { type: 'token',    requestId: string; delta: string }
+ * Output ← { type: 'result',   requestId: string; text: string; usage: TokenUsage }
+ * Output ← { type: 'error',    requestId: string; message: string; stack?: string }
  */
 
-import type { AgentPlan } from "@shared/types.js";
+import * as webllm from "@mlc-ai/web-llm";
 
-// ─── Message Types ────────────────────────────────────────────────────────────
+// ─── Types ─────────────────────────────────────────────────────────────────────
 
-/** Messages the worker receives from the main thread. */
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/** Messages received from the main offscreen thread. */
 type LLMWorkerInput =
   | { type: "load"; modelId: string }
-  | { type: "plan"; prompt: string; schema: object }
-  | { type: "abort" };
+  | { type: "generate"; messages: ChatMessage[]; grammar?: string; requestId: string }
+  | { type: "abort"; requestId: string };
 
-/** Messages the worker sends to the main thread. */
+/** Messages sent to the main offscreen thread. */
 type LLMWorkerOutput =
   | { type: "ready" }
-  | { type: "result"; plan: AgentPlan }
-  | { type: "token"; text: string }
-  | { type: "error"; message: string; stack?: string }
-  | { type: "progress"; loaded: number; total: number; modelId: string };
+  | { type: "progress"; loaded: number; total: number; text: string }
+  | { type: "token"; requestId: string; delta: string }
+  | { type: "result"; requestId: string; text: string; usage: TokenUsage }
+  | { type: "error"; requestId: string; message: string; stack?: string };
 
-// ─── Worker State ─────────────────────────────────────────────────────────────
+// ─── Worker State ──────────────────────────────────────────────────────────────
 
-/**
- * TODO: Replace with actual WebLLM engine instance.
- * ```ts
- * import * as webllm from '@mlc-ai/web-llm';
- * let engine: webllm.MLCEngine | null = null;
- * ```
- */
-let modelLoaded = false;
+let engine: webllm.MLCEngine | null = null;
 let currentModelId = "";
+let isLoading = false;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+/** AbortControllers keyed by requestId for in-flight generations. */
+const abortControllers = new Map<string, AbortController>();
 
-function postResult(msg: LLMWorkerOutput): void {
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+function post(msg: LLMWorkerOutput): void {
   self.postMessage(msg);
 }
 
-/**
- * Load the LLM model with progress reporting.
- *
- * TODO: Implement with WebLLM:
- * ```ts
- * engine = await webllm.CreateMLCEngine(modelId, {
- *   initProgressCallback: (progress) => {
- *     postResult({
- *       type: 'progress',
- *       loaded: progress.progress * 100,
- *       total: 100,
- *       modelId,
- *     });
- *   },
- * });
- * postResult({ type: 'ready' });
- * ```
- */
-async function loadModel(modelId: string): Promise<void> {
-  currentModelId = modelId;
-
-  try {
-    console.log(`[LLM Worker] Loading model: ${modelId}`);
-
-    // Simulate download progress for the stub
-    for (let i = 0; i <= 100; i += 10) {
-      await new Promise<void>((r) => setTimeout(r, 50));
-      postResult({ type: "progress", loaded: i, total: 100, modelId });
-    }
-
-    // TODO: Initialize WebLLM engine here
-    modelLoaded = true;
-    postResult({ type: "ready" });
-    console.log(`[LLM Worker] Model "${modelId}" ready.`);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    postResult({ type: "error", message: `Failed to load model: ${message}`, stack });
-  }
+function postError(requestId: string, message: string, err?: unknown): void {
+  const stack = err instanceof Error ? err.stack : undefined;
+  post({ type: "error", requestId, message, ...(stack !== undefined ? { stack } : {}) });
 }
 
+// ─── Load ──────────────────────────────────────────────────────────────────────
+
 /**
- * Generate an AgentPlan from a prompt using constrained JSON decoding.
+ * Initialise the WebLLM MLCEngine with the requested model.
  *
- * The `schema` parameter is converted to a BNF grammar and passed to the LLM
- * engine to guarantee that the output is valid JSON conforming to AgentPlan.
+ * WebLLM downloads model weights via its own fetch infrastructure; they land
+ * in Cache Storage and are reused across sessions (SRS NFR-STO-01).
  *
- * TODO: Implement with WebLLM:
- * ```ts
- * const grammar = webllm.SchemaToGrammar(schema);
- * const reply = await engine.chat.completions.create({
- *   messages: [{ role: 'user', content: prompt }],
- *   response_format: { type: 'json_object', schema: grammar },
- *   temperature: 0.1,
- *   max_tokens: 1024,
- *   stream: true,
- * });
- *
- * let fullText = '';
- * for await (const chunk of reply) {
- *   const token = chunk.choices[0]?.delta.content ?? '';
- *   fullText += token;
- *   postResult({ type: 'token', text: token });
- * }
- *
- * const plan = JSON.parse(fullText) as AgentPlan;
- * postResult({ type: 'result', plan });
- * ```
+ * Model IDs follow the MLC format: "<model>-<quant>-MLC"
+ * Default: "Llama-3.2-1B-Instruct-q4f16_1-MLC" (SRS FR-MODEL-02, Standard profile)
  */
-async function generatePlan(prompt: string, _schema: object): Promise<void> {
-  if (!modelLoaded) {
-    postResult({ type: "error", message: "Model not loaded. Send 'load' message first." });
+async function loadEngine(modelId: string): Promise<void> {
+  if (isLoading) {
+    postError("", "Engine load already in progress.");
+    return;
+  }
+  if (engine && currentModelId === modelId) {
+    post({ type: "ready" });
     return;
   }
 
+  // Reset existing engine before switching models.
+  if (engine) {
+    await engine.unload();
+    engine = null;
+  }
+
+  isLoading = true;
+  currentModelId = modelId;
+  console.log(`[LLM Worker] Loading engine for "${modelId}"…`);
+
   try {
-    console.log(`[LLM Worker] Generating plan... (prompt length: ${prompt.length})`);
+    engine = await webllm.CreateMLCEngine(modelId, {
+      initProgressCallback: (report: webllm.InitProgressReport) => {
+        post({
+          type: "progress",
+          loaded: report.progress * 100,  // convert 0-1 to percent for display
+          total: 100,
+          text: report.text,
+        });
+      },
+      logLevel: "WARN",
+    });
 
-    // TODO: Replace with actual WebLLM constrained generation
-    // Stub: return a no-op plan after a simulated delay
-    await new Promise<void>((r) => setTimeout(r, 200));
-
-    const stubPlan: AgentPlan = {
-      intent: "[LLM not yet implemented]",
-      actions: [{ type: "done", summary: "LLM worker is a stub — not yet implemented." }],
-      risk: 0,
-      requiresConfirmation: false,
-    };
-
-    postResult({ type: "result", plan: stubPlan });
+    isLoading = false;
+    console.log(`[LLM Worker] Engine ready for "${modelId}".`);
+    post({ type: "ready" });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    postResult({ type: "error", message: `Plan generation failed: ${message}`, stack });
+    isLoading = false;
+    engine = null;
+    postError("", `Failed to load engine for "${modelId}": ${err instanceof Error ? err.message : String(err)}`, err);
   }
 }
 
-// ─── Message Handler ──────────────────────────────────────────────────────────
+// ─── Generate ──────────────────────────────────────────────────────────────────
+
+/**
+ * Run a constrained JSON generation request.
+ *
+ * Uses streaming so the panel can show partial output while the agent is thinking.
+ * When a JSON grammar is supplied, WebLLM uses constrained decoding (grammar sampling)
+ * to guarantee the output conforms to the AgentPlan schema (SRS FR-PLAN-02).
+ *
+ * Generation params (SRS tuning):
+ * - temperature: 0.1  → deterministic, low creativity (planning task)
+ * - top_p: 0.9        → nucleus sampling safety net
+ * - max_tokens: 1024  → enough for 10-action plans + reasoning
+ */
+async function generate(
+  requestId: string,
+  messages: ChatMessage[],
+  grammar?: string,
+): Promise<void> {
+  if (!engine) {
+    postError(requestId, "Engine not loaded. Send 'load' message first.");
+    return;
+  }
+
+  const controller = new AbortController();
+  abortControllers.set(requestId, controller);
+
+  console.log(`[LLM Worker] Generating for requestId="${requestId}" (${messages.length} messages)…`);
+  const t0 = performance.now();
+
+  try {
+    // Build request options. grammar is used for constrained JSON decoding.
+    const requestOptions: webllm.ChatCompletionRequestStreaming = {
+      messages: messages as webllm.ChatCompletionMessageParam[],
+      temperature: 0.1,
+      top_p: 0.9,
+      max_tokens: 1024,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+
+    // Apply JSON grammar constraint when available.
+    if (grammar) {
+      (requestOptions as unknown as Record<string, unknown>)["response_format"] = {
+        type: "json_object",
+        schema: grammar,
+      };
+    }
+
+    let fullText = "";
+    let usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+    const asyncGen = await engine.chat.completions.create(requestOptions);
+
+    for await (const chunk of asyncGen) {
+      // Check for abort signal between chunks.
+      if (controller.signal.aborted) {
+        console.log(`[LLM Worker] Generation aborted for requestId="${requestId}".`);
+        break;
+      }
+
+      const delta = chunk.choices[0]?.delta?.content ?? "";
+      if (delta) {
+        fullText += delta;
+        post({ type: "token", requestId, delta });
+      }
+
+      // Capture usage from the final chunk.
+      if (chunk.usage) {
+        usage = {
+          prompt_tokens: chunk.usage.prompt_tokens,
+          completion_tokens: chunk.usage.completion_tokens,
+          total_tokens: chunk.usage.total_tokens,
+        };
+      }
+    }
+
+    abortControllers.delete(requestId);
+    const elapsed = performance.now() - t0;
+    console.log(`[LLM Worker] Generation done in ${elapsed.toFixed(0)}ms (${usage.completion_tokens} tokens)`);
+
+    post({ type: "result", requestId, text: fullText, usage });
+  } catch (err: unknown) {
+    abortControllers.delete(requestId);
+    // Suppress abort errors — they're expected.
+    if (err instanceof Error && err.name === "AbortError") return;
+    postError(requestId, `Generation failed: ${err instanceof Error ? err.message : String(err)}`, err);
+  }
+}
+
+// ─── Message Handler ───────────────────────────────────────────────────────────
 
 self.addEventListener("message", (event: MessageEvent<LLMWorkerInput>) => {
   const msg = event.data;
 
   switch (msg.type) {
     case "load":
-      loadModel(msg.modelId).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        postResult({ type: "error", message });
+      loadEngine(msg.modelId).catch((err: unknown) => {
+        postError("", `Unhandled error in loadEngine: ${err instanceof Error ? err.message : String(err)}`, err);
       });
       break;
 
-    case "plan":
-      generatePlan(msg.prompt, msg.schema).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        postResult({ type: "error", message });
+    case "generate":
+      generate(msg.requestId, msg.messages, msg.grammar).catch((err: unknown) => {
+        postError(msg.requestId, `Unhandled error in generate: ${err instanceof Error ? err.message : String(err)}`, err);
       });
       break;
 
-    case "abort":
-      // TODO: Abort in-progress generation via AbortController / engine.interruptGenerate()
-      console.log("[LLM Worker] Abort requested.");
+    case "abort": {
+      const ctrl = abortControllers.get(msg.requestId);
+      if (ctrl) {
+        ctrl.abort();
+        abortControllers.delete(msg.requestId);
+      }
       break;
+    }
 
-    default:
-      console.warn(`[LLM Worker] Unknown message type: ${(msg as { type: string }).type}`);
+    default: {
+      const _exhaustive: never = msg;
+      postError("", `Unknown message type: ${JSON.stringify(_exhaustive)}`);
+    }
   }
 });
 
-console.log("[LLM Worker] VoxPilot LLM worker initialized.");
+console.log("[LLM Worker] Worker script initialised.");

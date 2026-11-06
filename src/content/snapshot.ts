@@ -198,7 +198,7 @@ export class SnapshotBuilder {
         tag,
         ...(inputType && { inputType }),
         ...(role && { role }),
-        label: extractLabel(el),
+        label: extractLabel(el) ?? "",
         ...(value && { value }),
         disabled: (el as HTMLInputElement).disabled ?? false,
         inViewport,

@@ -77,7 +77,7 @@ export class RiskClassifier {
     // Analyze each action
     let typeActionCount = 0;
     let hasVaultFill = false;
-    let hasNavigation = false;
+    // let hasNavigation = false; // reserved for future use
 
     for (const action of plan.actions) {
       const actionTier = this.classifyAction(action);
@@ -85,7 +85,7 @@ export class RiskClassifier {
 
       if (action.type === "type") typeActionCount++;
       if (action.type === "fill_from_vault") hasVaultFill = true;
-      if (action.type === "navigate") hasNavigation = true;
+      // hasNavigation tracking reserved for future use
     }
 
     // Escalate R1 to R2 if multiple type actions (multi-field form)

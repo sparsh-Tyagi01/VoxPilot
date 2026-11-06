@@ -306,8 +306,8 @@ export class ActionExecutor {
    * Uses scheduler.yield() if available (Chrome 115+), else rAF.
    */
   private yield(): Promise<void> {
-    if (typeof scheduler !== "undefined" && scheduler.yield) {
-      return scheduler.yield();
+    if (typeof (self as any).scheduler !== "undefined" && (self as any).scheduler.yield) {
+      return (self as any).scheduler.yield() as Promise<void>;
     }
     return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   }
