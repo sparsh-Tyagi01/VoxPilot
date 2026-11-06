@@ -60,6 +60,10 @@ export default defineConfig({
      * loaded via `new Worker(new URL(...))` without import resolution issues.
      */
     rollupOptions: {
+      input: {
+        onboarding: "src/onboarding/onboarding.html",
+        settings: "src/settings/settings.html",
+      },
       output: {
         /**
          * Chunk naming: keeps hashes short and names descriptive for debugging.

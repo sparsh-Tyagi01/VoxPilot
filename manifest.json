@@ -28,6 +28,11 @@
     "default_path": "src/panel/panel.html"
   },
 
+  "options_ui": {
+    "page": "src/settings/settings.html",
+    "open_in_tab": true
+  },
+
   "action": {
     "default_title": "VoxPilot",
     "default_icon": {
@@ -62,7 +67,11 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["src/offscreen/offscreen.html"],
+      "resources": [
+        "src/offscreen/offscreen.html",
+        "src/onboarding/onboarding.html",
+        "src/settings/settings.html"
+      ],
       "matches": ["<all_urls>"]
     }
   ],
