@@ -299,14 +299,24 @@
     <div class="plan-box">
       <div class="plan-intent">
         <span id="plan-intent-text">—</span>
-        <span class="risk-pill risk-0" id="risk-pill">R0</span>
+        <span class="risk-pill risk-0" id="risk-pill" aria-label="Risk level">R0</span>
       </div>
       <ul class="plan-actions" id="plan-actions" aria-label="Planned actions"></ul>
 
-      <!-- Confirmation buttons — shown for R3/R4 -->
-      <div class="confirm-buttons" id="confirm-buttons" hidden>
-        <button class="btn btn-cancel" id="btn-cancel" type="button">Cancel <kbd>Esc</kbd></button>
-        <button class="btn btn-confirm" id="btn-confirm" type="button">Confirm <kbd>Enter</kbd></button>
+      <!-- Confirmation buttons — shown for R3/R4 (role=alertdialog per WCAG 2.2) -->
+      <div class="confirm-buttons" id="confirm-buttons"
+           role="alertdialog" aria-modal="true"
+           aria-labelledby="plan-intent-text"
+           aria-describedby="plan-actions"
+           hidden>
+        <button class="btn btn-cancel" id="btn-cancel" type="button"
+                aria-label="Cancel this action (Escape)">
+          Cancel <kbd aria-hidden="true">Esc</kbd>
+        </button>
+        <button class="btn btn-confirm" id="btn-confirm" type="button"
+                aria-label="Confirm and execute this action (Enter)">
+          Confirm <kbd aria-hidden="true">Enter</kbd>
+        </button>
       </div>
     </div>
   </section>

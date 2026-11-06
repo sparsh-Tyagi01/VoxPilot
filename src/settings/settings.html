@@ -273,10 +273,12 @@
         <h3>Vault is locked</h3>
         <p>Enter your passphrase to access and edit your personal data.</p>
         <div style="display:flex;gap:8px;justify-content:center;align-items:center;">
-          <input type="password" id="vault-passphrase" placeholder="Passphrase" aria-label="Vault passphrase" style="width:200px;" />
+          <input type="password" id="vault-passphrase" placeholder="Passphrase"
+                 aria-label="Vault passphrase" aria-describedby="vault-error"
+                 autocomplete="current-password" style="width:200px;" />
           <button class="btn btn-primary" id="btn-unlock" type="button">Unlock</button>
         </div>
-        <p id="vault-error" style="color:var(--danger);font-size:12px;margin-top:8px;" hidden></p>
+        <p id="vault-error" role="alert" style="color:var(--danger);font-size:12px;margin-top:8px;" hidden></p>
       </div>
 
       <!-- Unlocked state -->

@@ -287,6 +287,12 @@ function showPlan(plan: AgentPlan): void {
   // Confirmation buttons for R3/R4
   const needsConfirm = plan.requiresConfirmation;
   confirmBtns.hidden = !needsConfirm;
+
+  // WCAG 2.2 — move focus to the Cancel button when a confirmation dialog appears
+  // (the safer default: user must actively press Enter/Confirm, not just Enter accidentally)
+  if (needsConfirm) {
+    requestAnimationFrame(() => btnCancel.focus());
+  }
 }
 
 /** Hide the plan section and clear state. */
