@@ -77,6 +77,42 @@ describe("IntentRouter", () => {
       expect(plan?.intent).toContain("bottom of the page");
     });
 
+    it("routes click commands", () => {
+      const plan = router.route("click login");
+      expect(plan).not.toBeNull();
+      expect(plan?.intent).toContain("login");
+      expect(plan?.actions[0]?.type).toBe("click");
+
+      const plan2 = router.route("please click on the search button");
+      expect(plan2).not.toBeNull();
+      expect(plan2?.actions[0]?.type).toBe("click");
+    });
+
+    it("routes search queries", () => {
+      const plan = router.route("search for Albert Einstein");
+      expect(plan).not.toBeNull();
+      expect(plan?.intent.toLowerCase()).toContain("albert einstein");
+      expect(plan?.actions[0]?.type).toBe("type");
+      expect((plan?.actions[0] as any)?.text.toLowerCase()).toBe("albert einstein");
+    });
+
+    it("routes tab management commands", () => {
+      const newTabPlan = router.route("new tab");
+      expect(newTabPlan).not.toBeNull();
+      expect(newTabPlan?.actions[0]?.type).toBe("tab");
+      expect((newTabPlan?.actions[0] as any)?.operation).toBe("open");
+
+      const closeTabPlan = router.route("close tab");
+      expect(closeTabPlan).not.toBeNull();
+      expect(closeTabPlan?.actions[0]?.type).toBe("tab");
+      expect((closeTabPlan?.actions[0] as any)?.operation).toBe("close");
+
+      const nextTabPlan = router.route("next tab");
+      expect(nextTabPlan).not.toBeNull();
+      expect(nextTabPlan?.actions[0]?.type).toBe("tab");
+      expect((nextTabPlan?.actions[0] as any)?.operation).toBe("switch");
+    });
+
     it("returns null for non-fastpath complex queries needing LLM", () => {
       expect(router.route("fill out my address and click submit")).toBeNull();
       expect(router.route("find the cheapest hotel on this page")).toBeNull();

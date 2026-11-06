@@ -89,7 +89,17 @@ export class ActionExecutor {
   // ─── Type ───────────────────────────────────────────────────────────────────
 
   private async doType(action: TypeAction): Promise<void> {
-    const el = this.resolveHandle(action.handle);
+    let el: Element | null = null;
+    try {
+      el = this.resolveHandle(action.handle);
+    } catch (err) {
+      // If query is a search query and no input exists on the page, navigate directly to search
+      if (action.handle.toLowerCase().includes("search")) {
+        window.location.href = `https://www.google.com/search?q=${encodeURIComponent(action.text)}`;
+        return;
+      }
+      throw err;
+    }
 
     if (!(el instanceof HTMLElement)) {
       throw new Error(`Handle ${action.handle} does not resolve to an HTMLElement`);
@@ -122,6 +132,35 @@ export class ActionExecutor {
       // Dispatch events that React/Vue/Angular listen to
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
+
+      // Dispatch Enter to submit search if it is a search input or handle is search
+      const isSearch =
+        action.handle.toLowerCase().includes("search") ||
+        el.type === "search" ||
+        (el.name && el.name.toLowerCase().includes("search")) ||
+        (el.placeholder && el.placeholder.toLowerCase().includes("search"));
+
+      if (isSearch || el.type === "text") {
+        this.dispatchKeyboardEvent(el, "keydown", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+        this.dispatchKeyboardEvent(el, "keypress", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+        this.dispatchKeyboardEvent(el, "keyup", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+
+        if (isSearch) {
+          const form = el.form || el.closest("form");
+          if (form) {
+            try {
+              if (typeof form.requestSubmit === "function") {
+                form.requestSubmit();
+              } else {
+                form.submit();
+              }
+            } catch {
+              // Ignore form submit errors
+            }
+          }
+        }
+      }
+
       await this.yield();
       return;
     }
@@ -210,7 +249,10 @@ export class ActionExecutor {
   // ─── Scroll ─────────────────────────────────────────────────────────────────
 
   private async doScroll(action: ScrollAction): Promise<void> {
-    const amount = action.amount ?? 300;
+    const screenHeight = window.innerHeight || 800;
+    // Scroll at least 85% of viewport height for page scrolls, or full page for 99999
+    const defaultAmount = Math.max(650, Math.round(screenHeight * 0.85));
+    const amount = action.amount === 99999 ? 999999 : Math.max(action.amount ?? defaultAmount, defaultAmount);
 
     let scrollTarget: Element | Window = window;
     if (action.handle) {
@@ -228,11 +270,15 @@ export class ActionExecutor {
       window.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
 
       // Fallbacks for SPAs and pages that scroll documentElement, scrollingElement, or body
-      if (document.scrollingElement && typeof document.scrollingElement.scrollBy === "function") {
-        document.scrollingElement.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
-      } else if (document.documentElement && typeof document.documentElement.scrollBy === "function") {
-        document.documentElement.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
-      }
+      setTimeout(() => {
+        if (yDelta !== 0 && window.scrollY === 0) {
+          if (document.scrollingElement && typeof document.scrollingElement.scrollBy === "function") {
+            document.scrollingElement.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
+          } else if (document.body && typeof document.body.scrollBy === "function") {
+            document.body.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
+          }
+        }
+      }, 50);
     }
 
     // Brief wait for smooth scroll to complete
@@ -397,16 +443,97 @@ export class ActionExecutor {
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   /**
-   * Resolve a handle to a DOM element, throwing a descriptive error if missing.
+   * Resolve a handle to a DOM element, either via the snapshot handle registry
+   * or by semantic search on the live DOM (for direct voice commands like "click search").
    */
   private resolveHandle(handle: string): Element {
     const el = this.handles.resolve(handle);
-    if (!el) {
-      throw new Error(
-        `Handle "${handle}" not found in page registry. The page may have changed since the snapshot was taken.`
+    if (el) return el;
+
+    // Semantic search in live DOM
+    const found = this.findElementByQuery(handle);
+    if (found) return found;
+
+    throw new Error(
+      `Element or handle "${handle}" not found on page. The page may have changed.`
+    );
+  }
+
+  /**
+   * Search for an interactive element matching a query string (for click, type, select).
+   */
+  private findElementByQuery(query: string): Element | null {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+
+    // Clean noise words
+    const cleanQ = q.replace(/^(?:the|a|an)\s+/i, "").replace(/\s+(?:button|btn|link|tab|icon|menu)$/i, "").trim();
+
+    // Check for search input queries
+    if (q.includes("search") || q === "input" || q === "text box") {
+      const searchEl = document.querySelector<HTMLInputElement>(
+        "input[type='search'], input[name*='search'], input[name='q'], input[id*='search'], input[placeholder*='search' i], textarea[name*='search'], [role='searchbox'], input[type='text'], input:not([type])"
       );
+      if (searchEl) return searchEl;
     }
-    return el;
+
+    // Try finding clickable / interactive elements
+    const interactive = Array.from(document.querySelectorAll<HTMLElement>(
+      "button, a, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [tabindex='0']"
+    ));
+
+    // 1. Exact match on innerText, aria-label, placeholder, value, name, id
+    for (const el of interactive) {
+      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase();
+      const aria = el.getAttribute("aria-label")?.trim().toLowerCase();
+      const placeholder = (el as HTMLInputElement).placeholder?.trim().toLowerCase();
+      const val = (el as HTMLInputElement).value?.trim().toLowerCase();
+      const name = el.getAttribute("name")?.trim().toLowerCase();
+      const id = el.id?.trim().toLowerCase();
+
+      if (
+        text === q || text === cleanQ ||
+        aria === q || aria === cleanQ ||
+        placeholder === q || placeholder === cleanQ ||
+        val === q || val === cleanQ ||
+        name === q || name === cleanQ ||
+        id === q || id === cleanQ
+      ) {
+        return el;
+      }
+    }
+
+    // 2. Substring match
+    for (const el of interactive) {
+      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
+      const aria = el.getAttribute("aria-label")?.trim().toLowerCase() || "";
+      const placeholder = (el as HTMLInputElement).placeholder?.trim().toLowerCase() || "";
+      const title = el.getAttribute("title")?.trim().toLowerCase() || "";
+
+      if (
+        (text && (text.includes(q) || (cleanQ.length >= 3 && text.includes(cleanQ)))) ||
+        (aria && (aria.includes(q) || (cleanQ.length >= 3 && aria.includes(cleanQ)))) ||
+        (placeholder && (placeholder.includes(q) || (cleanQ.length >= 3 && placeholder.includes(cleanQ)))) ||
+        (title && (title.includes(q) || (cleanQ.length >= 3 && title.includes(cleanQ))))
+      ) {
+        return el;
+      }
+    }
+
+    // 3. Fallback: any element with matching text
+    const allMatching = Array.from(document.querySelectorAll<HTMLElement>("h1, h2, h3, h4, p, span, li, dt, dd, b, strong"));
+    for (const el of allMatching) {
+      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
+      if (
+        text === q || text === cleanQ ||
+        (cleanQ.length >= 3 && text.includes(cleanQ) && text.length < cleanQ.length + 40)
+      ) {
+        const interactiveAncestor = el.closest<HTMLElement>("button, a, [role='button'], [role='link'], [tabindex='0']");
+        return interactiveAncestor || el;
+      }
+    }
+
+    return null;
   }
 
   /** Dispatch a MouseEvent on an element. */

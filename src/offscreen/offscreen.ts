@@ -172,6 +172,11 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       await agentCore?.onPageSnapshot(msg.snapshot);
       break;
 
+    case "EXECUTE_TEXT_COMMAND":
+      // Execute text command via AgentCore pipeline (fast path or LLM planning)
+      await agentCore?.executeCommandText(msg.text);
+      break;
+
     case "EXECUTE_PLAN":
       // Execute a confirmed plan
       await agentCore?.executePlan(msg.plan, msg.tabId);

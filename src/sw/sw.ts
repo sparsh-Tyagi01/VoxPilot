@@ -153,6 +153,32 @@ async function getTargetTab(): Promise<chrome.tabs.Tab | null> {
  * chrome.scripting.executeScript to guarantee immediate execution.
  */
 async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void> {
+  // 1. Direct handling of Tab operations at SW level
+  for (const action of plan.actions) {
+    if (action.type === "tab") {
+      try {
+        if (action.operation === "open") {
+          await chrome.tabs.create({ url: action.url ?? "chrome://newtab" });
+        } else if (action.operation === "close") {
+          const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (cur?.id) await chrome.tabs.remove(cur.id);
+        } else if (action.operation === "switch") {
+          const tabs = await chrome.tabs.query({ currentWindow: true });
+          const curIdx = tabs.findIndex((t) => t.active);
+          if (curIdx !== -1 && tabs.length > 1) {
+            const delta = action.index ?? 1;
+            const nextIdx = (curIdx + delta + tabs.length) % tabs.length;
+            const target = tabs[nextIdx];
+            if (target?.id) await chrome.tabs.update(target.id, { active: true });
+          }
+        }
+      } catch (err) {
+        console.error("[SW] Direct tab operation failed:", err);
+      }
+    }
+  }
+
+  // 2. Attempt in-page execution via content script
   let executedInContent = false;
   try {
     const res = await sendToContentScript(tabId, {
@@ -166,27 +192,79 @@ async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void>
     console.warn("[SW] Content script execution failed, falling back to direct chrome.scripting:", err);
   }
 
+  // 3. Fallback direct script injection if content script is unavailable or failed
   if (!executedInContent) {
     for (const action of plan.actions) {
       if (action.type === "scroll") {
         const direction = action.direction;
-        const amount = action.amount ?? 400;
+        const amount = action.amount ?? 750;
         await chrome.scripting.executeScript({
           target: { tabId },
           func: (dir: string, amt: number) => {
-            const y = dir === "up" ? -amt : dir === "down" ? amt : 0;
-            const x = dir === "left" ? -amt : dir === "right" ? amt : 0;
+            const screenH = window.innerHeight || 800;
+            const scrollDist = amt === 99999 ? 999999 : Math.max(amt, Math.round(screenH * 0.85));
+            const y = dir === "up" ? -scrollDist : dir === "down" ? scrollDist : 0;
+            const x = dir === "left" ? -scrollDist : dir === "right" ? scrollDist : 0;
             window.scrollBy({ left: x, top: y, behavior: "smooth" });
-            if (document.scrollingElement && typeof document.scrollingElement.scrollBy === "function") {
-              document.scrollingElement.scrollBy({ left: x, top: y, behavior: "smooth" });
-            } else if (document.documentElement && typeof document.documentElement.scrollBy === "function") {
-              document.documentElement.scrollBy({ left: x, top: y, behavior: "smooth" });
-            } else if (document.body && typeof document.body.scrollBy === "function") {
-              document.body.scrollBy({ left: x, top: y, behavior: "smooth" });
-            }
           },
           args: [direction, amount],
         }).catch((e: unknown) => console.error("[SW] Direct scroll script failed:", e));
+      } else if (action.type === "click") {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (targetQuery: string) => {
+            const q = targetQuery.trim().toLowerCase();
+            const cleanQ = q.replace(/^(?:the|a|an)\s+/i, "").replace(/\s+(?:button|btn|link|tab|icon|menu)$/i, "").trim();
+            const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+              "button, a, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [tabindex='0'], h1, h2, h3, h4, p, span, li, b, strong"
+            ));
+            for (const el of candidates) {
+              const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
+              const aria = el.getAttribute("aria-label")?.trim().toLowerCase() || "";
+              if (
+                text === q || text === cleanQ ||
+                aria === q || aria === cleanQ ||
+                (cleanQ.length >= 3 && (text.includes(cleanQ) || aria.includes(cleanQ)))
+              ) {
+                const interactive = el.closest<HTMLElement>("button, a, [role='button'], [role='link'], [tabindex='0']") || el;
+                interactive.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                interactive.click();
+                return;
+              }
+            }
+          },
+          args: [action.handle],
+        }).catch((e: unknown) => console.error("[SW] Direct click script failed:", e));
+      } else if (action.type === "type") {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (handleQuery: string, textToType: string) => {
+            const q = handleQuery.trim().toLowerCase();
+            let inputEl = document.querySelector<HTMLInputElement>(
+              "input[type='search'], input[name*='search'], input[name='q'], input[id*='search'], input[placeholder*='search' i], textarea[name*='search'], [role='searchbox'], input[type='text'], input:not([type]), textarea"
+            );
+            if (!inputEl) {
+              inputEl = Array.from(document.querySelectorAll<HTMLInputElement>("input, textarea")).find(
+                (el) => el.placeholder?.toLowerCase().includes(q) || el.name?.toLowerCase().includes(q) || el.id?.toLowerCase().includes(q)
+              ) || null;
+            }
+            if (inputEl) {
+              inputEl.focus();
+              inputEl.value = textToType;
+              inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+              inputEl.dispatchEvent(new Event("change", { bubbles: true }));
+              inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+              inputEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+              const form = inputEl.form || inputEl.closest("form");
+              if (form) {
+                try { form.requestSubmit(); } catch { form.submit(); }
+              }
+            } else if (q.includes("search")) {
+              window.location.href = `https://www.google.com/search?q=${encodeURIComponent(textToType)}`;
+            }
+          },
+          args: [action.handle, action.text],
+        }).catch((e: unknown) => console.error("[SW] Direct type script failed:", e));
       } else if (action.type === "navigate") {
         if (action.url.startsWith("javascript:history.back")) {
           await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.back() }).catch(() => {});
@@ -569,6 +647,12 @@ async function handleMessage(
           void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
         }
         broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true });
+      } else {
+        // Fallback for complex queries or unmatched commands: forward to offscreen agent LLM planner
+        console.log(`[SW] No fast-path match for "${text}" — forwarding to AgentCore for planning`);
+        await updateSessionState({ agentState: AgentState.Planning });
+        broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Planning });
+        await relayToOffscreen({ type: "EXECUTE_TEXT_COMMAND", text });
       }
       sendResponse({ ok: true });
       break;

@@ -166,6 +166,12 @@ export interface DirectTranscriptMsg extends BaseMessage {
   text: string;
 }
 
+/** SW instructs offscreen to plan and execute a natural language voice command. */
+export interface ExecuteTextCommandMsg extends BaseMessage {
+  type: "EXECUTE_TEXT_COMMAND";
+  text: string;
+}
+
 // ─── Offscreen → SW Messages ──────────────────────────────────────────────────
 
 /** STT produced a transcript. */
@@ -445,6 +451,7 @@ export type VoxPilotMessage =
   | StartAudioMsg
   | StopAudioMsg
   | ExecutePlanMsg
+  | ExecuteTextCommandMsg
   | PageSnapshotMsg
   | UserAnswerMsg
   | KeepaliveMsg

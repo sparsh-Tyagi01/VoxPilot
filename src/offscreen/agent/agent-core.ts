@@ -259,18 +259,36 @@ export class AgentCore {
         isFinal: true,
       });
 
+      await this.processUtterance(transcript.text);
+    } catch (err: unknown) {
+      this.handlePipelineError(err);
+    }
+  }
+
+  /**
+   * Execute a natural language text command directly (e.g. from Web Speech API fast-path).
+   */
+  async executeCommandText(text: string): Promise<void> {
+    this.killRequested = false;
+    await this.processUtterance(text);
+  }
+
+  /**
+   * Core pipeline: takes transcribed text, checks safety/kill/undo,
+   * performs intent routing / LLM planning, validates plan, and sends to SW.
+   */
+  private async processUtterance(text: string): Promise<void> {
+    try {
       this.transitionTo(AgentState.Routing);
 
       // ── Step 2: Kill switch check ────────────────────────────────────────
-      // "Stop", "cancel", "abort" commands always kill the pipeline (FR-SAFE-04).
-      if (this.intentRouter.isKillCommand(transcript.text)) {
+      if (this.intentRouter.isKillCommand(text)) {
         this.handleKill();
         return;
       }
 
       // ── Step 2b: Undo check ──────────────────────────────────────────────
-      // "Undo", "revert" commands reverse the last reversible action (FR-SAFE-03).
-      if (this.intentRouter.isUndoCommand(transcript.text)) {
+      if (this.intentRouter.isUndoCommand(text)) {
         await this.undo();
         this.transitionTo(AgentState.Listening);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
@@ -278,7 +296,7 @@ export class AgentCore {
       }
 
       // ── Step 3: Intent Routing ────────────────────────────────────────────
-      const fastPlan = this.intentRouter.route(transcript.text);
+      const fastPlan = this.intentRouter.route(text);
 
       let plan: AgentPlan;
 
@@ -300,7 +318,7 @@ export class AgentCore {
 
         if (this.killRequested) { this.handleKill(); return; }
 
-        plan = await this.planner.plan(transcript.text, this.currentSnapshot!);
+        plan = await this.planner.plan(text, this.currentSnapshot!);
       }
 
       if (this.killRequested) { this.handleKill(); return; }
@@ -314,19 +332,9 @@ export class AgentCore {
 
       // ═══ SAFETY INVARIANT (NFR-REL-01) ═══════════════════════════════════
       // R3/R4 plans MUST ALWAYS require explicit user confirmation.
-      // This invariant is enforced unconditionally in code — it cannot be
-      // bypassed by LLM output or config drift.
-      // 0 violations allowed. Any change here must pass security review.
       const needsConfirm = risk >= RiskTier.R3
-        ? true  // ← Hardcoded safety floor. Do NOT change this condition.
+        ? true  // ← Hardcoded safety floor.
         : riskConfig.requiresConfirmation;
-
-      // Assert the invariant holds — this acts as a runtime safety net.
-      if (risk >= RiskTier.R3 && !needsConfirm) {
-        // Should be unreachable, but if reached (e.g. RISK_TIER_CONFIG misconfigured),
-        // we still require confirmation rather than silently proceeding.
-        console.error("[AgentCore] SAFETY VIOLATION: R3/R4 plan marked as no-confirm — overriding.");
-      }
 
       plan = { ...plan, requiresConfirmation: needsConfirm };
 
@@ -342,28 +350,32 @@ export class AgentCore {
       }
 
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("[AgentCore] Pipeline error:", err);
-
-      const _stack = err instanceof Error ? err.stack : undefined;
-      await sendToSW({
-        type: "OFFSCREEN_ERROR",
-        source: "agent",
-        message,
-        ...(_stack !== undefined ? { stack: _stack } : {}),
-      });
-
-      this.transitionTo(AgentState.Error);
-      await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Error });
-
-      // Auto-recover to Listening after 3 seconds
-      setTimeout(() => {
-        if (this.state === AgentState.Error) {
-          this.transitionTo(AgentState.Listening);
-          void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
-        }
-      }, 3_000);
+      this.handlePipelineError(err);
     }
+  }
+
+  private handlePipelineError(err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[AgentCore] Pipeline error:", err);
+
+    const _stack = err instanceof Error ? err.stack : undefined;
+    void sendToSW({
+      type: "OFFSCREEN_ERROR",
+      source: "agent",
+      message,
+      ...(_stack !== undefined ? { stack: _stack } : {}),
+    });
+
+    this.transitionTo(AgentState.Error);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Error });
+
+    // Auto-recover to Listening after 3 seconds
+    setTimeout(() => {
+      if (this.state === AgentState.Error) {
+        this.transitionTo(AgentState.Listening);
+        void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+      }
+    }, 3_000);
   }
 
   // ─── External Event Handlers ───────────────────────────────────────────────

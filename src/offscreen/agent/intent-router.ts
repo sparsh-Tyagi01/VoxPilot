@@ -107,7 +107,7 @@ export class IntentRouter {
           risk: RiskTier.R0,
           requiresConfirmation: false,
           actions: [
-            { type: "scroll", handle: null, direction: "down", amount: 300 },
+            { type: "scroll", handle: null, direction: "down", amount: 750 },
             { type: "done", summary: "Scrolled down." },
           ],
         }),
@@ -120,7 +120,7 @@ export class IntentRouter {
           risk: RiskTier.R0,
           requiresConfirmation: false,
           actions: [
-            { type: "scroll", handle: null, direction: "up", amount: 300 },
+            { type: "scroll", handle: null, direction: "up", amount: 750 },
             { type: "done", summary: "Scrolled up." },
           ],
         }),
@@ -193,6 +193,64 @@ export class IntentRouter {
         }),
       },
 
+      // ── Click / Select ─────────────────────────────────────────────────────
+      {
+        name: "click-element",
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:click|tap|press|select)(?:\s+on)?(?:\s+the)?\s+(.+)$/i,
+        planFactory: (match) => {
+          const target = match[1]?.trim();
+          if (!target || target.length < 2) return null;
+          return {
+            intent: `Click "${target}"`,
+            risk: RiskTier.R1,
+            requiresConfirmation: false,
+            actions: [
+              { type: "click", handle: target },
+              { type: "done", summary: `Clicked "${target}".` },
+            ],
+          };
+        },
+      },
+
+      // ── Search Query ───────────────────────────────────────────────────────
+      {
+        name: "search-query",
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:search\s+for|search)\s+(.+)$/i,
+        planFactory: (match) => {
+          const query = match[1]?.trim();
+          if (!query) return null;
+          return {
+            intent: `Search for "${query}"`,
+            risk: RiskTier.R1,
+            requiresConfirmation: false,
+            actions: [
+              { type: "type", handle: "search", text: query },
+              { type: "done", summary: `Searched for "${query}".` },
+            ],
+          };
+        },
+      },
+
+      // ── Type Text ──────────────────────────────────────────────────────────
+      {
+        name: "type-text",
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:type|write|input|enter)\s+(.+?)(?:\s+(?:in|into|on)\s+(.+))?$/i,
+        planFactory: (match) => {
+          const text = match[1]?.trim();
+          const field = match[2]?.trim() || "input";
+          if (!text) return null;
+          return {
+            intent: `Type "${text}" into ${field}`,
+            risk: RiskTier.R1,
+            requiresConfirmation: false,
+            actions: [
+              { type: "type", handle: field, text },
+              { type: "done", summary: `Typed "${text}".` },
+            ],
+          };
+        },
+      },
+
       // ── Tab Management ─────────────────────────────────────────────────────
       {
         name: "new-tab",
@@ -217,6 +275,32 @@ export class IntentRouter {
           actions: [
             { type: "tab", operation: "close" },
             { type: "done", summary: "Tab closed." },
+          ],
+        }),
+      },
+      {
+        name: "next-tab",
+        pattern: /^(?:switch\s+to\s+)?(?:the\s+)?next\s+tab$/i,
+        planFactory: () => ({
+          intent: "Switch to next tab",
+          risk: RiskTier.R1,
+          requiresConfirmation: false,
+          actions: [
+            { type: "tab", operation: "switch", index: 1 },
+            { type: "done", summary: "Switched to next tab." },
+          ],
+        }),
+      },
+      {
+        name: "prev-tab",
+        pattern: /^(?:switch\s+to\s+)?(?:the\s+)?(?:previous|prev)\s+tab$/i,
+        planFactory: () => ({
+          intent: "Switch to previous tab",
+          risk: RiskTier.R1,
+          requiresConfirmation: false,
+          actions: [
+            { type: "tab", operation: "switch", index: -1 },
+            { type: "done", summary: "Switched to previous tab." },
           ],
         }),
       },
