@@ -50,16 +50,21 @@ export function generateMacroId(): string {
   return `macro_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const STOP_WORDS = new Set([
+  "a", "an", "the", "in", "on", "at", "to", "for", "of", "and", "or",
+  "please", "can", "you", "me", "my", "this", "that", "it",
+]);
+
 /**
  * Derive trigger words from a macro name for voice matching.
- * Lowercases and splits on whitespace/punctuation.
+ * Lowercases, strips punctuation, and removes common stop words.
  */
 export function deriveTriggerWords(name: string): string[] {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter(w => w.length > 1); // remove single chars (a, I, etc.)
+    .filter(w => w.length > 1 && !STOP_WORDS.has(w));
 }
 
 /**
