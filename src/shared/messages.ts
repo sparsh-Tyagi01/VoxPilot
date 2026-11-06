@@ -151,6 +151,21 @@ export interface KeepaliveMsg extends BaseMessage {
   type: "KEEPALIVE";
 }
 
+/** Real-time microphone audio level (VU meter) and speech activity. */
+export interface AudioLevelMsg extends BaseMessage {
+  type: "AUDIO_LEVEL";
+  /** RMS volume normalized between 0 and 1 */
+  level: number;
+  /** Whether VAD or energy detection currently considers this speech */
+  isSpeech: boolean;
+}
+
+/** Direct speech transcript from Web Speech API (zero-latency fast path). */
+export interface DirectTranscriptMsg extends BaseMessage {
+  type: "DIRECT_TRANSCRIPT";
+  text: string;
+}
+
 // ─── Offscreen → SW Messages ──────────────────────────────────────────────────
 
 /** STT produced a transcript. */
@@ -416,6 +431,7 @@ export type VoxPilotMessage =
   | UndoLastActionMsg
   | TriggerMacroMsg
   | GetSessionStateMsg
+  | DirectTranscriptMsg
   /* SW → Panel */
   | SessionStateUpdateMsg
   | TranscriptUpdateMsg
@@ -423,6 +439,8 @@ export type VoxPilotMessage =
   | AgentStateChangedMsg
   | ActionCompletedMsg
   | SpeakingMsg
+  | AudioLevelMsg
+  | DirectTranscriptMsg
   /* SW → Offscreen */
   | StartAudioMsg
   | StopAudioMsg
@@ -439,6 +457,7 @@ export type VoxPilotMessage =
   | ModelLoadProgressMsg
   | LlmTokenMsg
   | RelayActionMsg
+  | AudioLevelMsg
   /* SW → Content */
   | CaptureSnapshotMsg
   | ExecuteInPageMsg

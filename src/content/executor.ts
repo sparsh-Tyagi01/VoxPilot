@@ -224,11 +224,19 @@ export class ActionExecutor {
     if (scrollTarget instanceof Element) {
       scrollTarget.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
     } else {
+      // Primary scroll
       window.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
+
+      // Fallbacks for SPAs and pages that scroll documentElement, scrollingElement, or body
+      if (document.scrollingElement && typeof document.scrollingElement.scrollBy === "function") {
+        document.scrollingElement.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
+      } else if (document.documentElement && typeof document.documentElement.scrollBy === "function") {
+        document.documentElement.scrollBy({ left: xDelta, top: yDelta, behavior: "smooth" });
+      }
     }
 
     // Brief wait for smooth scroll to complete
-    await new Promise<void>((r) => setTimeout(r, 300));
+    await new Promise<void>((r) => setTimeout(r, 200));
   }
 
   // ─── Navigate ───────────────────────────────────────────────────────────────

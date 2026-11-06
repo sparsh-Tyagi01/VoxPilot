@@ -63,10 +63,18 @@ async function startAudioPipeline(): Promise<void> {
       },
     });
 
-    // Initialize audio capture and wire to VAD
+    // Initialize audio capture and wire to VAD and SW audio level monitor
     audioCapture = new AudioCapture({
+      bufferSize: 2048,
       onAudioData: (data: Float32Array) => {
         vad?.processAudioChunk(data);
+      },
+      onAudioLevel: (level: number) => {
+        void sendToSW({
+          type: "AUDIO_LEVEL",
+          level,
+          isSpeech: vad?.currentState === "speech" || level > 0.015,
+        });
       },
     });
 

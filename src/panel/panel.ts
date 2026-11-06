@@ -45,6 +45,13 @@ const btnSettings  = document.getElementById("btn-settings") as HTMLButtonElemen
 const btnPrivacy   = document.getElementById("btn-privacy") as HTMLButtonElement;
 const btnHelp      = document.getElementById("btn-help") as HTMLButtonElement;
 
+// Audio meter references
+const audioMeterWrap = document.getElementById("audio-meter-wrap") as HTMLElement;
+const audioMeterText = document.getElementById("audio-meter-text") as HTMLElement;
+const audioMeterStatus = document.getElementById("audio-meter-status") as HTMLElement;
+const audioBars = document.getElementById("audio-bars") as HTMLElement;
+const barSpans = audioBars ? (Array.from(audioBars.querySelectorAll(".bar")) as HTMLElement[]) : [];
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let currentPlan: AgentPlan | null = null;
@@ -256,13 +263,129 @@ function updateStatus(state: string, error?: string): void {
   statusText.textContent = error ? `Error: ${error.slice(0, 40)}` : cfg.label;
 }
 
+// ─── Live Audio Activity & Web Speech Engine ─────────────────────────────────
+
+let currentListeningState = false;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let webSpeechRecognition: any = null;
+let isWebSpeechRunning = false;
+
+function updateAudioMeter(level: number, isSpeech: boolean): void {
+  if (!audioMeterWrap || audioMeterWrap.style.display === "none") return;
+
+  const active = isSpeech || level > 0.012;
+  audioMeterStatus?.classList.toggle("speech", active);
+  audioBars?.classList.toggle("speech", active);
+  if (audioMeterText) {
+    audioMeterText.textContent = active ? "Hearing speech..." : "Listening (mic active)";
+  }
+
+  // Dynamic bar visualization
+  const scaled = Math.min(1, Math.max(0, level * 16));
+  barSpans.forEach((bar, idx) => {
+    const multiplier = [0.6, 1.0, 1.5, 1.9, 1.4, 0.9, 0.5][idx] ?? 1.0;
+    const h = Math.max(3, Math.min(18, Math.round(scaled * 18 * multiplier)));
+    bar.style.height = `${h}px`;
+  });
+}
+
+function startWebSpeech(): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    console.log("[Panel] Web Speech API not supported in this browser window.");
+    return;
+  }
+  if (isWebSpeechRunning) return;
+
+  try {
+    webSpeechRecognition = new SpeechRecognition();
+    webSpeechRecognition.continuous = true;
+    webSpeechRecognition.interimResults = true;
+    webSpeechRecognition.lang = "en-US";
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    webSpeechRecognition.onresult = (event: any) => {
+      let interim = "";
+      let final = "";
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          final += event.results[i][0].transcript;
+        } else {
+          interim += event.results[i][0].transcript;
+        }
+      }
+
+      const spoken = (final || interim).trim();
+      if (spoken) {
+        transcriptBox.textContent = spoken;
+        transcriptBox.classList.remove("empty");
+        updateAudioMeter(0.2, true);
+      }
+
+      if (final.trim()) {
+        console.log(`[Panel WebSpeech] Final transcript: "${final.trim()}"`);
+        chrome.runtime.sendMessage({
+          type: "DIRECT_TRANSCRIPT",
+          text: final.trim(),
+        }).catch(console.error);
+      }
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    webSpeechRecognition.onerror = (event: any) => {
+      console.warn("[Panel WebSpeech] Notice:", event.error);
+    };
+
+    webSpeechRecognition.onend = () => {
+      isWebSpeechRunning = false;
+      // Auto-restart if listening is still enabled
+      if (currentListeningState) {
+        try {
+          webSpeechRecognition.start();
+          isWebSpeechRunning = true;
+        } catch {
+          // ignore restart collisions
+        }
+      }
+    };
+
+    webSpeechRecognition.start();
+    isWebSpeechRunning = true;
+    console.log("[Panel WebSpeech] Zero-latency speech engine started.");
+  } catch (err: unknown) {
+    console.warn("[Panel WebSpeech] Could not start speech recognition:", err);
+  }
+}
+
+function stopWebSpeech(): void {
+  if (webSpeechRecognition) {
+    try {
+      webSpeechRecognition.stop();
+    } catch {}
+    webSpeechRecognition = null;
+  }
+  isWebSpeechRunning = false;
+}
+
 /** Update the toggle button appearance. */
 function updateToggleBtn(listening: boolean): void {
-  void listening; // tracking reserved
+  currentListeningState = listening;
   toggleBtn.setAttribute("aria-pressed", String(listening));
   toggleBtn.classList.toggle("active", listening);
   toggleIcon.textContent = listening ? "⏹️" : "🎙️";
   toggleLabel.textContent = listening ? "Stop Listening" : "Start Listening";
+
+  if (audioMeterWrap) {
+    audioMeterWrap.style.display = listening ? "flex" : "none";
+  }
+
+  if (listening) {
+    startWebSpeech();
+  } else {
+    stopWebSpeech();
+    barSpans.forEach((bar) => { bar.style.height = "4px"; });
+  }
 }
 
 /** Render the plan preview section. */
@@ -375,6 +498,11 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
   const msg = rawMsg as VoxPilotMessage;
 
   switch (msg.type) {
+    case "AUDIO_LEVEL": {
+      updateAudioMeter(msg.level, msg.isSpeech);
+      break;
+    }
+
     case "SESSION_STATE_UPDATE": {
       const state = msg.state as SessionState;
       updateStatus(state.agentState);

@@ -31,6 +31,14 @@ import type { SessionState, AgentPlan } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
 import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
 import { VaultService } from "@vault/vault.js";
+import { IntentRouter } from "../offscreen/agent/intent-router.js";
+
+// Global intent router instance for SW-level fast-path execution
+const swIntentRouter = new IntentRouter();
+
+// Command deduplication cache to prevent double-firing from dual recognition engines
+let lastExecutedCommand = "";
+let lastExecutedCommandTime = 0;
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -106,10 +114,93 @@ async function relayToOffscreen(msg: VoxPilotMessage): Promise<void> {
   });
 }
 
+/**
+ * Dispatch an AgentPlan to the appropriate tab or overlay.
+ */
+async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
+  const state = await updateSessionState({
+    currentPlan: plan,
+    agentState: plan.requiresConfirmation
+      ? AgentState.Confirming
+      : AgentState.Executing,
+  });
+
+  broadcastToPanel({ type: "PLAN_READY", plan });
+
+  // Target the user's currently focused tab if available, else session activeTabId
+  const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const targetTabId = currentTab?.id ?? state.activeTabId;
+
+  // Check if the current tab is an internal browser page (chrome://) where extensions cannot run
+  const isInternal = currentTab?.url && (
+    currentTab.url.startsWith("chrome://") ||
+    currentTab.url.startsWith("chrome-extension://") ||
+    currentTab.url.startsWith("edge://") ||
+    currentTab.url.startsWith("about:")
+  );
+
+  if (isInternal) {
+    broadcastToPanel({
+      type: "AGENT_STATE_CHANGED",
+      state: AgentState.Listening,
+      error: "Browser system pages (chrome://) cannot be scripted. Please test on any regular webpage.",
+    });
+    await relayToOffscreen({
+      type: "SPEAK",
+      text: "Browser internal pages cannot be controlled. Please test on a regular webpage.",
+    });
+    return false;
+  }
+
+  // If confirmation required, show overlay in content script
+  if (plan.requiresConfirmation && targetTabId !== null) {
+    await sendToContentScript(targetTabId, {
+      type: "SHOW_CONFIRMATION",
+      plan,
+    }).catch((err: unknown) => {
+      console.error("[SW] Failed to show confirmation overlay:", err);
+    });
+  } else if (!plan.requiresConfirmation && targetTabId !== null) {
+    // Auto-execute low-risk plans
+    await sendToContentScript(targetTabId, {
+      type: "EXECUTE_IN_PAGE",
+      plan,
+    }).catch((err: unknown) => {
+      console.error("[SW] Failed to relay plan to content script:", err);
+    });
+  }
+
+  return true;
+}
+
 // ─── Offscreen Document Lifecycle ─────────────────────────────────────────────
 
 const OFFSCREEN_URL = "src/offscreen/offscreen.html";
-const OFFSCREEN_REASON: chrome.offscreen.Reason = chrome.offscreen?.Reason?.AUDIO_PLAYBACK ?? ("AUDIO_PLAYBACK" as chrome.offscreen.Reason);
+const OFFSCREEN_REASONS: chrome.offscreen.Reason[] = [
+  (chrome.offscreen?.Reason?.USER_MEDIA ?? "USER_MEDIA") as chrome.offscreen.Reason,
+  (chrome.offscreen?.Reason?.AUDIO_PLAYBACK ?? "AUDIO_PLAYBACK") as chrome.offscreen.Reason,
+];
+
+/**
+ * Check whether the offscreen document is currently open.
+ */
+async function hasOffscreenDocument(): Promise<boolean> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  if (typeof (chrome as any).offscreen?.hasDocument === "function") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return await (chrome as any).offscreen.hasDocument();
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const getContexts = (chrome.runtime as any).getContexts as ((q: unknown) => Promise<unknown[]>) | undefined;
+  if (getContexts) {
+    const contexts = await getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+    });
+    return contexts.length > 0;
+  }
+  return false;
+}
 
 /**
  * Ensure the offscreen document is open.
@@ -117,28 +208,25 @@ const OFFSCREEN_REASON: chrome.offscreen.Reason = chrome.offscreen?.Reason?.AUDI
  * Safe to call multiple times — only creates if not already open.
  */
 async function ensureOffscreenDocument(): Promise<void> {
-  // Check if offscreen is already open using the contexts API
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const getContexts = (chrome.runtime as any).getContexts as ((q: unknown) => Promise<unknown[]>) | undefined;
-  if (!getContexts) { return; }
-  const contexts = await getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
-  });
-
-  if (contexts.length > 0) {
-    // Already open; refresh keepalive timestamp
+  if (await hasOffscreenDocument()) {
     await updateSessionState({ offscreenActive: true, lastKeepalive: Date.now() });
     return;
   }
 
-  // Create the offscreen document
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [OFFSCREEN_REASON],
-    justification:
-      "VoxPilot requires persistent AudioContext for real-time microphone capture and on-device ONNX Runtime Web inference (STT + LLM). This cannot be done in the service worker.",
-  });
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: OFFSCREEN_REASONS,
+      justification:
+        "VoxPilot requires persistent AudioContext for real-time microphone capture and on-device ONNX Runtime Web inference (STT + LLM). This cannot be done in the service worker.",
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("Only a single offscreen document may be created")) {
+      console.error("[SW] Failed to create offscreen document:", err);
+      throw err;
+    }
+  }
 
   await updateSessionState({ offscreenActive: true, lastKeepalive: Date.now() });
   console.log("[SW] Offscreen document created.");
@@ -348,7 +436,73 @@ async function handleMessage(
       break;
     }
 
+    // ── Panel / Direct Speech → SW ──────────────────────────────────────────
+    case "DIRECT_TRANSCRIPT": {
+      const text = msg.text.trim();
+      if (!text) {
+        sendResponse({ ok: true });
+        break;
+      }
+
+      console.log(`[SW] Direct transcript received: "${text}"`);
+      await updateSessionState({
+        lastTranscript: text,
+        agentState: AgentState.Routing,
+      });
+      broadcastToPanel({ type: "TRANSCRIPT_UPDATE", text, isFinal: true });
+
+      // Deduplication check: if identical command within 1.5 seconds, skip re-executing
+      const now = Date.now();
+      if (text.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 1500) {
+        console.log(`[SW] Duplicate command suppressed: "${text}"`);
+        sendResponse({ ok: true, deduplicated: true });
+        break;
+      }
+
+      // Check kill command
+      if (swIntentRouter.isKillCommand(text)) {
+        lastExecutedCommand = text;
+        lastExecutedCommandTime = now;
+        await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
+        broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+        sendResponse({ ok: true });
+        break;
+      }
+
+      // Check undo command
+      if (swIntentRouter.isUndoCommand(text)) {
+        lastExecutedCommand = text;
+        lastExecutedCommandTime = now;
+        await relayToOffscreen({ type: "UNDO_LAST_ACTION" });
+        sendResponse({ ok: true });
+        break;
+      }
+
+      // Fast-path routing
+      const plan = swIntentRouter.route(text);
+      if (plan) {
+        lastExecutedCommand = text;
+        lastExecutedCommandTime = now;
+        console.log(`[SW] Fast-path executing direct plan: "${plan.intent}"`);
+        await dispatchPlan(plan);
+        const doneAction = plan.actions.find((a) => a.type === "done") as { type: "done"; summary: string } | undefined;
+        if (doneAction) {
+          void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
+        }
+        broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true });
+      }
+      sendResponse({ ok: true });
+      break;
+    }
+
     // ── Offscreen → SW ─────────────────────────────────────────────────────
+    case "AUDIO_LEVEL": {
+      // Forward real-time microphone level to panel for VU meter
+      broadcastToPanel(msg);
+      sendResponse({ ok: true });
+      break;
+    }
+
     case "TRANSCRIPT": {
       await updateSessionState({
         lastTranscript: msg.text,
@@ -361,59 +515,14 @@ async function handleMessage(
     }
 
     case "PLAN_PRODUCED": {
-      const state = await updateSessionState({
-        currentPlan: msg.plan,
-        agentState: msg.plan.requiresConfirmation
-          ? AgentState.Confirming
-          : AgentState.Executing,
-      });
-
-      broadcastToPanel({ type: "PLAN_READY", plan: msg.plan });
-
-      // Target the user's currently focused tab if available, else session activeTabId
-      const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const targetTabId = currentTab?.id ?? state.activeTabId;
-
-      // Check if the current tab is an internal browser page (chrome://) where extensions cannot run
-      const isInternal = currentTab?.url && (
-        currentTab.url.startsWith("chrome://") ||
-        currentTab.url.startsWith("chrome-extension://") ||
-        currentTab.url.startsWith("edge://") ||
-        currentTab.url.startsWith("about:")
-      );
-
-      if (isInternal) {
-        broadcastToPanel({
-          type: "AGENT_STATE_CHANGED",
-          state: AgentState.Listening,
-          error: "Browser system pages (chrome://) cannot be scripted. Please test on any regular webpage.",
-        });
-        await relayToOffscreen({
-          type: "SPEAK",
-          text: "Browser internal pages cannot be controlled. Please test on a regular webpage.",
-        });
-        sendResponse({ ok: false, error: "Cannot control browser internal pages" });
+      const now = Date.now();
+      // If this plan's intent corresponds to the command already executed via fast-path, skip re-execution
+      if (msg.plan.intent.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 2000) {
+        console.log(`[SW] Redundant PLAN_PRODUCED suppressed: "${msg.plan.intent}"`);
+        sendResponse({ ok: true });
         break;
       }
-
-      // If confirmation required, show overlay in content script
-      if (msg.plan.requiresConfirmation && targetTabId !== null) {
-        await sendToContentScript(targetTabId, {
-          type: "SHOW_CONFIRMATION",
-          plan: msg.plan,
-        }).catch((err: unknown) => {
-          console.error("[SW] Failed to show confirmation overlay:", err);
-        });
-      } else if (!msg.plan.requiresConfirmation && targetTabId !== null) {
-        // Auto-execute low-risk plans
-        await sendToContentScript(targetTabId, {
-          type: "EXECUTE_IN_PAGE",
-          plan: msg.plan,
-        }).catch((err: unknown) => {
-          console.error("[SW] Failed to relay plan to content script:", err);
-        });
-      }
-
+      await dispatchPlan(msg.plan);
       sendResponse({ ok: true });
       break;
     }

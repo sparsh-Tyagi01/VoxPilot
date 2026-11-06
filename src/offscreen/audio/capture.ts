@@ -21,16 +21,41 @@ import { AUDIO_SAMPLE_RATE } from "@shared/constants.js";
 export interface AudioCaptureConfig {
   /**
    * Callback invoked with each audio chunk from the microphone.
-   * Called at the ScriptProcessor buffer rate (every ~21ms at 16 kHz).
+   * Called at the ScriptProcessor buffer rate (every ~64-128ms at 16 kHz).
    * @param data Float32Array of mono PCM samples at AUDIO_SAMPLE_RATE
    */
   onAudioData: (data: Float32Array) => void;
 
   /**
+   * Optional callback for live audio volume / RMS level (0.0 to 1.0).
+   * Throttled to ~10 Hz (every ~100ms) for UI VU meter feedback.
+   */
+  onAudioLevel?: (level: number) => void;
+
+  /**
    * Buffer size for the ScriptProcessorNode (must be power of 2).
-   * Default: 4096 (~256ms at 16 kHz)
+   * Default: 2048 (~128ms at 16 kHz) for responsive feedback.
    */
   bufferSize?: number;
+}
+
+/**
+ * Resample a Float32Array audio buffer to target sample rate using linear interpolation.
+ */
+function resampleBuffer(input: Float32Array, fromRate: number, toRate: number): Float32Array {
+  if (fromRate === toRate) return new Float32Array(input);
+  const ratio = fromRate / toRate;
+  const newLength = Math.round(input.length / ratio);
+  const output = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const origin = i * ratio;
+    const index = Math.floor(origin);
+    const decimal = origin - index;
+    const s0 = input[index] ?? 0;
+    const s1 = input[index + 1] ?? s0;
+    output[i] = s0 + decimal * (s1 - s0);
+  }
+  return output;
 }
 
 /** AudioCapture manages a live microphone stream and feeds chunks to VAD. */
@@ -39,11 +64,13 @@ export class AudioCapture {
   private audioContext: AudioContext | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private processorNode: ScriptProcessorNode | null = null;
-  private readonly config: Required<AudioCaptureConfig>;
+  private gainNode: GainNode | null = null;
+  private lastLevelEmitTime = 0;
+  private readonly config: Required<Omit<AudioCaptureConfig, "onAudioLevel">> & Pick<AudioCaptureConfig, "onAudioLevel">;
 
   constructor(config: AudioCaptureConfig) {
     this.config = {
-      bufferSize: 4096,
+      bufferSize: 2048,
       ...config,
     };
   }
@@ -78,10 +105,21 @@ export class AudioCapture {
       });
     }
 
-    // Create AudioContext at the target sample rate
-    this.audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+    // Create AudioContext at the target sample rate (fallback to native rate if constructor rejects option)
+    try {
+      this.audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+    } catch {
+      this.audioContext = new AudioContext();
+    }
 
-    // Connect: MediaStream → AudioSourceNode → ScriptProcessorNode → output (silent)
+    // CRITICAL: AudioContext created without direct user gesture starts suspended.
+    // In suspended state, the audio clock does NOT tick and onaudioprocess never fires.
+    if (this.audioContext.state === "suspended") {
+      await this.audioContext.resume();
+    }
+    console.log(`[AudioCapture] AudioContext state: ${this.audioContext.state}, rate: ${this.audioContext.sampleRate} Hz`);
+
+    // Connect: MediaStream → AudioSourceNode → ScriptProcessorNode → GainNode(0) → output
     this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
     this.processorNode = this.audioContext.createScriptProcessor(
       this.config.bufferSize,
@@ -89,22 +127,47 @@ export class AudioCapture {
       1  // output channels (mono)
     );
 
+    // Mute gain node prevents mic feedback loop through speakers while keeping graph running
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.gain.value = 0;
+
+    const nativeRate = this.audioContext.sampleRate;
+
     // Audio processing callback — runs at buffer boundary
     this.processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
       const channelData = event.inputBuffer.getChannelData(0);
-      // Clone the data before passing it to the callback
-      // (the Float32Array is backed by shared memory and may be reused)
-      const chunk = new Float32Array(channelData);
+
+      // Resample to 16 kHz if the system AudioContext is running at 44.1k/48k
+      const chunk = nativeRate === AUDIO_SAMPLE_RATE
+        ? new Float32Array(channelData)
+        : resampleBuffer(channelData, nativeRate, AUDIO_SAMPLE_RATE);
+
+      // Calculate RMS audio level
+      let sumSq = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        const s = chunk[i] ?? 0;
+        sumSq += s * s;
+      }
+      const rms = Math.sqrt(sumSq / chunk.length);
+
+      // Throttle audio level feedback to ~10 Hz (every 100ms)
+      const now = performance.now();
+      if (now - this.lastLevelEmitTime > 100) {
+        this.lastLevelEmitTime = now;
+        this.config.onAudioLevel?.(rms);
+      }
+
       this.config.onAudioData(chunk);
     };
 
     // Connect the graph
     this.sourceNode.connect(this.processorNode);
-    // Connect to destination to keep the graph active (silent output)
-    this.processorNode.connect(this.audioContext.destination);
+    this.processorNode.connect(this.gainNode);
+    this.gainNode.connect(this.audioContext.destination);
 
     console.log(
-      `[AudioCapture] Started. Sample rate: ${this.audioContext.sampleRate} Hz, ` +
+      `[AudioCapture] Started. Sample rate: ${this.audioContext.sampleRate} Hz ` +
+      `(${nativeRate === AUDIO_SAMPLE_RATE ? "native 16k" : "resampling to 16k"}), ` +
       `buffer: ${this.config.bufferSize} frames.`
     );
   }
@@ -117,6 +180,7 @@ export class AudioCapture {
     // Disconnect graph
     this.processorNode?.disconnect();
     this.sourceNode?.disconnect();
+    this.gainNode?.disconnect();
 
     // Release microphone (removes the browser indicator dot)
     this.stream?.getTracks().forEach((track) => track.stop());
@@ -126,6 +190,7 @@ export class AudioCapture {
 
     this.processorNode = null;
     this.sourceNode = null;
+    this.gainNode = null;
     this.stream = null;
     this.audioContext = null;
 
