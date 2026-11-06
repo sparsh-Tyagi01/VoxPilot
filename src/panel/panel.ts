@@ -4,12 +4,16 @@
  *
  * The panel provides the primary user interface:
  * - Live transcript display (aria-live for screen reader support)
+ * - Streaming LLM token display (FR-MODEL-03)
+ * - Model load progress bar (FR-MODEL-01)
  * - Plan preview with step progress
  * - Confirmation UI for R3/R4 risk actions
- * - Command history with undo buttons
+ * - Vault passphrase prompt (when vault is locked during fill_from_vault)
+ * - Command history with undo buttons (FR-HIST-01)
+ * - Macro recording trigger (FR-MACRO-01)
  * - Settings and privacy links
  *
- * SRS references: IR-UI-04; FR-HIST-01 to 03; Section 3.1 (Side panel)
+ * SRS references: IR-UI-04; FR-HIST-01 to 03; FR-MACRO-01; Section 3.1 (Side panel)
  *
  * Architecture: Panel communicates exclusively via chrome.runtime.sendMessage
  * to the Service Worker — it never touches the offscreen document or content
@@ -44,6 +48,190 @@ const btnHelp      = document.getElementById("btn-help") as HTMLButtonElement;
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let currentPlan: AgentPlan | null = null;
+
+// ─── Model Load Progress Bar ─────────────────────────────────────────────────
+
+/**
+ * Inject a model-load progress bar above the transcript box if not already present.
+ * Hidden by default; shown when MODEL_LOAD_PROGRESS messages arrive (FR-MODEL-01).
+ */
+function ensureProgressBar(): { bar: HTMLElement; fill: HTMLElement; label: HTMLElement } {
+  let bar  = document.getElementById("model-progress-bar");
+  let fill = document.getElementById("model-progress-fill");
+  let label = document.getElementById("model-progress-label");
+
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "model-progress-bar";
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", "0");
+    bar.setAttribute("aria-label", "Model loading progress");
+    bar.style.cssText = [
+      "display:none", "height:4px", "background:var(--border,#e5e7eb)",
+      "border-radius:2px", "overflow:hidden", "margin-bottom:8px",
+    ].join(";");
+
+    fill = document.createElement("div");
+    fill.id = "model-progress-fill";
+    fill.style.cssText = "height:100%;width:0%;background:var(--accent,#6366f1);transition:width 0.3s ease;";
+    bar.appendChild(fill);
+
+    label = document.createElement("div");
+    label.id = "model-progress-label";
+    label.setAttribute("aria-live", "polite");
+    label.style.cssText = "display:none;font-size:11px;color:var(--muted,#6b7280);text-align:center;margin-bottom:4px;";
+
+    // Insert before the transcript box
+    transcriptBox.parentElement?.insertBefore(bar, transcriptBox);
+    transcriptBox.parentElement?.insertBefore(label, transcriptBox);
+  }
+
+  return {
+    bar: bar as HTMLElement,
+    fill: fill as HTMLElement,
+    label: label as HTMLElement,
+  };
+}
+
+function showModelProgress(pct: number, phase: string, done: boolean): void {
+  const { bar, fill, label } = ensureProgressBar();
+  if (done) {
+    bar.style.display = "none";
+    label.style.display = "none";
+    return;
+  }
+  bar.style.display = "block";
+  label.style.display = "block";
+  fill.style.width = `${pct}%`;
+  bar.setAttribute("aria-valuenow", String(pct));
+  label.textContent = pct < 100
+    ? `${phase === "loading" ? "Loading" : "Downloading"} model… ${pct}%`
+    : "Model ready";
+}
+
+// ─── LLM Streaming Tokens ────────────────────────────────────────────────────
+
+/**
+ * Append a streaming LLM token to the transcript area.
+ * When the LLM is streaming its plan, we show partial tokens as "thinking…"
+ * feedback so the user knows the agent is working (FR-MODEL-03 latency UX).
+ */
+let streamingBuffer = "";
+
+function appendStreamingToken(token: string): void {
+  streamingBuffer += token;
+  // Show only first 120 chars of the streaming output to avoid UI clutter
+  const preview = streamingBuffer.length > 120
+    ? streamingBuffer.slice(0, 117) + "…"
+    : streamingBuffer;
+  transcriptBox.textContent = `🤔 Thinking: ${preview}`;
+  transcriptBox.classList.remove("empty");
+}
+
+function clearStreamingBuffer(): void {
+  streamingBuffer = "";
+}
+
+// ─── Vault Passphrase Prompt ─────────────────────────────────────────────────
+
+/**
+ * Show a passphrase input overlay so the user can unlock their vault.
+ * Called when SW sends VAULT_PASSPHRASE_REQUEST (vault is locked during fill).
+ */
+function showVaultPassphrasePrompt(requestId: string): void {
+  // Create overlay if not present
+  let overlay = document.getElementById("vault-prompt-overlay");
+  if (overlay) return; // Already showing
+
+  overlay = document.createElement("div");
+  overlay.id = "vault-prompt-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-labelledby", "vault-prompt-title");
+  overlay.style.cssText = [
+    "position:fixed", "inset:0", "background:rgba(0,0,0,.5)",
+    "display:flex", "align-items:center", "justify-content:center", "z-index:9999",
+  ].join(";");
+
+  const box = document.createElement("div");
+  box.style.cssText = [
+    "background:var(--surface,#fff)", "border-radius:12px", "padding:24px",
+    "width:260px", "box-shadow:0 8px 32px rgba(0,0,0,.2)",
+  ].join(";");
+
+  const title = document.createElement("h3");
+  title.id = "vault-prompt-title";
+  title.textContent = "🔐 Unlock Vault";
+  title.style.cssText = "margin:0 0 8px;font-size:16px;";
+
+  const desc = document.createElement("p");
+  desc.textContent = "Enter your vault passphrase to auto-fill this field.";
+  desc.style.cssText = "font-size:13px;color:var(--muted,#6b7280);margin:0 0 16px;";
+
+  const input = document.createElement("input");
+  input.type = "password";
+  input.placeholder = "Passphrase";
+  input.setAttribute("aria-label", "Vault passphrase");
+  input.style.cssText = "width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--border,#e5e7eb);border-radius:6px;font-size:14px;margin-bottom:12px;";
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.type = "button";
+  cancelBtn.style.cssText = "padding:8px 16px;border:1px solid var(--border,#e5e7eb);border-radius:6px;cursor:pointer;font-size:13px;";
+
+  const submitBtn = document.createElement("button");
+  submitBtn.textContent = "Unlock";
+  submitBtn.type = "button";
+  submitBtn.style.cssText = "padding:8px 16px;background:var(--accent,#6366f1);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;";
+
+  const errorEl = document.createElement("p");
+  errorEl.style.cssText = "color:#ef4444;font-size:12px;margin:8px 0 0;display:none;";
+  errorEl.textContent = "Wrong passphrase — try again.";
+
+  const handleSubmit = (): void => {
+    const passphrase = input.value.trim();
+    if (!passphrase) { input.focus(); return; }
+    errorEl.style.display = "none";
+
+    chrome.runtime.sendMessage({
+      type: "VAULT_PASSPHRASE_RESPONSE",
+      requestId,
+      passphrase,
+    }).catch(console.error);
+
+    overlay?.remove();
+  };
+
+  submitBtn.addEventListener("click", handleSubmit);
+  cancelBtn.addEventListener("click", () => overlay?.remove());
+  input.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter") handleSubmit(); });
+
+  // Listen for VAULT_UNLOCK_FAILED to show error
+  const failListener = (rawMsg: unknown): boolean => {
+    const m = rawMsg as { type?: string; requestId?: string };
+    if (m.type === "VAULT_UNLOCK_FAILED" && m.requestId === requestId) {
+      input.value = "";
+      errorEl.style.display = "block";
+      input.focus();
+      chrome.runtime.onMessage.removeListener(failListener);
+    }
+    return false;
+  };
+  chrome.runtime.onMessage.addListener(failListener);
+
+  btnRow.append(cancelBtn, submitBtn);
+  box.append(title, desc, input, btnRow, errorEl);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  // Focus the passphrase input (a11y: dialog focus management)
+  requestAnimationFrame(() => input.focus());
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -108,10 +296,18 @@ function hidePlan(): void {
   confirmBtns.hidden = true;
 }
 
-/** Add an entry to the history list. */
+/** Add an entry to the history list from a plan. */
 function addHistory(plan: AgentPlan): void {
   historyEmpty.hidden = true;
+  renderHistoryItem(plan.intent, plan.risk <= RiskTier.R2);
+}
 
+/**
+ * Render a history list item.
+ * @param intent  - Human-readable intent/command string.
+ * @param undoable - Whether to show the Undo button (R0-R2 only).
+ */
+function renderHistoryItem(intent: string, undoable: boolean): void {
   const item = document.createElement("div");
   item.className = "history-item";
   item.setAttribute("role", "listitem");
@@ -119,32 +315,31 @@ function addHistory(plan: AgentPlan): void {
   const textEl = document.createElement("div");
   textEl.className = "history-item-text";
   const strong = document.createElement("strong");
-  strong.textContent = plan.intent;
+  strong.textContent = intent.slice(0, 80);
   textEl.appendChild(strong);
-  textEl.append(` · R${plan.risk}`);
-
-  const undoBtn = document.createElement("button");
-  undoBtn.className = "btn-undo";
-  undoBtn.textContent = "Undo";
-  undoBtn.type = "button";
-  undoBtn.setAttribute("aria-label", `Undo: ${plan.intent}`);
-  undoBtn.addEventListener("click", () => {
-    chrome.runtime.sendMessage({ type: "UNDO_LAST_ACTION" }).catch(console.error);
-    item.remove();
-    if (historyList.querySelectorAll(".history-item").length === 0) {
-      historyEmpty.hidden = false;
-    }
-  });
 
   item.appendChild(textEl);
-  if (plan.risk <= RiskTier.R2) {
+
+  if (undoable) {
+    const undoBtn = document.createElement("button");
+    undoBtn.className = "btn-undo";
+    undoBtn.textContent = "Undo";
+    undoBtn.type = "button";
+    undoBtn.setAttribute("aria-label", `Undo: ${intent}`);
+    undoBtn.addEventListener("click", () => {
+      chrome.runtime.sendMessage({ type: "UNDO_LAST_ACTION" }).catch(console.error);
+      item.remove();
+      if (historyList.querySelectorAll(".history-item").length === 0) {
+        historyEmpty.hidden = false;
+      }
+    });
     item.appendChild(undoBtn);
   }
 
   // Prepend newest first
   historyList.insertBefore(item, historyList.firstChild);
 
-  // Cap at 20 entries
+  // Cap at 20 entries in the panel (full list is in persistent storage)
   const items = historyList.querySelectorAll(".history-item");
   if (items.length > 20) {
     items[items.length - 1]!.remove();
@@ -183,12 +378,14 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
     }
 
     case "TRANSCRIPT_UPDATE": {
+      clearStreamingBuffer();
       transcriptBox.textContent = msg.text;
       transcriptBox.classList.toggle("empty", !msg.text);
       break;
     }
 
     case "PLAN_READY": {
+      clearStreamingBuffer();
       showPlan(msg.plan);
       break;
     }
@@ -196,12 +393,43 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
     case "AGENT_STATE_CHANGED": {
       updateStatus(msg.state, msg.error);
       if (msg.state === AgentState.Listening || msg.state === AgentState.Idle) {
+        clearStreamingBuffer();
         hidePlan();
       }
       break;
     }
 
+    case "MODEL_LOAD_PROGRESS": {
+      // Show model download progress bar (FR-MODEL-01).
+      // msg.llm has { loaded, total } byte counts for the LLM model.
+      // msg.stt has { loaded, total } byte counts for the STT/Whisper model.
+      let pct = 0;
+      if (msg.llm && msg.llm.total > 0) {
+        // Show LLM progress (the larger download — typically 400 MB+)
+        pct = Math.round((msg.llm.loaded / msg.llm.total) * 100);
+      } else if (msg.stt && msg.stt.total > 0) {
+        pct = Math.round((msg.stt.loaded / msg.stt.total) * 100);
+      }
+      const phase = msg.llm ? "downloading" : "loading";
+      const done = pct >= 100;
+      showModelProgress(pct, phase, done);
+      break;
+    }
+
+    case "LLM_TOKEN": {
+      // Show streaming LLM tokens as "thinking" feedback (FR-MODEL-03)
+      appendStreamingToken(msg.delta);
+      break;
+    }
+
+    case "VAULT_PASSPHRASE_REQUEST": {
+      // Vault is locked — prompt user for passphrase (FR-VAULT-04)
+      showVaultPassphrasePrompt(msg.requestId);
+      break;
+    }
+
     case "EXECUTION_DONE": {
+      clearStreamingBuffer();
       if (currentPlan) {
         addHistory(currentPlan);
         hidePlan();
@@ -247,6 +475,31 @@ document.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.key === "Escape") btnCancel.click();
 });
 
+// ─── Audit Log: Populate History on Panel Open ───────────────────────────────
+
+/**
+ * Load the persistent audit log from SW and populate the history panel.
+ * Called once at init. The panel session also tracks in-session history
+ * via EXECUTION_DONE messages.
+ */
+async function loadAuditLog(): Promise<void> {
+  try {
+    const entries = await chrome.runtime.sendMessage({
+      type: "GET_AUDIT_LOG",
+      limit: 20,
+    }) as Array<{ intent: string; risk: number }>;
+
+    if (!Array.isArray(entries) || entries.length === 0) return;
+
+    historyEmpty.hidden = true;
+    for (const entry of entries) {
+      renderHistoryItem(entry.intent ?? "(unknown)", (entry.risk ?? 4) <= RiskTier.R2);
+    }
+  } catch {
+    // History unavailable — that's fine
+  }
+}
+
 // ─── Initialise ───────────────────────────────────────────────────────────────
 
 async function init(): Promise<void> {
@@ -267,6 +520,8 @@ async function init(): Promise<void> {
     // Service worker may not be ready yet
     updateStatus(AgentState.Idle);
   }
+
+  await loadAuditLog();
 }
 
 init().catch(console.error);

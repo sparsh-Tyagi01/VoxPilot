@@ -165,6 +165,38 @@ document.getElementById("btn-lock-vault")?.addEventListener("click", () => {
   vaultFieldsList.innerHTML = "";
 });
 
+// ─── Change Passphrase (FR-VAULT-05) ─────────────────────────────────────────
+
+document.getElementById("btn-change-passphrase")?.addEventListener("click", async () => {
+  if (!vault.isUnlocked) {
+    window.alert("Please unlock the vault first.");
+    return;
+  }
+
+  const currentPass = window.prompt("Enter your CURRENT passphrase:");
+  if (currentPass === null) return; // User cancelled
+
+  const newPass = window.prompt("Enter a NEW passphrase (at least 12 characters recommended):");
+  if (newPass === null) return;
+  if (newPass.length < 8) {
+    window.alert("Passphrase must be at least 8 characters.");
+    return;
+  }
+
+  const confirm = window.prompt("Confirm your NEW passphrase:");
+  if (confirm !== newPass) {
+    window.alert("Passphrases do not match. Please try again.");
+    return;
+  }
+
+  const ok = await vault.changePassphrase(currentPass, newPass);
+  if (ok) {
+    window.alert("✓ Passphrase changed successfully. Your vault has been re-encrypted.");
+  } else {
+    window.alert("❌ Incorrect current passphrase. Passphrase not changed.");
+  }
+});
+
 function renderVaultFields(): void {
   vaultFieldsList.innerHTML = "";
 

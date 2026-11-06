@@ -107,9 +107,9 @@ downloadBtn.addEventListener("click", async () => {
       profile: selectedProfile,
     });
 
-    // Poll for progress (SW will send MODEL_DOWNLOAD_PROGRESS messages)
-    // For now, simulate progress (TODO: wire real progress from model store)
-    await simulateDownload();
+    // Listen for real MODEL_LOAD_PROGRESS messages from the service worker.
+    // Falls back to simulated progress if models are already cached.
+    await waitForModelDownload();
 
     await chrome.storage.local.set({
       onboarding_complete: true,
@@ -127,10 +127,69 @@ downloadBtn.addEventListener("click", async () => {
 
 document.getElementById("btn-step2-back")?.addEventListener("click", () => goToStep(1));
 
-/** Simulated download progress (placeholder until real model download is wired). */
+/**
+ * Wait for model download to complete via real MODEL_LOAD_PROGRESS messages.
+ *
+ * The service worker forwards MODEL_LOAD_PROGRESS messages (originating from
+ * offscreen LLM/STT workers) to all extension pages including onboarding.
+ * Falls back to simulated progress after 2 s if no real messages arrive.
+ */
+function waitForModelDownload(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let receivedRealProgress = false;
+
+    // 2-second grace period — fall back to simulation for cached models
+    const fallbackTimer = setTimeout(async () => {
+      if (!receivedRealProgress) {
+        chrome.runtime.onMessage.removeListener(progressListener);
+        await simulateDownload();
+        resolve();
+      }
+    }, 2_000);
+
+    // 10-minute safety timeout for large model downloads on slow connections
+    const timeoutTimer = setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(progressListener);
+      clearTimeout(fallbackTimer);
+      reject(new Error("Model download timed out after 10 minutes"));
+    }, 10 * 60 * 1_000);
+
+    const progressListener = (msg: unknown): boolean => {
+      if (typeof msg !== "object" || msg === null) return false;
+      const m = msg as Record<string, unknown>;
+
+      if (m["type"] === "MODEL_LOAD_PROGRESS") {
+        receivedRealProgress = true;
+        clearTimeout(fallbackTimer);
+
+        const pct = typeof m["progress"] === "number" ? Math.round(m["progress"] * 100) : 0;
+        const phase = String(m["phase"] ?? "downloading");
+
+        progressFill.style.width = `${pct}%`;
+        progressFill.setAttribute("aria-valuenow", String(pct));
+        downloadStatus.textContent =
+          `${phase === "loading" ? "Loading" : "Downloading"} models… ${pct}%`;
+
+        if (m["done"] === true || pct >= 100) {
+          clearTimeout(timeoutTimer);
+          chrome.runtime.onMessage.removeListener(progressListener);
+          downloadStatus.textContent = "✓ Models ready!";
+          downloadStatus.style.color = "#10b981";
+          resolve();
+        }
+      }
+      return false;
+    };
+
+    chrome.runtime.onMessage.addListener(progressListener);
+  });
+}
+
+/** Simulated download progress (fallback for cached/fast model loads). */
 async function simulateDownload(): Promise<void> {
   for (let pct = 0; pct <= 100; pct += 5) {
     progressFill.style.width = `${pct}%`;
+    progressFill.setAttribute("aria-valuenow", String(pct));
     downloadStatus.textContent = `Downloading models… ${pct}%`;
     await sleep(80);
   }
