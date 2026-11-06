@@ -27,7 +27,9 @@ import {
 } from "@shared/constants.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 import { AgentState } from "@shared/types.js";
-import type { SessionState } from "@shared/types.js";
+import type { SessionState, AgentPlan } from "@shared/types.js";
+import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
+import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -278,9 +280,28 @@ async function handleMessage(
     }
 
     case "TRIGGER_MACRO": {
-      // TODO: Load macro from storage and execute its plan
-      console.warn("[SW] Macro trigger not yet implemented.");
-      sendResponse({ ok: false, error: "Macros not yet implemented" });
+      const macros = await loadMacros();
+      const macro = macros.find(m => m.id === msg.macroId);
+      if (!macro) {
+        sendResponse({ ok: false, error: `Macro "${msg.macroId}" not found` });
+        break;
+      }
+      macro.useCount++;
+      await saveMacros(macros);
+      const macroState = await getSessionState();
+      if (macroState.activeTabId !== null) {
+        const macroPlan: AgentPlan = {
+          intent: `Run macro: ${macro.name}`,
+          risk: 1,
+          requiresConfirmation: false,
+          actions: macro.actions,
+        };
+        await sendToContentScript(macroState.activeTabId, {
+          type: "EXECUTE_IN_PAGE",
+          plan: macroPlan,
+        });
+      }
+      sendResponse({ ok: true });
       break;
     }
 
@@ -385,8 +406,19 @@ async function handleMessage(
 
     // ── Content Script → SW ────────────────────────────────────────────────
     case "EXECUTION_DONE": {
+      const doneState = await getSessionState();
+      // Record to history (opt-in)
+      await appendHistory({
+        id: generateHistoryId(),
+        timestamp: new Date().toISOString(),
+        transcript: doneState.lastTranscript,
+        plan: doneState.currentPlan,
+        success: msg.success,
+        ...(msg.error !== undefined ? { error: msg.error } : {}),
+      }).catch(() => {}); // history write failure is non-fatal
+
       if (msg.success) {
-        await updateSessionState({ agentState: AgentState.Listening });
+        await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
       } else {
         const { errorCount } = await getSessionState();
         await updateSessionState({
@@ -414,6 +446,73 @@ async function handleMessage(
       } else {
         await handleMessage({ type: "CANCEL_PLAN" }, sender, sendResponse);
       }
+      break;
+    }
+
+    case "SAVE_MACRO": {
+      const macros = await loadMacros();
+      if (macros.length >= 50) {
+        sendResponse({ ok: false, error: "Maximum 50 macros reached" });
+        break;
+      }
+      const newMacro = {
+        id: generateMacroId(),
+        name: msg.name,
+        triggerWords: deriveTriggerWords(msg.name),
+        actions: msg.actions,
+        createdAt: new Date().toISOString(),
+        useCount: 0,
+      };
+      macros.push(newMacro);
+      await saveMacros(macros);
+      sendResponse({ ok: true, macro: newMacro });
+      break;
+    }
+
+    case "DELETE_MACRO": {
+      const macros = await loadMacros();
+      const updated = macros.filter(m => m.id !== msg.macroId);
+      await saveMacros(updated);
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "GET_MACROS": {
+      const macros = await loadMacros();
+      sendResponse({ ok: true, macros });
+      break;
+    }
+
+    case "CLEAR_HISTORY": {
+      await clearHistory();
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "AGENT_STATE_CHANGED": {
+      await updateSessionState({ agentState: msg.state });
+      broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: msg.state });
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "MODEL_LOAD_PROGRESS": {
+      // Forward model download progress to panel
+      broadcastToPanel(msg);
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "LLM_TOKEN": {
+      // Forward streaming token to panel
+      broadcastToPanel(msg);
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "GET_AUDIT_LOG": {
+      const entries = await loadHistory();
+      sendResponse(entries.slice(0, msg.limit ?? 50));
       break;
     }
 

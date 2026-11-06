@@ -290,6 +290,29 @@ export interface GetAuditLogMsg extends BaseMessage {
   limit?: number;
 }
 
+/** Panel requests to save a new macro. */
+export interface SaveMacroMsg extends BaseMessage {
+  type: "SAVE_MACRO";
+  name: string;
+  actions: import("./types.js").AgentAction[];
+}
+
+/** Panel requests to delete a macro by ID. */
+export interface DeleteMacroMsg extends BaseMessage {
+  type: "DELETE_MACRO";
+  macroId: string;
+}
+
+/** Panel requests the full macro list. */
+export interface GetMacrosMsg extends BaseMessage {
+  type: "GET_MACROS";
+}
+
+/** Panel requests history clear. */
+export interface ClearHistoryMsg extends BaseMessage {
+  type: "CLEAR_HISTORY";
+}
+
 /** SW responds with audit log. */
 export interface AuditLogResponseMsg extends BaseMessage {
   type: "AUDIT_LOG_RESPONSE";
@@ -346,7 +369,11 @@ export type VoxPilotMessage =
   | InPageConfirmMsg
   /* Audit */
   | GetAuditLogMsg
-  | AuditLogResponseMsg;
+  | AuditLogResponseMsg
+  | SaveMacroMsg
+  | DeleteMacroMsg
+  | GetMacrosMsg
+  | ClearHistoryMsg;
 
 /** Utility: extract a message type by its `type` discriminant. */
 export type MessageByType<T extends VoxPilotMessage["type"]> = Extract<
