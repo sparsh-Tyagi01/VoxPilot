@@ -223,7 +223,7 @@ export class AgentCore {
    * Transitions to Transcribing state. Implements barge-in (SRS FR-VOICE-03).
    */
   onSpeechStart(): void {
-    if (this.state !== AgentState.Listening) return;
+    if (this.state !== AgentState.Listening && this.state !== AgentState.Idle) return;
     this.transitionTo(AgentState.Transcribing);
 
     // Barge-in: interrupt TTS if currently speaking (FR-VOICE-03)
@@ -242,6 +242,9 @@ export class AgentCore {
     this.killRequested = false;
 
     try {
+      // Await STT worker readiness if model is still downloading
+      await this.sttReady;
+
       // ── Step 1: Transcribe ───────────────────────────────────────────────
       const transcript = await this.transcribe(audio);
       if (this.killRequested) { this.handleKill(); return; }

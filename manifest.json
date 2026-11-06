@@ -8,6 +8,7 @@
   "permissions": [
     "offscreen",
     "activeTab",
+    "tabs",
     "scripting",
     "storage",
     "unlimitedStorage",
@@ -15,7 +16,7 @@
     "alarms"
   ],
 
-  "optional_permissions": ["tabs", "debugger"],
+  "optional_permissions": ["debugger"],
 
   "optional_host_permissions": ["https://*/*", "http://*/*"],
 

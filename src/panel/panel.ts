@@ -402,6 +402,9 @@ function stopPanelAudioCapture(): void {
   if (audioMeterStatus) audioMeterStatus.classList.remove("speech");
 }
 
+let lastDispatchedSpoken = "";
+let lastDispatchedTime = 0;
+
 function startWebSpeech(): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -434,14 +437,25 @@ function startWebSpeech(): void {
         transcriptBox.textContent = spoken;
         transcriptBox.classList.remove("empty");
         updateAudioMeter(0.3, true);
-      }
 
-      if (final.trim()) {
-        console.log(`[Panel WebSpeech] Final transcript: "${final.trim()}"`);
-        chrome.runtime.sendMessage({
-          type: "DIRECT_TRANSCRIPT",
-          text: final.trim(),
-        }).catch(console.error);
+        // Normalize spoken text
+        const clean = spoken.toLowerCase().replace(/[.,!?;:]+$/g, "").trim();
+
+        // Recognize fast-path commands immediately without waiting for isFinal
+        const isFastCommand = /^(?:can\s+you\s+|please\s+)?(?:scroll\s+(?:down|up|to\s+top|to\s+bottom)|scroll|go\s+(?:down|up)|page\s+(?:down|up)|stop|abort|cancel|undo|zoom\s+(?:in|out)|reload|refresh|new\s+tab|close\s+tab)(?:\s+(?:a\s+)?(?:bit|little))?(?:\s+please)?$/i.test(clean);
+
+        const shouldDispatch = Boolean(final.trim()) || isFastCommand;
+        const now = Date.now();
+
+        if (shouldDispatch && clean !== lastDispatchedSpoken && (now - lastDispatchedTime > 1200)) {
+          lastDispatchedSpoken = clean;
+          lastDispatchedTime = now;
+          console.log(`[Panel WebSpeech] Dispatching recognized command: "${spoken}" (isFinal=${Boolean(final.trim())})`);
+          chrome.runtime.sendMessage({
+            type: "DIRECT_TRANSCRIPT",
+            text: spoken,
+          }).catch(console.error);
+        }
       }
     };
 

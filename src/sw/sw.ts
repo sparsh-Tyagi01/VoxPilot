@@ -114,6 +114,94 @@ async function relayToOffscreen(msg: VoxPilotMessage): Promise<void> {
   });
 }
 
+function isInternalUrl(url?: string): boolean {
+  if (!url) return false;
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("devtools://")
+  );
+}
+
+async function getTargetTab(): Promise<chrome.tabs.Tab | null> {
+  // 1. Try active tab in last focused window (the browser window behind the side panel)
+  const tabsInLastFocused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  for (const t of tabsInLastFocused) {
+    if (t.id && !isInternalUrl(t.url)) return t;
+  }
+
+  // 2. Try active tab in current window
+  const tabsCurrent = await chrome.tabs.query({ active: true, currentWindow: true });
+  for (const t of tabsCurrent) {
+    if (t.id && !isInternalUrl(t.url)) return t;
+  }
+
+  // 3. Fallback to any active tab across all windows
+  const anyTabs = await chrome.tabs.query({ active: true });
+  for (const t of anyTabs) {
+    if (t.id && !isInternalUrl(t.url)) return t;
+  }
+
+  return tabsInLastFocused[0] ?? tabsCurrent[0] ?? anyTabs[0] ?? null;
+}
+
+/**
+ * Execute plan actions in the target tab. First attempts execution via the
+ * page content script; if unavailable or unmounted, falls back to direct
+ * chrome.scripting.executeScript to guarantee immediate execution.
+ */
+async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void> {
+  let executedInContent = false;
+  try {
+    const res = await sendToContentScript(tabId, {
+      type: "EXECUTE_IN_PAGE",
+      plan,
+    });
+    if (res && (res as any).success) {
+      executedInContent = true;
+    }
+  } catch (err: unknown) {
+    console.warn("[SW] Content script execution failed, falling back to direct chrome.scripting:", err);
+  }
+
+  if (!executedInContent) {
+    for (const action of plan.actions) {
+      if (action.type === "scroll") {
+        const direction = action.direction;
+        const amount = action.amount ?? 400;
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (dir: string, amt: number) => {
+            const y = dir === "up" ? -amt : dir === "down" ? amt : 0;
+            const x = dir === "left" ? -amt : dir === "right" ? amt : 0;
+            window.scrollBy({ left: x, top: y, behavior: "smooth" });
+            if (document.scrollingElement && typeof document.scrollingElement.scrollBy === "function") {
+              document.scrollingElement.scrollBy({ left: x, top: y, behavior: "smooth" });
+            } else if (document.documentElement && typeof document.documentElement.scrollBy === "function") {
+              document.documentElement.scrollBy({ left: x, top: y, behavior: "smooth" });
+            } else if (document.body && typeof document.body.scrollBy === "function") {
+              document.body.scrollBy({ left: x, top: y, behavior: "smooth" });
+            }
+          },
+          args: [direction, amount],
+        }).catch((e: unknown) => console.error("[SW] Direct scroll script failed:", e));
+      } else if (action.type === "navigate") {
+        if (action.url.startsWith("javascript:history.back")) {
+          await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.back() }).catch(() => {});
+        } else if (action.url.startsWith("javascript:history.forward")) {
+          await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.forward() }).catch(() => {});
+        } else if (action.url.startsWith("javascript:location.reload")) {
+          await chrome.tabs.reload(tabId).catch(() => {});
+        } else {
+          await chrome.tabs.update(tabId, { url: action.url }).catch(console.error);
+        }
+      }
+    }
+  }
+}
+
 /**
  * Dispatch an AgentPlan to the appropriate tab or overlay.
  */
@@ -127,19 +215,10 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
 
   broadcastToPanel({ type: "PLAN_READY", plan });
 
-  // Target the user's currently focused tab if available, else session activeTabId
-  const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const targetTabId = currentTab?.id ?? state.activeTabId;
+  const targetTab = await getTargetTab();
+  const targetTabId = targetTab?.id ?? state.activeTabId;
 
-  // Check if the current tab is an internal browser page (chrome://) where extensions cannot run
-  const isInternal = currentTab?.url && (
-    currentTab.url.startsWith("chrome://") ||
-    currentTab.url.startsWith("chrome-extension://") ||
-    currentTab.url.startsWith("edge://") ||
-    currentTab.url.startsWith("about:")
-  );
-
-  if (isInternal) {
+  if (targetTab?.url && isInternalUrl(targetTab.url)) {
     broadcastToPanel({
       type: "AGENT_STATE_CHANGED",
       state: AgentState.Listening,
@@ -152,22 +231,22 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
     return false;
   }
 
+  if (targetTabId === null) {
+    console.warn("[SW] No valid target tab found for plan execution.");
+    return false;
+  }
+
   // If confirmation required, show overlay in content script
-  if (plan.requiresConfirmation && targetTabId !== null) {
+  if (plan.requiresConfirmation) {
     await sendToContentScript(targetTabId, {
       type: "SHOW_CONFIRMATION",
       plan,
     }).catch((err: unknown) => {
       console.error("[SW] Failed to show confirmation overlay:", err);
     });
-  } else if (!plan.requiresConfirmation && targetTabId !== null) {
+  } else {
     // Auto-execute low-risk plans
-    await sendToContentScript(targetTabId, {
-      type: "EXECUTE_IN_PAGE",
-      plan,
-    }).catch((err: unknown) => {
-      console.error("[SW] Failed to relay plan to content script:", err);
-    });
+    await executePlanActions(targetTabId, plan);
   }
 
   return true;
