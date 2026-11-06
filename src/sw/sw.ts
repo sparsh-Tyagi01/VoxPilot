@@ -167,20 +167,48 @@ async function sendToContentScript(
   tabId: number,
   msg: VoxPilotMessage
 ): Promise<VoxPilotMessage | null> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`Content script in tab ${tabId} did not respond within ${CONTENT_SCRIPT_TIMEOUT_MS}ms`));
-    }, CONTENT_SCRIPT_TIMEOUT_MS);
+  const trySend = (): Promise<VoxPilotMessage | null> => {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Content script in tab ${tabId} did not respond within ${CONTENT_SCRIPT_TIMEOUT_MS}ms`));
+      }, CONTENT_SCRIPT_TIMEOUT_MS);
 
-    chrome.tabs.sendMessage(tabId, msg, (response: VoxPilotMessage | null) => {
-      clearTimeout(timer);
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(response);
-      }
+      chrome.tabs.sendMessage(tabId, msg, (response: VoxPilotMessage | null) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
     });
-  });
+  };
+
+  try {
+    return await trySend();
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    if (errorMsg.includes("Receiving end does not exist") || errorMsg.includes("Could not establish connection")) {
+      // Content script not yet injected into this tab (e.g., opened before extension reload)
+      const manifest = chrome.runtime.getManifest();
+      const files = manifest.content_scripts?.[0]?.js;
+      if (files && files.length > 0) {
+        try {
+          console.log(`[SW] On-demand injecting content script into tab ${tabId}...`);
+          await chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            files,
+          });
+          // Allow content script a brief tick to mount its onMessage listener
+          await new Promise((r) => setTimeout(r, 150));
+          return await trySend();
+        } catch (injectErr: unknown) {
+          console.warn("[SW] Dynamic script injection skipped or failed:", injectErr);
+        }
+      }
+    }
+    throw err;
+  }
 }
 
 // ─── Listening Toggle ─────────────────────────────────────────────────────────
@@ -342,17 +370,43 @@ async function handleMessage(
 
       broadcastToPanel({ type: "PLAN_READY", plan: msg.plan });
 
+      // Target the user's currently focused tab if available, else session activeTabId
+      const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const targetTabId = currentTab?.id ?? state.activeTabId;
+
+      // Check if the current tab is an internal browser page (chrome://) where extensions cannot run
+      const isInternal = currentTab?.url && (
+        currentTab.url.startsWith("chrome://") ||
+        currentTab.url.startsWith("chrome-extension://") ||
+        currentTab.url.startsWith("edge://") ||
+        currentTab.url.startsWith("about:")
+      );
+
+      if (isInternal) {
+        broadcastToPanel({
+          type: "AGENT_STATE_CHANGED",
+          state: AgentState.Listening,
+          error: "Browser system pages (chrome://) cannot be scripted. Please test on any regular webpage.",
+        });
+        await relayToOffscreen({
+          type: "SPEAK",
+          text: "Browser internal pages cannot be controlled. Please test on a regular webpage.",
+        });
+        sendResponse({ ok: false, error: "Cannot control browser internal pages" });
+        break;
+      }
+
       // If confirmation required, show overlay in content script
-      if (msg.plan.requiresConfirmation && state.activeTabId !== null) {
-        await sendToContentScript(state.activeTabId, {
+      if (msg.plan.requiresConfirmation && targetTabId !== null) {
+        await sendToContentScript(targetTabId, {
           type: "SHOW_CONFIRMATION",
           plan: msg.plan,
         }).catch((err: unknown) => {
           console.error("[SW] Failed to show confirmation overlay:", err);
         });
-      } else if (!msg.plan.requiresConfirmation && state.activeTabId !== null) {
+      } else if (!msg.plan.requiresConfirmation && targetTabId !== null) {
         // Auto-execute low-risk plans
-        await sendToContentScript(state.activeTabId, {
+        await sendToContentScript(targetTabId, {
           type: "EXECUTE_IN_PAGE",
           plan: msg.plan,
         }).catch((err: unknown) => {
@@ -367,7 +421,12 @@ async function handleMessage(
     case "REQUEST_SNAPSHOT": {
       // Relay snapshot request to content script, then forward response to offscreen
       try {
-        const response = await sendToContentScript(msg.tabId, {
+        const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const targetTabId = (msg.tabId && msg.tabId > 0) ? msg.tabId : currentTab?.id;
+        if (!targetTabId) {
+          throw new Error("No active tab found for snapshot");
+        }
+        const response = await sendToContentScript(targetTabId, {
           type: "CAPTURE_SNAPSHOT",
         });
         if (response?.type === "SNAPSHOT_RESPONSE") {

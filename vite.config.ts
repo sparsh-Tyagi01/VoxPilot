@@ -61,6 +61,8 @@ export default defineConfig({
      */
     rollupOptions: {
       input: {
+        offscreen: "src/offscreen/offscreen.html",
+        panel: "src/panel/panel.html",
         onboarding: "src/onboarding/onboarding.html",
         settings: "src/settings/settings.html",
       },

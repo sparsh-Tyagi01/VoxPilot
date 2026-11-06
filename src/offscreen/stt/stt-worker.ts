@@ -110,8 +110,7 @@ async function loadModel(modelId: string): Promise<void> {
   };
 
   try {
-    // Try WebGPU first (fastest), fall back to WASM.
-    // @huggingface/transformers v3 supports `device` as a string.
+    // Try WebGPU first (fastest), fall back to WASM q8, then default.
     asr = await pipeline("automatic-speech-recognition", modelId, {
       dtype: "q8" as "q8",
       device: "webgpu" as "webgpu",
@@ -122,6 +121,12 @@ async function loadModel(modelId: string): Promise<void> {
         dtype: "q8" as "q8",
         device: "wasm" as "wasm",
         progress_callback: progressCallback,
+      }).catch(async (wasmErr: unknown) => {
+        console.warn("[STT Worker] WASM q8 failed, trying standard WASM pipeline:", wasmErr);
+        return pipeline("automatic-speech-recognition", modelId, {
+          device: "wasm" as "wasm",
+          progress_callback: progressCallback,
+        });
       });
     });
 

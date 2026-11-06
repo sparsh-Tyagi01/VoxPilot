@@ -59,17 +59,24 @@ export class AudioCapture {
       return;
     }
 
-    // Request microphone with privacy-preserving audio processing
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,          // Mono — Whisper expects mono
-        sampleRate: AUDIO_SAMPLE_RATE, // 16 kHz — Whisper's native sample rate
-        echoCancellation: true,   // Prevents TTS audio feedback
-        noiseSuppression: true,   // Reduces background noise for STT
-        autoGainControl: true,    // Normalizes microphone gain
-      },
-      video: false,
-    });
+    // Request microphone with fallback for OS compatibility
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+    } catch {
+      // Fallback with basic audio constraint (e.g. if hardware rejects advanced constraints)
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+    }
 
     // Create AudioContext at the target sample rate
     this.audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });

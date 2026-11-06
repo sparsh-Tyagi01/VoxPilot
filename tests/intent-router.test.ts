@@ -6,9 +6,10 @@ describe("IntentRouter", () => {
   const router = new IntentRouter();
 
   describe("Kill Switch Detection (FR-SAFE-04)", () => {
-    it("identifies direct kill commands", () => {
+    it("identifies direct kill commands, including with punctuation", () => {
       expect(router.isKillCommand("stop")).toBe(true);
-      expect(router.isKillCommand("STOP")).toBe(true);
+      expect(router.isKillCommand("stop.")).toBe(true);
+      expect(router.isKillCommand("STOP!")).toBe(true);
       expect(router.isKillCommand("abort")).toBe(true);
       expect(router.isKillCommand("cancel")).toBe(true);
       expect(router.isKillCommand("quit")).toBe(true);
@@ -43,9 +44,15 @@ describe("IntentRouter", () => {
   });
 
   describe("Fast-Path Intent Routing", () => {
-    it("routes scroll-down commands", () => {
+    it("routes scroll-down commands (with variations and punctuation)", () => {
+      expect(router.route("scroll down")).not.toBeNull();
+      expect(router.route("Scroll down.")).not.toBeNull();
+      expect(router.route("scroll down please")).not.toBeNull();
+      expect(router.route("can you scroll down?")).not.toBeNull();
+      expect(router.route("page down")).not.toBeNull();
+      expect(router.route("scroll down a bit")).not.toBeNull();
+
       const plan = router.route("scroll down");
-      expect(plan).not.toBeNull();
       expect(plan?.intent).toContain("Scroll down");
       expect(plan?.risk).toBe(RiskTier.R0);
       expect(plan?.actions[0]?.type).toBe("scroll");

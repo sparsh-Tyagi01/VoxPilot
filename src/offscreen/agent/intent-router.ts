@@ -32,6 +32,14 @@ interface IntentPattern {
   planFactory: (match: RegExpMatchArray) => AgentPlan | null;
 }
 
+function normalizeTranscript(transcript: string): string {
+  return transcript
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?;:]+$/g, "")
+    .trim();
+}
+
 /**
  * IntentRouter tries to match a transcript against a set of fast-path patterns.
  * Returns null if no pattern matches (indicating LLM planning is needed).
@@ -53,7 +61,7 @@ export class IntentRouter {
    * Returns true for: stop, abort, cancel, quit, exit, never mind, etc.
    */
   isKillCommand(transcript: string): boolean {
-    const normalised = transcript.trim().toLowerCase();
+    const normalised = normalizeTranscript(transcript);
     return /^(?:stop|abort|cancel|quit|exit|never\s*mind|stop\s+that|stop\s+it)$/.test(normalised);
   }
 
@@ -62,12 +70,12 @@ export class IntentRouter {
    * Returns true for: undo, undo that, undo last action, revert, etc.
    */
   isUndoCommand(transcript: string): boolean {
-    const normalised = transcript.trim().toLowerCase();
+    const normalised = normalizeTranscript(transcript);
     return /^(?:please\s+)?(?:undo|undo\s+that|undo\s+last\s+action|revert|revert\s+that)$/.test(normalised);
   }
 
   route(transcript: string): AgentPlan | null {
-    const normalized = transcript.trim().toLowerCase();
+    const normalized = normalizeTranscript(transcript);
 
     for (const { name, pattern, planFactory } of this.patterns) {
       const match = normalized.match(pattern);
@@ -93,7 +101,7 @@ export class IntentRouter {
       // ── Scroll ─────────────────────────────────────────────────────────────
       {
         name: "scroll-down",
-        pattern: /^(?:please\s+)?scroll\s+(?:down|page\s+down)(?:\s+a\s+(?:bit|little))?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+down|scroll|go\s+down|page\s+down)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
         planFactory: () => ({
           intent: "Scroll down the page",
           risk: RiskTier.R0,
@@ -106,7 +114,7 @@ export class IntentRouter {
       },
       {
         name: "scroll-up",
-        pattern: /^(?:please\s+)?scroll\s+(?:up|page\s+up)(?:\s+a\s+(?:bit|little))?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+up|go\s+up|page\s+up)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
         planFactory: () => ({
           intent: "Scroll up the page",
           risk: RiskTier.R0,

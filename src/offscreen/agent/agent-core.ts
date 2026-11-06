@@ -185,23 +185,32 @@ export class AgentCore {
       llm: { loaded: 0, total: 100, text: "Starting…" },
     } as any);
 
-    // Await both workers becoming ready.
-    // We don't block the offscreen startup on this — the pipeline is unusable
-    // until both are ready, but other messages (KEEPALIVE, etc.) can still land.
-    Promise.all([this.sttReady, this.llmReady])
+    // Transition to Listening as soon as STT worker is ready (Whisper loaded).
+    // Fast-path commands ("scroll down", "click", "back", "stop", "undo") only need STT
+    // and can execute immediately without waiting for the large LLM to download/compile.
+    this.sttReady
       .then(async () => {
-        console.log("[AgentCore] Both workers ready — transitioning to Listening.");
+        console.log("[AgentCore] STT ready — transitioning to Listening.");
         this.transitionTo(AgentState.Listening);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
       })
       .catch((err: unknown) => {
-        console.error("[AgentCore] Worker initialization failed:", err);
+        console.error("[AgentCore] STT worker initialization failed:", err);
         this.transitionTo(AgentState.Error);
         void sendToSW({
           type: "OFFSCREEN_ERROR",
           source: "agent",
-          message: `Worker init failed: ${err instanceof Error ? err.message : String(err)}`,
+          message: `STT init failed: ${err instanceof Error ? err.message : String(err)}`,
         });
+      });
+
+    // LLM loads in background for complex multi-step planning
+    this.llmReady
+      .then(() => {
+        console.log("[AgentCore] LLM worker ready for complex planning.");
+      })
+      .catch((err: unknown) => {
+        console.warn("[AgentCore] LLM worker unavailable (fast-path commands still functional):", err);
       });
 
     console.log("[AgentCore] Workers spawned — model loading in progress.");
@@ -277,6 +286,9 @@ export class AgentCore {
         // ── Step 4: LLM Planning ───────────────────────────────────────────
         this.transitionTo(AgentState.Planning);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Planning });
+
+        // Ensure LLM model has finished loading before attempting inference
+        await this.llmReady;
 
         // Request a fresh page snapshot
         const tabId = await this.getActiveTabId();

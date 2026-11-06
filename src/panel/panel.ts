@@ -407,17 +407,21 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
 
     case "MODEL_LOAD_PROGRESS": {
       // Show model download progress bar (FR-MODEL-01).
-      // msg.llm has { loaded, total } byte counts for the LLM model.
-      // msg.stt has { loaded, total } byte counts for the STT/Whisper model.
       let pct = 0;
-      if (msg.llm && msg.llm.total > 0) {
-        // Show LLM progress (the larger download — typically 400 MB+)
-        pct = Math.round((msg.llm.loaded / msg.llm.total) * 100);
-      } else if (msg.stt && msg.stt.total > 0) {
+      let phase = "Loading speech model";
+
+      if (msg.stt && msg.stt.total > 0 && msg.stt.loaded < msg.stt.total) {
         pct = Math.round((msg.stt.loaded / msg.stt.total) * 100);
+        phase = "Downloading speech model";
+      } else if (msg.llm && msg.llm.total > 0 && msg.llm.loaded < msg.llm.total) {
+        pct = Math.round((msg.llm.loaded / msg.llm.total) * 100);
+        phase = "Downloading AI planner";
+      } else if (msg.stt && msg.stt.total > 0) {
+        pct = 100;
+        phase = "Speech ready";
       }
-      const phase = msg.llm ? "downloading" : "loading";
-      const done = pct >= 100;
+
+      const done = pct >= 100 && (!msg.llm || msg.llm.loaded >= msg.llm.total);
       showModelProgress(pct, phase, done);
       break;
     }
@@ -447,7 +451,14 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
 
 // ─── Button Handlers ──────────────────────────────────────────────────────────
 
-toggleBtn.addEventListener("click", () => {
+toggleBtn.addEventListener("click", async () => {
+  // Chrome MV3 requirement: request microphone permission from a visible page first
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+  } catch (err: unknown) {
+    console.warn("[Panel] Microphone permission prompt was denied or dismissed:", err);
+  }
   chrome.runtime.sendMessage({ type: "TOGGLE_LISTENING" }).catch(console.error);
 });
 

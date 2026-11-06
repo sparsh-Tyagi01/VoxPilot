@@ -83,8 +83,9 @@ export class VAD {
 
   constructor(config: VADConfig) {
     this.config = {
-      speechThreshold: 0.012,
-      silenceThreshold: 0.006,
+      // Calibrated for standard laptop and headset microphones
+      speechThreshold: 0.007,
+      silenceThreshold: 0.003,
       ...config,
     };
   }
