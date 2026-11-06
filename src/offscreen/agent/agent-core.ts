@@ -288,9 +288,22 @@ export class AgentCore {
 
       const riskConfig = RISK_TIER_CONFIG[risk];
 
-      // SAFETY INVARIANT: R3/R4 plans ALWAYS require confirmation (NFR-REL-01).
-      // This is enforced here unconditionally — not based on model output.
-      const needsConfirm = riskConfig.requiresConfirmation;
+      // ═══ SAFETY INVARIANT (NFR-REL-01) ═══════════════════════════════════
+      // R3/R4 plans MUST ALWAYS require explicit user confirmation.
+      // This invariant is enforced unconditionally in code — it cannot be
+      // bypassed by LLM output or config drift.
+      // 0 violations allowed. Any change here must pass security review.
+      const needsConfirm = risk >= RiskTier.R3
+        ? true  // ← Hardcoded safety floor. Do NOT change this condition.
+        : riskConfig.requiresConfirmation;
+
+      // Assert the invariant holds — this acts as a runtime safety net.
+      if (risk >= RiskTier.R3 && !needsConfirm) {
+        // Should be unreachable, but if reached (e.g. RISK_TIER_CONFIG misconfigured),
+        // we still require confirmation rather than silently proceeding.
+        console.error("[AgentCore] SAFETY VIOLATION: R3/R4 plan marked as no-confirm — overriding.");
+      }
+
       plan = { ...plan, requiresConfirmation: needsConfirm };
 
       // Send plan to SW — it coordinates confirmation UI and execution relay

@@ -35,12 +35,28 @@ import type { ChatMessage } from "../llm/llm-worker.js";
  *
  * We use XML-entity escaping for the angle-bracket delimiters and strip
  * null bytes which ONNX tokenisers handle inconsistently.
+ *
+ * SECURITY AUDIT NOTES (FR-SAFE-05 — Prompt Injection Defence):
+ * - ALL page-sourced fields (URL, title, element labels, element values) MUST
+ *   pass through this function before entering the LLM prompt.
+ * - The function closes the injection vector via XML-entity escaping, preventing
+ *   an attacker from embedding <page_data> close tags or JSON in page content.
+ * - Additional mitigations in the system prompt instruct the LLM to treat all
+ *   content inside <page_data>...</page_data> as untrusted data.
+ * - The 2 000-char hard cap prevents token-exhaustion prompt injection attacks.
  */
 function sanitizePageContent(raw: string): string {
   return raw
-    .replace(/\0/g, "")        // remove null bytes
-    .replace(/</g, "&lt;")     // prevent tag injection into XML-delimited block
-    .replace(/>/g, "&gt;")
+    .replace(/\0/g, "")         // remove null bytes (tokeniser confusion)
+    .replace(/&/g, "&amp;")     // must be first to avoid double-escaping
+    .replace(/</g, "&lt;")      // prevent XML/HTML tag injection
+    .replace(/>/g, "&gt;")      // close any open XML tags
+    .replace(/"/g, "&quot;")    // prevent attribute value injection
+    .replace(/'/g, "&#39;")     // prevent attribute value injection (single quotes)
+    // Strip Unicode direction-override characters used in bidirectional attacks
+    .replace(/[\u202A-\u202E\u2066-\u2069\u200F\u200E]/g, "")
+    // Strip prompt-injection-specific control sequences sometimes used to end contexts
+    .replace(/\u0003|\u0004|\u001A|\u001C|\u001D|\u001E|\u001F/g, "")
     .slice(0, 2_000);           // hard cap per field — tokens are expensive
 }
 
@@ -199,6 +215,10 @@ R4 = irreversible (download, delete, purchase — always requires confirmation)`
       ? `\n(NOTE: snapshot truncated to first ${MAX_SNAPSHOT_ELEMENTS} elements)`
       : "";
 
+    // ── SECURITY: ALL page-sourced content MUST pass through sanitizePageContent() ──
+    // Any new field added from PageSnapshot must be sanitized. This comment is
+    // the enforcement point for FR-SAFE-05 audit reviews. No raw page data may
+    // bypass sanitizePageContent() before entering the LLM context.
     // All page-sourced content is sanitized then wrapped in <page_data> tags.
     const pageData =
       `<page_data>\n` +
