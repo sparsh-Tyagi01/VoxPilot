@@ -256,6 +256,15 @@ export class AgentCore {
         return;
       }
 
+      // ── Step 2b: Undo check ──────────────────────────────────────────────
+      // "Undo", "revert" commands reverse the last reversible action (FR-SAFE-03).
+      if (this.intentRouter.isUndoCommand(transcript.text)) {
+        await this.undo();
+        this.transitionTo(AgentState.Listening);
+        await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+        return;
+      }
+
       // ── Step 3: Intent Routing ────────────────────────────────────────────
       const fastPlan = this.intentRouter.route(transcript.text);
 
@@ -368,6 +377,52 @@ export class AgentCore {
       this.transitionTo(AgentState.Listening);
       await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
     }
+  }
+
+  /**
+   * Undo the last reversible action (FR-SAFE-03).
+   * Pops the top entry from the undo stack, computes inverse actions,
+   * wraps them in an AgentPlan, and sends them to SW to execute in the tab.
+   */
+  async undo(): Promise<boolean> {
+    const entry = this.undoStack.undo();
+    if (!entry) {
+      console.warn("[AgentCore] Nothing to undo.");
+      await this.tts.speak("Nothing to undo.");
+      return false;
+    }
+
+    const inverseActions = this.undoStack.buildInverseActions(entry);
+    if (inverseActions.length === 0) {
+      console.warn("[AgentCore] Action cannot be reversed.");
+      await this.tts.speak("That action cannot be automatically undone.");
+      return false;
+    }
+
+    const undoPlan: AgentPlan = {
+      intent: `Undo: ${entry.plan.intent}`,
+      risk: RiskTier.R1,
+      requiresConfirmation: false,
+      actions: [
+        ...inverseActions,
+        { type: "done", summary: `Undid: ${entry.plan.intent}` },
+      ],
+    };
+
+    console.log("[AgentCore] Executing undo plan:", undoPlan.intent);
+    await sendToSW({
+      type: "RELAY_ACTION",
+      tabId: entry.tabId,
+      plan: undoPlan,
+    });
+
+    try {
+      await this.tts.speak(`Undid ${entry.plan.intent}`);
+    } finally {
+      await sendToSW({ type: "TTS_DONE" });
+    }
+
+    return true;
   }
 
   /**

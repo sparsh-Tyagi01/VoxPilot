@@ -57,6 +57,15 @@ export class IntentRouter {
     return /^(?:stop|abort|cancel|quit|exit|never\s*mind|stop\s+that|stop\s+it)$/.test(normalised);
   }
 
+  /**
+   * Check if the transcript is an undo command (FR-SAFE-03).
+   * Returns true for: undo, undo that, undo last action, revert, etc.
+   */
+  isUndoCommand(transcript: string): boolean {
+    const normalised = transcript.trim().toLowerCase();
+    return /^(?:please\s+)?(?:undo|undo\s+that|undo\s+last\s+action|revert|revert\s+that)$/.test(normalised);
+  }
+
   route(transcript: string): AgentPlan | null {
     const normalized = transcript.trim().toLowerCase();
 

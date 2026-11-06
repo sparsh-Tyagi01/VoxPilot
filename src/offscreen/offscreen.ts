@@ -18,6 +18,8 @@ import { AudioCapture } from "./audio/capture.js";
 import { VAD } from "./audio/vad.js";
 import { TTS } from "./audio/tts.js";
 import { AgentCore } from "./agent/agent-core.js";
+import { ModelStore } from "./model-store.js";
+import { ModelProfile } from "@shared/types.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 
 // ─── Module-level singletons (safe here — offscreen is not the SW) ────────────
@@ -171,6 +173,56 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       // Forward user's response to an `ask` action
       agentCore?.onUserAnswer(msg.answer);
       break;
+
+    case "SPEAK": {
+      // Content script or SW requested speech synthesis (FR-VOICE-04)
+      if (!tts) {
+        tts = new TTS();
+      }
+      try {
+        await tts.speak(msg.text);
+      } finally {
+        await sendToSW({ type: "TTS_DONE" });
+      }
+      break;
+    }
+
+    case "UNDO_LAST_ACTION": {
+      // Revert the last reversible action (FR-SAFE-03)
+      await agentCore?.undo();
+      break;
+    }
+
+    case "START_MODEL_DOWNLOAD": {
+      // Onboarding initiated explicit model download (FR-MODEL-01, FR-MODEL-02)
+      const modelStore = new ModelStore();
+      const profileMap: Record<string, ModelProfile> = {
+        lite: ModelProfile.Fast,
+        standard: ModelProfile.Balanced,
+        enhanced: ModelProfile.Powerful,
+        fast: ModelProfile.Fast,
+        balanced: ModelProfile.Balanced,
+        powerful: ModelProfile.Powerful,
+      };
+      const profile = profileMap[msg.profile] ?? ModelProfile.Fast;
+      console.log(`[Offscreen] Starting model download for profile: ${profile}`);
+      await modelStore.downloadProfile(profile, (modelId, loaded, total) => {
+        void sendToSW({
+          type: "MODEL_LOAD_PROGRESS",
+          llm: { loaded, total, text: `Downloading ${modelId}...` },
+        });
+      });
+      void sendToSW({
+        type: "MODEL_LOAD_PROGRESS",
+        llm: { loaded: 100, total: 100, text: "Models ready" },
+      });
+      break;
+    }
+
+    case "PROFILE_CHANGED": {
+      console.log(`[Offscreen] Profile changed to: ${msg.profile}`);
+      break;
+    }
 
     case "KEEPALIVE":
       // No-op — just prevents GC by receiving a message

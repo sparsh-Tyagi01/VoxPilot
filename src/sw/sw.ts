@@ -288,9 +288,9 @@ async function handleMessage(
     }
 
     case "UNDO_LAST_ACTION": {
-      // TODO: Implement undo by relaying to offscreen undo stack
-      console.warn("[SW] Undo not yet implemented.");
-      sendResponse({ ok: false, error: "Undo not yet implemented" });
+      // Reversible actions (R0-R2) are popped and inverted in offscreen undo stack (FR-SAFE-03)
+      await relayToOffscreen({ type: "UNDO_LAST_ACTION" });
+      sendResponse({ ok: true });
       break;
     }
 

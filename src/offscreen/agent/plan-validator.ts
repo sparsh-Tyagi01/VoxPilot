@@ -17,7 +17,7 @@
  */
 
 import Ajv, { type ValidateFunction } from "ajv";
-// import addFormats from "ajv-formats"; // TODO: add ajv-formats to devDependencies
+import addFormats from "ajv-formats";
 import { AGENT_PLAN_SCHEMA } from "@shared/schema.js";
 import type { AgentPlan } from "@shared/types.js";
 
@@ -50,8 +50,7 @@ export class PlanValidator {
     });
 
     // Add format validators (e.g., "uri" format for navigate action URLs)
-    // Note: ajv-formats may need to be added as a dependency
-    // addFormats(ajv);  // TODO: Add ajv-formats to package.json
+    addFormats(ajv);
 
     // Compile the schema once at construction time (compilation is expensive)
     this.validateFn = ajv.compile<AgentPlan>(AGENT_PLAN_SCHEMA);
