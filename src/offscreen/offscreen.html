@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  @file src/offscreen/offscreen.html
+  @description Offscreen document HTML for VoxPilot.
+
+  This page is loaded by chrome.offscreen.createDocument() and lives in the
+  background, invisible to the user. It is the host for:
+    - AudioContext + MediaStream (microphone capture)
+    - VAD (voice activity detection)
+    - STT Web Worker (Whisper / ONNX Runtime Web)
+    - LLM Web Worker (WebLLM / Llama)
+    - TTS (Web Speech API or ONNX TTS)
+
+  Constraints:
+    - NO inline scripts (MV3 CSP)
+    - NO chrome.* APIs except chrome.runtime.sendMessage
+    - Script must be type="module" for ES module imports
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoxPilot Offscreen</title>
+  </head>
+  <body>
+    <!--
+      The offscreen document has no visible UI.
+      All work is done in offscreen.ts via Web Workers and AudioContext.
+    -->
+    <script type="module" src="./offscreen.ts"></script>
+  </body>
+</html>

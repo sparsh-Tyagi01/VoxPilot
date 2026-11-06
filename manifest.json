@@ -1,0 +1,91 @@
+/**
+ * @file manifest.json
+ * @description Chrome Extension Manifest V3 for VoxPilot.
+ * Based on SRS v2.0 Appendix C.
+ *
+ * Key design decisions:
+ * - offscreen permission: required for persistent AudioContext + WebWorker (STT/LLM)
+ * - sidePanel: main user-facing UI
+ * - unlimitedStorage: ONNX model weights can be 100 MB+
+ * - wasm-unsafe-eval in CSP: required for ONNX Runtime Web / WebLLM
+ * - optional tabs + debugger: requested at runtime only when user enables advanced features
+ */
+{
+  "manifest_version": 3,
+  "name": "VoxPilot",
+  "short_name": "VoxPilot",
+  "description": "Autonomous on-device voice AI agent for hands-free browser control. 100% private — all processing runs on your device.",
+  "version": "0.1.0",
+
+  /* ─── Permissions ─────────────────────────────────────────────────────────── */
+  "permissions": [
+    "offscreen",
+    "activeTab",
+    "scripting",
+    "storage",
+    "unlimitedStorage",
+    "sidePanel",
+    "alarms"
+  ],
+
+  /* Optional permissions requested at runtime via chrome.permissions.request() */
+  "optional_permissions": ["tabs", "debugger"],
+
+  /* Optional host permissions: injecting content scripts on arbitrary pages */
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+
+  /* ─── Background Service Worker ───────────────────────────────────────────── */
+  "background": {
+    "service_worker": "src/sw/sw.ts",
+    "type": "module"
+  },
+
+  /* ─── Side Panel ──────────────────────────────────────────────────────────── */
+  "side_panel": {
+    "default_path": "src/panel/panel.html"
+  },
+
+  /* ─── Action (toolbar icon) ───────────────────────────────────────────────── */
+  "action": {},
+
+  /* ─── Keyboard Shortcuts ──────────────────────────────────────────────────── */
+  "commands": {
+    "toggle-listening": {
+      "suggested_key": {
+        "default": "Alt+V",
+        "mac": "Alt+V"
+      },
+      "description": "Toggle voice listening on/off"
+    }
+  },
+
+  /* ─── Content Scripts ─────────────────────────────────────────────────────── */
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/content/content.ts"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+
+  /* ─── Content Security Policy ─────────────────────────────────────────────── */
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co"
+  },
+
+  /* ─── Web Accessible Resources ────────────────────────────────────────────── */
+  "web_accessible_resources": [
+    {
+      "resources": ["src/offscreen/offscreen.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  /* ─── Icons ───────────────────────────────────────────────────────────────── */
+  "icons": {
+    "16": "src/icons/icon-16.png",
+    "48": "src/icons/icon-48.png",
+    "128": "src/icons/icon-128.png"
+  }
+}

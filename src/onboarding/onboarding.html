@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>VoxPilot — Setup</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f172a; --surface: #1e293b; --border: #334155;
+      --text: #f1f5f9; --muted: #94a3b8; --accent: #2563eb;
+      --success: #10b981; --warn: #f59e0b; --danger: #ef4444;
+      --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    }
+
+    body {
+      font-family: var(--font); background: var(--bg); color: var(--text);
+      min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; padding: 24px; font-size: 15px; line-height: 1.6;
+    }
+
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+      padding: 40px; max-width: 540px; width: 100%;
+    }
+
+    .logo-row { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .logo { font-size: 36px; }
+    .product-name { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; }
+    .tagline { font-size: 13px; color: var(--muted); }
+
+    /* ─── Steps ─── */
+    .steps { display: flex; gap: 0; margin-bottom: 32px; }
+
+    .step-indicator {
+      flex: 1; text-align: center; position: relative;
+      padding-bottom: 12px; border-bottom: 2px solid var(--border);
+      font-size: 12px; color: var(--muted);
+    }
+
+    .step-indicator.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+    .step-indicator.done   { border-color: var(--success); color: var(--success); }
+
+    /* ─── Step Panels ─── */
+    .step-panel { display: none; }
+    .step-panel.active { display: block; }
+
+    h2 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    p  { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+
+    /* ─── Permission Grant ─── */
+    .perm-box {
+      background: rgba(37,99,235,0.08); border: 1px solid rgba(37,99,235,0.3);
+      border-radius: 10px; padding: 16px; margin-bottom: 20px;
+      display: flex; align-items: flex-start; gap: 12px;
+    }
+
+    .perm-icon { font-size: 24px; flex-shrink: 0; }
+    .perm-text { font-size: 13px; color: var(--text); }
+    .perm-text strong { display: block; margin-bottom: 2px; }
+
+    /* ─── Model Download ─── */
+    .model-option {
+      border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+      margin-bottom: 10px; cursor: pointer; transition: border-color 0.15s;
+      display: flex; align-items: center; gap: 12px;
+    }
+
+    .model-option:hover { border-color: var(--accent); }
+    .model-option.selected { border-color: var(--accent); background: rgba(37,99,235,0.08); }
+    .model-option input[type=radio] { accent-color: var(--accent); flex-shrink: 0; }
+
+    .model-info { flex: 1; }
+    .model-name { font-weight: 600; font-size: 14px; }
+    .model-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .model-size { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    .progress-bar {
+      height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+      margin-top: 8px; display: none;
+    }
+
+    .progress-fill {
+      height: 100%; background: var(--accent); border-radius: 3px;
+      transition: width 0.3s ease; width: 0%;
+    }
+
+    .download-status { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+    /* ─── Privacy Notice ─── */
+    .privacy-list { list-style: none; display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+    .privacy-item {
+      display: flex; align-items: flex-start; gap: 10px;
+      font-size: 13px; color: var(--muted);
+    }
+
+    .privacy-item .check { color: var(--success); flex-shrink: 0; font-size: 16px; }
+
+    /* ─── Buttons ─── */
+    .btn-row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+
+    .btn {
+      padding: 10px 22px; border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; border: none; transition: all 0.15s;
+    }
+
+    .btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .btn-secondary:hover { background: var(--surface); color: var(--text); }
+
+    /* ─── Done ─── */
+    .done-icon { font-size: 48px; text-align: center; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo-row">
+      <span class="logo" aria-hidden="true">🎙️</span>
+      <div>
+        <div class="product-name">VoxPilot</div>
+        <div class="tagline">Hands-free browser control · 100% on-device</div>
+      </div>
+    </div>
+
+    <!-- Step indicators -->
+    <div class="steps" role="tablist" aria-label="Setup steps">
+      <div class="step-indicator active" id="step-ind-0" role="tab" aria-selected="true">1. Privacy</div>
+      <div class="step-indicator"        id="step-ind-1" role="tab" aria-selected="false">2. Microphone</div>
+      <div class="step-indicator"        id="step-ind-2" role="tab" aria-selected="false">3. Models</div>
+      <div class="step-indicator"        id="step-ind-3" role="tab" aria-selected="false">4. Done</div>
+    </div>
+
+    <!-- Step 0: Privacy -->
+    <div class="step-panel active" id="step-0" role="tabpanel" aria-labelledby="step-ind-0">
+      <h2>Privacy-first by design</h2>
+      <p>VoxPilot runs entirely on your device. Here's what that means:</p>
+
+      <ul class="privacy-list">
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Your voice is never sent to any server</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Page content stays on your device</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> No accounts, no analytics, no telemetry</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Personal data encrypted with AES-256</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Delete all data any time from settings</li>
+      </ul>
+
+      <p style="font-size:12px; color: var(--muted);">
+        One-time model download required (up to 1.2 GB for the Standard profile).
+        All subsequent processing is fully local.
+      </p>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btn-step0-next" type="button">
+          Understood — Continue
+        </button>
+      </div>
+    </div>
+
+    <!-- Step 1: Microphone Permission -->
+    <div class="step-panel" id="step-1" role="tabpanel" aria-labelledby="step-ind-1">
+      <h2>Microphone access</h2>
+      <p>VoxPilot needs your microphone to hear voice commands. Audio is processed locally.</p>
+
+      <div class="perm-box">
+        <span class="perm-icon" aria-hidden="true">🎤</span>
+        <div class="perm-text">
+          <strong>What to expect</strong>
+          Your browser will show a permission dialog. Click <strong>Allow</strong>
+          to grant microphone access to VoxPilot.
+        </div>
+      </div>
+
+      <p id="mic-status-text" aria-live="polite" style="font-size:13px; color: var(--muted);">
+        Click the button below to request microphone permission.
+      </p>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-step1-back" type="button">Back</button>
+        <button class="btn btn-primary"   id="btn-request-mic" type="button">🎤 Grant Microphone Access</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Model Selection & Download -->
+    <div class="step-panel" id="step-2" role="tabpanel" aria-labelledby="step-ind-2">
+      <h2>Choose your profile</h2>
+      <p>Select a model tier. Standard is recommended for most users.</p>
+
+      <div role="radiogroup" aria-label="Model profile selection">
+        <label class="model-option selected" id="label-lite">
+          <input type="radio" name="profile" value="lite" id="radio-lite" checked />
+          <div class="model-info">
+            <div class="model-name">Lite</div>
+            <div class="model-desc">Rule-based commands, WASM speech. No GPU required.</div>
+            <div class="model-size">≈ 300 MB download</div>
+          </div>
+        </label>
+
+        <label class="model-option" id="label-standard">
+          <input type="radio" name="profile" value="standard" id="radio-standard" />
+          <div class="model-info">
+            <div class="model-name">Standard ⭐ Recommended</div>
+            <div class="model-desc">Llama 3.2 1B + Whisper base. Requires 2 GB GPU VRAM.</div>
+            <div class="model-size">≈ 1.2 GB download</div>
+          </div>
+        </label>
+
+        <label class="model-option" id="label-enhanced">
+          <input type="radio" name="profile" value="enhanced" id="radio-enhanced" />
+          <div class="model-info">
+            <div class="model-name">Enhanced</div>
+            <div class="model-desc">Llama 3.2 3B. Best accuracy, requires 4 GB GPU VRAM.</div>
+            <div class="model-size">≈ 3.0 GB download</div>
+          </div>
+        </label>
+      </div>
+
+      <div class="progress-bar" id="download-progress-bar">
+        <div class="progress-fill" id="download-progress-fill"></div>
+      </div>
+      <div class="download-status" id="download-status" aria-live="polite"></div>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-step2-back" type="button">Back</button>
+        <button class="btn btn-primary"   id="btn-download" type="button">Download &amp; Continue</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Done -->
+    <div class="step-panel" id="step-3" role="tabpanel" aria-labelledby="step-ind-3">
+      <div class="done-icon" aria-hidden="true">🎉</div>
+      <h2 style="text-align:center;">You're all set!</h2>
+      <p style="text-align:center;">
+        VoxPilot is ready. Press <strong>Alt+V</strong> on any page to start listening,
+        or click the toolbar icon to open the panel.
+      </p>
+
+      <ul class="privacy-list" style="margin-top:16px;">
+        <li class="privacy-item"><span class="check" aria-hidden="true">💡</span> Say <strong>"scroll down"</strong> to scroll</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">💡</span> Say <strong>"click Sign In"</strong> to click buttons</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">💡</span> Say <strong>"fill the form"</strong> to auto-fill</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">💡</span> Say <strong>"stop"</strong> to cancel any action</li>
+      </ul>
+
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="btn-open-settings" type="button">Settings</button>
+        <button class="btn btn-primary"   id="btn-done" type="button">Open Panel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="onboarding.js" type="module"></script>
+</body>
+</html>
+

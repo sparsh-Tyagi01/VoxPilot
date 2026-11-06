@@ -1,0 +1,28 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.env
+.env.*
+*.crx
+*.pem
+*.zip
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Test coverage
+coverage/
+
+# Canvas build artifacts (dev only)
+build/
+
