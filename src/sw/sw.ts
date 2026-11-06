@@ -30,6 +30,7 @@ import { AgentState } from "@shared/types.js";
 import type { SessionState, AgentPlan } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
 import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
+import { VaultService } from "@vault/vault.js";
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -513,6 +514,116 @@ async function handleMessage(
     case "GET_AUDIT_LOG": {
       const entries = await loadHistory();
       sendResponse(entries.slice(0, msg.limit ?? 50));
+      break;
+    }
+
+    // ─── Vault Fill (FR-VAULT-04) ─────────────────────────────────────────────
+
+    case "VAULT_FILL_REQUEST": {
+      // Security contract: Only the SW can access vault values.
+      // The decrypted value is sent directly to the requesting tab's content
+      // script — it never passes through offscreen or the LLM.
+
+      // Determine which tab this message came from (required for sendMessage)
+      const senderTabId = sender?.tab?.id;
+      if (senderTabId === undefined) {
+        sendResponse({ ok: false, error: "No tab ID in VAULT_FILL_REQUEST sender" });
+        break;
+      }
+
+      // Create a per-request vault service instance (SW is stateless)
+      const vaultSvc = new VaultService();
+
+      // If the vault is locked, we need the user's passphrase.
+      // We'll prompt via the panel (broadcast VAULT_PASSPHRASE_REQUEST),
+      // then wait for the user's VAULT_PASSPHRASE_RESPONSE.
+      if (!vaultSvc.isUnlocked) {
+        const requestId = crypto.randomUUID();
+
+        // Ask the panel to show a passphrase prompt
+        broadcastToPanel({ type: "VAULT_PASSPHRASE_REQUEST", requestId });
+
+        // Wait for the user's passphrase (or timeout after 60s)
+        const passphrase = await new Promise<string | null>((resolve) => {
+          const timer = setTimeout(() => {
+            chrome.runtime.onMessage.removeListener(listener);
+            resolve(null); // Timed out
+          }, 60_000);
+
+          const listener = (
+            passphraseMsg: unknown,
+            _passphraseSource: chrome.runtime.MessageSender,
+            _respond: (response?: unknown) => void
+          ): boolean => {
+            if (
+              typeof passphraseMsg === "object" &&
+              passphraseMsg !== null &&
+              (passphraseMsg as { type?: string }).type === "VAULT_PASSPHRASE_RESPONSE" &&
+              (passphraseMsg as { requestId?: string }).requestId === requestId
+            ) {
+              clearTimeout(timer);
+              chrome.runtime.onMessage.removeListener(listener);
+              resolve((passphraseMsg as { passphrase: string }).passphrase);
+            }
+            return false;
+          };
+
+          chrome.runtime.onMessage.addListener(listener);
+        });
+
+        if (!passphrase) {
+          // Passphrase prompt was dismissed or timed out
+          chrome.tabs.sendMessage(senderTabId, {
+            type: "VAULT_FILL_ERROR",
+            handle: msg.handle,
+            error: "Vault passphrase not provided",
+          }).catch(() => {});
+          sendResponse({ ok: false, error: "Vault passphrase not provided" });
+          break;
+        }
+
+        const unlocked = await vaultSvc.unlock(passphrase);
+        if (!unlocked) {
+          broadcastToPanel({ type: "VAULT_UNLOCK_FAILED", requestId });
+          chrome.tabs.sendMessage(senderTabId, {
+            type: "VAULT_FILL_ERROR",
+            handle: msg.handle,
+            error: "Incorrect vault passphrase",
+          }).catch(() => {});
+          sendResponse({ ok: false, error: "Incorrect vault passphrase" });
+          break;
+        }
+      }
+
+      // Retrieve the vault field value (never logged, never stored)
+      const value = vaultSvc.getField(msg.fieldKey as import("@shared/types.js").VaultFieldKey);
+
+      if (value === null) {
+        chrome.tabs.sendMessage(senderTabId, {
+          type: "VAULT_FILL_ERROR",
+          handle: msg.handle,
+          error: `Vault field "${msg.fieldKey}" not found`,
+        }).catch(() => {});
+        sendResponse({ ok: false, error: `Vault field "${msg.fieldKey}" not found` });
+        break;
+      }
+
+      // Send the value directly to the content script in the requesting tab.
+      // The value only lives in-memory and is immediately used to fill the DOM element.
+      await chrome.tabs.sendMessage(senderTabId, {
+        type: "VAULT_FILL_RESPONSE",
+        handle: msg.handle,
+        value,
+      });
+
+      sendResponse({ ok: true });
+      break;
+    }
+
+    case "VAULT_PASSPHRASE_RESPONSE": {
+      // This is handled inside the VAULT_FILL_REQUEST listener above via onMessage.
+      // If it arrives outside that context, acknowledge and discard.
+      sendResponse({ ok: true });
       break;
     }
 

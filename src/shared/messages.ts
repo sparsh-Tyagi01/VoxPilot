@@ -313,6 +313,60 @@ export interface ClearHistoryMsg extends BaseMessage {
   type: "CLEAR_HISTORY";
 }
 
+// ─── Vault Fill (FR-VAULT-04) ──────────────────────────────────────────────
+
+/**
+ * Content script asks SW to resolve a vault field and relay it back.
+ * The field key (e.g. "email") is passed; the decrypted value is returned
+ * directly to the content script's tab — it NEVER traverses to offscreen/LLM.
+ */
+export interface VaultFillRequestMsg extends BaseMessage {
+  type: "VAULT_FILL_REQUEST";
+  /** Vault field key (e.g. "email", "password"). */
+  fieldKey: string;
+  /** DOM handle of the target input element. */
+  handle: string;
+}
+
+/**
+ * SW relays the decrypted vault value back to the content script.
+ * Lives in memory only — never logged, never sent to offscreen.
+ */
+export interface VaultFillResponseMsg extends BaseMessage {
+  type: "VAULT_FILL_RESPONSE";
+  /** DOM handle of the target input element (echoed from request). */
+  handle: string;
+  /** Decrypted field value — only lives in memory, never logged. */
+  value: string;
+}
+
+/**
+ * SW → Panel: request the user to enter their vault passphrase.
+ * Sent when a vault fill is requested but the vault is locked.
+ */
+export interface VaultPassphraseRequestMsg extends BaseMessage {
+  type: "VAULT_PASSPHRASE_REQUEST";
+  /** Pending request ID so the response can be correlated. */
+  requestId: string;
+}
+
+/**
+ * Panel → SW: user submitted their vault passphrase.
+ */
+export interface VaultPassphraseResponseMsg extends BaseMessage {
+  type: "VAULT_PASSPHRASE_RESPONSE";
+  requestId: string;
+  passphrase: string;
+}
+
+/**
+ * SW → Panel: vault unlock failed (wrong passphrase).
+ */
+export interface VaultUnlockFailedMsg extends BaseMessage {
+  type: "VAULT_UNLOCK_FAILED";
+  requestId: string;
+}
+
 /** SW responds with audit log. */
 export interface AuditLogResponseMsg extends BaseMessage {
   type: "AUDIT_LOG_RESPONSE";
@@ -373,7 +427,13 @@ export type VoxPilotMessage =
   | SaveMacroMsg
   | DeleteMacroMsg
   | GetMacrosMsg
-  | ClearHistoryMsg;
+  | ClearHistoryMsg
+  /* Vault fill (FR-VAULT-04) */
+  | VaultFillRequestMsg
+  | VaultFillResponseMsg
+  | VaultPassphraseRequestMsg
+  | VaultPassphraseResponseMsg
+  | VaultUnlockFailedMsg;
 
 /** Utility: extract a message type by its `type` discriminant. */
 export type MessageByType<T extends VoxPilotMessage["type"]> = Extract<

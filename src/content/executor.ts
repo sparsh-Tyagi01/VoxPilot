@@ -16,7 +16,7 @@
  * - All confirmation for R3/R4 is handled before executor is called.
  */
 
-import type { AgentAction, AgentPlan, ClickAction, TypeAction, SelectAction, ToggleAction, ScrollAction, NavigateAction, TabAction, ReadAction } from "@shared/types.js";
+import type { AgentAction, AgentPlan, ClickAction, TypeAction, SelectAction, ToggleAction, ScrollAction, NavigateAction, TabAction, ReadAction, FillFromVaultAction } from "@shared/types.js";
 import type { HandleRegistry } from "./handles.js";
 
 /**
@@ -52,7 +52,7 @@ export class ActionExecutor {
       case "navigate":    return this.doNavigate(action);
       case "tab":         return this.doTab(action);
       case "read":        return this.doRead(action);
-      case "fill_from_vault": return; // Handled by SW → vault service → content
+      case "fill_from_vault": return this.doFillFromVault(action);
       case "ask":         return; // Handled by TTS + side panel
       case "done":        return; // Terminal — nothing to execute in DOM
       default: {
@@ -264,6 +264,126 @@ export class ActionExecutor {
     // Truncate to avoid excessively long TTS
     const truncated = textToRead.slice(0, 500);
     await chrome.runtime.sendMessage({ type: "SPEAK", text: truncated });
+  }
+
+  // ─── Fill From Vault (FR-VAULT-04) ──────────────────────────────────────────
+
+  /**
+   * Fill a DOM input element with a value from the encrypted vault.
+   *
+   * Security contract (SRS NFR-PRV-02, NFR-PRV-03):
+   * - The LLM only knows the vault field KEY (e.g. "email"), never the value.
+   * - The decrypted value travels: SW (vault service) → content script → DOM only.
+   * - The value is never logged, never stored in state, never sent to offscreen.
+   * - If the vault is locked, SW will prompt the user for their passphrase before
+   *   resolving — the content script simply awaits the response message.
+   *
+   * Protocol:
+   *   1. Content → SW: VAULT_FILL_REQUEST { fieldKey, handle }
+   *   2. SW unlocks vault (prompts user if needed), retrieves value
+   *   3. SW → Content (via tab message): VAULT_FILL_RESPONSE { handle, value }
+   *   4. Content fills element using the same framework-aware strategy as doType()
+   *   5. Value is immediately discarded (not held in any variable beyond this method)
+   */
+  private async doFillFromVault(action: FillFromVaultAction): Promise<void> {
+    // 1. Request the vault value from the service worker.
+    //    The SW is the only component allowed to unlock/read the vault.
+    const response = await new Promise<{ handle: string; value: string } | { error: string }>(
+      (resolve) => {
+        // Set up a one-shot listener for the fill response BEFORE sending the request,
+        // to avoid a race condition if SW responds synchronously.
+        const handler = (msg: unknown): boolean => {
+          if (
+            typeof msg === "object" &&
+            msg !== null &&
+            (msg as { type?: string }).type === "VAULT_FILL_RESPONSE" &&
+            (msg as { handle?: string }).handle === action.handle
+          ) {
+            chrome.runtime.onMessage.removeListener(handler);
+            resolve(msg as { handle: string; value: string });
+          }
+          // Also handle error from SW (e.g. vault unlock cancelled)
+          if (
+            typeof msg === "object" &&
+            msg !== null &&
+            (msg as { type?: string }).type === "VAULT_FILL_ERROR" &&
+            (msg as { handle?: string }).handle === action.handle
+          ) {
+            chrome.runtime.onMessage.removeListener(handler);
+            resolve({ error: (msg as { error: string }).error });
+          }
+          return false; // We're async but not using sendResponse in this direction
+        };
+
+        chrome.runtime.onMessage.addListener(handler);
+
+        // Send the fill request to SW
+        chrome.runtime.sendMessage({
+          type: "VAULT_FILL_REQUEST",
+          fieldKey: action.vaultField,
+          handle: action.handle,
+        }).catch(() => {
+          chrome.runtime.onMessage.removeListener(handler);
+          resolve({ error: "Failed to reach service worker" });
+        });
+
+        // Safety timeout — if SW doesn't respond in 30s (e.g. user dismissed passphrase prompt)
+        setTimeout(() => {
+          chrome.runtime.onMessage.removeListener(handler);
+          resolve({ error: "Vault fill timed out — passphrase not provided?" });
+        }, 30_000);
+      }
+    );
+
+    // 2. Handle error response
+    if ("error" in response) {
+      throw new Error(`[Vault] ${response.error}`);
+    }
+
+    // 3. Fill the DOM element using the same framework-aware strategy as doType().
+    //    The value variable only lives for the duration of this method.
+    const el = this.resolveHandle(action.handle);
+
+    if (!(el instanceof HTMLElement)) {
+      throw new Error(`[Vault] Handle ${action.handle} is not an HTMLElement`);
+    }
+
+    el.focus();
+    await this.yield();
+
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      // Clear existing value
+      el.select();
+
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype,
+        "value"
+      )?.set;
+
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(el, response.value);
+      } else {
+        el.value = response.value;
+      }
+
+      // Trigger the full React/Vue/Angular event chain
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+
+      // For password managers / autofill listeners
+      el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+    } else if (el.isContentEditable) {
+      // ContentEditable elements (e.g. rich text editors)
+      el.textContent = response.value;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      throw new Error(`[Vault] Handle ${action.handle} is not a fillable element`);
+    }
+
+    await this.yield();
+    // Note: response.value is not explicitly zeroed here as JS has no manual memory mgmt.
+    // The GC will collect it. This is an acceptable trade-off for the browser extension
+    // sandbox environment. Future: use a TypedArray and zero it manually.
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────────────
