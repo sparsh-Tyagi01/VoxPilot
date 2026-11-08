@@ -63,6 +63,30 @@ describe("IntentRouter", () => {
       expect(plan).not.toBeNull();
       expect(plan?.intent).toContain("Scroll up");
       expect(plan?.risk).toBe(RiskTier.R0);
+      expect((plan?.actions[0] as any)?.direction).toBe("up");
+
+      const plan2 = router.route("scroll up");
+      expect(plan2).not.toBeNull();
+      expect(plan2?.intent).toContain("Scroll up");
+      expect((plan2?.actions[0] as any)?.direction).toBe("up");
+    });
+
+    it("routes navigation commands", () => {
+      const backPlan = router.route("go back");
+      expect(backPlan).not.toBeNull();
+      expect(backPlan?.intent).toContain("Navigate back");
+
+      const backPlan2 = router.route("back");
+      expect(backPlan2).not.toBeNull();
+      expect(backPlan2?.intent).toContain("Navigate back");
+
+      const reloadPlan = router.route("reload");
+      expect(reloadPlan).not.toBeNull();
+      expect(reloadPlan?.intent).toContain("Reload the page");
+
+      const refreshPlan = router.route("refresh page");
+      expect(refreshPlan).not.toBeNull();
+      expect(refreshPlan?.intent).toContain("Reload the page");
     });
 
     it("routes scroll-to-top commands", () => {

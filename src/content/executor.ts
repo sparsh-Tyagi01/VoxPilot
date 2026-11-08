@@ -288,8 +288,15 @@ export class ActionExecutor {
   // ─── Navigate ───────────────────────────────────────────────────────────────
 
   private doNavigate(action: NavigateAction): Promise<void> {
-    // Basic URL validation (schema already validated against ^https?://)
-    window.location.href = action.url;
+    if (action.url.includes("history.back") || action.url === "back") {
+      window.history.back();
+    } else if (action.url.includes("history.forward") || action.url === "forward") {
+      window.history.forward();
+    } else if (action.url.includes("location.reload") || action.url === "reload") {
+      window.location.reload();
+    } else {
+      window.location.href = action.url;
+    }
     return Promise.resolve();
   }
 

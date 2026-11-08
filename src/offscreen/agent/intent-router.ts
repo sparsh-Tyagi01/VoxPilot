@@ -100,8 +100,21 @@ export class IntentRouter {
     return [
       // ── Scroll ─────────────────────────────────────────────────────────────
       {
+        name: "scroll-up",
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+up|go\s+up|page\s+up)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
+        planFactory: () => ({
+          intent: "Scroll up the page",
+          risk: RiskTier.R0,
+          requiresConfirmation: false,
+          actions: [
+            { type: "scroll", handle: null, direction: "up", amount: 750 },
+            { type: "done", summary: "Scrolled up." },
+          ],
+        }),
+      },
+      {
         name: "scroll-down",
-        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+down|scroll|go\s+down|page\s+down)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+down|go\s+down|page\s+down)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
         planFactory: () => ({
           intent: "Scroll down the page",
           risk: RiskTier.R0,
@@ -113,15 +126,15 @@ export class IntentRouter {
         }),
       },
       {
-        name: "scroll-up",
-        pattern: /^(?:can\s+you\s+|please\s+)?(?:scroll\s+up|go\s+up|page\s+up)(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
+        name: "scroll-default",
+        pattern: /^(?:can\s+you\s+|please\s+)?scroll(?:\s+a\s+(?:bit|little))?(?:\s+please)?$/i,
         planFactory: () => ({
-          intent: "Scroll up the page",
+          intent: "Scroll down the page",
           risk: RiskTier.R0,
           requiresConfirmation: false,
           actions: [
-            { type: "scroll", handle: null, direction: "up", amount: 750 },
-            { type: "done", summary: "Scrolled up." },
+            { type: "scroll", handle: null, direction: "down", amount: 750 },
+            { type: "done", summary: "Scrolled down." },
           ],
         }),
       },
@@ -155,7 +168,7 @@ export class IntentRouter {
       // ── Navigation ─────────────────────────────────────────────────────────
       {
         name: "go-back",
-        pattern: /^(?:go\s+)?back(?:\s+(?:a\s+)?page)?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:go\s+back|back(?:\s+a\s+page)?|previous\s+page)$/i,
         planFactory: () => ({
           intent: "Navigate back",
           risk: RiskTier.R1,
@@ -168,7 +181,7 @@ export class IntentRouter {
       },
       {
         name: "go-forward",
-        pattern: /^(?:go\s+)?forward(?:\s+(?:a\s+)?page)?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:go\s+forward|forward(?:\s+a\s+page)?|next\s+page)$/i,
         planFactory: () => ({
           intent: "Navigate forward",
           risk: RiskTier.R1,
@@ -181,7 +194,7 @@ export class IntentRouter {
       },
       {
         name: "reload-page",
-        pattern: /^(?:reload|refresh)(?:\s+(?:the\s+)?page)?$/i,
+        pattern: /^(?:can\s+you\s+|please\s+)?(?:reload|refresh)(?:\s+(?:the\s+)?page)?$/i,
         planFactory: () => ({
           intent: "Reload the page",
           risk: RiskTier.R1,

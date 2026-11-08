@@ -441,13 +441,14 @@ function startWebSpeech(): void {
         // Normalize spoken text
         const clean = spoken.toLowerCase().replace(/[.,!?;:]+$/g, "").trim();
 
-        // Recognize fast-path commands immediately without waiting for isFinal
-        const isFastCommand = /^(?:can\s+you\s+|please\s+)?(?:scroll\s+(?:down|up|to\s+top|to\s+bottom)|scroll|go\s+(?:down|up)|page\s+(?:down|up)|stop|abort|cancel|undo|zoom\s+(?:in|out)|reload|refresh|new\s+tab|close\s+tab)(?:\s+(?:a\s+)?(?:bit|little))?(?:\s+please)?$/i.test(clean);
+        // Recognize fast-path commands immediately when complete and unambiguous
+        const isFastCommand = /^(?:can\s+you\s+|please\s+)?(?:scroll\s+(?:down|up|to\s+(?:the\s+)?top|to\s+(?:the\s+)?bottom)|go\s+(?:down|up|back|forward)|page\s+(?:down|up)|go\s+to\s+(?:the\s+)?(?:top|bottom)|back|forward|stop|abort|cancel|undo|revert|zoom\s+(?:in|out)|reload|refresh|new\s+tab|close\s+tab|next\s+tab|previous\s+tab|prev\s+tab)(?:\s+(?:a\s+)?(?:bit|little))?(?:\s+please)?$/i.test(clean);
 
         const shouldDispatch = Boolean(final.trim()) || isFastCommand;
         const now = Date.now();
+        const isNewOrRepeatedCommand = clean !== lastDispatchedSpoken || (now - lastDispatchedTime > 1500);
 
-        if (shouldDispatch && clean !== lastDispatchedSpoken && (now - lastDispatchedTime > 1200)) {
+        if (shouldDispatch && isNewOrRepeatedCommand && (now - lastDispatchedTime > 600)) {
           lastDispatchedSpoken = clean;
           lastDispatchedTime = now;
           console.log(`[Panel WebSpeech] Dispatching recognized command: "${spoken}" (isFinal=${Boolean(final.trim())})`);

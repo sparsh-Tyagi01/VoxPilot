@@ -153,7 +153,7 @@ async function getTargetTab(): Promise<chrome.tabs.Tab | null> {
  * chrome.scripting.executeScript to guarantee immediate execution.
  */
 async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void> {
-  // 1. Direct handling of Tab operations at SW level
+  // 1. Direct handling of Tab and Navigation operations at SW level
   for (const action of plan.actions) {
     if (action.type === "tab") {
       try {
@@ -175,7 +175,39 @@ async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void>
       } catch (err) {
         console.error("[SW] Direct tab operation failed:", err);
       }
+    } else if (action.type === "navigate") {
+      try {
+        console.log(`[SW] Direct navigate action: "${action.url}" on tab ${tabId}`);
+        if (action.url.includes("history.back") || action.url === "back") {
+          await chrome.tabs.goBack(tabId).catch(async (e) => {
+            console.warn("[SW] chrome.tabs.goBack failed, trying script:", e);
+            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.back() }).catch(() => {});
+          });
+        } else if (action.url.includes("history.forward") || action.url === "forward") {
+          await chrome.tabs.goForward(tabId).catch(async (e) => {
+            console.warn("[SW] chrome.tabs.goForward failed, trying script:", e);
+            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.forward() }).catch(() => {});
+          });
+        } else if (action.url.includes("location.reload") || action.url === "reload") {
+          await chrome.tabs.reload(tabId).catch(async (e) => {
+            console.warn("[SW] chrome.tabs.reload failed, trying script:", e);
+            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.location.reload() }).catch(() => {});
+          });
+        } else {
+          await chrome.tabs.update(tabId, { url: action.url }).catch(console.error);
+        }
+      } catch (err) {
+        console.error("[SW] Direct navigate operation failed:", err);
+      }
     }
+  }
+
+  // Check if there are in-page DOM actions (scroll, click, type, etc.)
+  const hasDomActions = plan.actions.some((a) =>
+    ["scroll", "click", "type", "select", "toggle", "read", "fill_from_vault"].includes(a.type)
+  );
+  if (!hasDomActions) {
+    return;
   }
 
   // 2. Attempt in-page execution via content script
