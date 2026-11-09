@@ -23,6 +23,7 @@
  */
 
 import type { AgentPlan, PageSnapshot, ElementHandle } from "@shared/types.js";
+import { RiskTier } from "@shared/types.js";
 import { AGENT_PLAN_SCHEMA } from "@shared/schema.js";
 import { MAX_SNAPSHOT_ELEMENTS, LLM_TIMEOUT_MS } from "@shared/constants.js";
 import type { ChatMessage } from "../llm/llm-worker.js";
@@ -121,39 +122,81 @@ export class Planner {
 
   /**
    * Generate an AgentPlan from a user transcript and the current page snapshot.
-   *
-   * @param transcript The user's voice command (from STT)
-   * @param snapshot The current page DOM snapshot
-   * @returns A validated AgentPlan
-   * @throws If LLM times out, returns invalid JSON, or the plan fails schema validation
+   * Multi-tier pipeline:
+   * 1. Attempts Chrome Built-in AI (Prompt API / Gemini Nano) if supported.
+   * 2. Attempts WebLLM worker (Llama 3.2) if loaded and ready.
+   * 3. Falls back gracefully to Autonomous Semantic Reasoner (instant on-device reasoning).
    */
   async plan(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan> {
-    if (!this.llm) {
-      throw new Error("[Planner] LLM interface not wired — call setLLMInterface() first.");
+    // 1. Try Chrome Built-in AI (Prompt API / Gemini Nano)
+    try {
+      const chromeAiPlan = await this.tryPlanWithChromeAI(transcript, snapshot);
+      if (chromeAiPlan) {
+        console.log("[Planner] Successfully generated plan via Chrome Built-in AI");
+        return chromeAiPlan;
+      }
+    } catch (e) {
+      console.warn("[Planner] Chrome AI attempt skipped:", e);
     }
+
+    // 2. Try WebLLM worker if wired
+    if (this.llm) {
+      try {
+        const webLlmPlan = await this.planWithWebLLM(transcript, snapshot);
+        if (webLlmPlan) {
+          console.log("[Planner] Successfully generated plan via WebLLM worker");
+          return webLlmPlan;
+        }
+      } catch (err) {
+        console.warn("[Planner] WebLLM planning unavailable or timed out, falling back to autonomous reasoner:", err);
+      }
+    }
+
+    // 3. Autonomous Semantic Reasoner (Zero-dependency, instant on-device decision engine)
+    console.log(`[Planner] Deciding plan via Autonomous Semantic Reasoner for: "${transcript}"`);
+    return this.planWithAutonomousReasoner(transcript, snapshot);
+  }
+
+  private async tryPlanWithChromeAI(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan | null> {
+    const aiObj = (globalThis as any).ai?.languageModel;
+    if (!aiObj) return null;
+
+    const capabilities = await aiObj.capabilities?.();
+    if (capabilities?.available !== "readily" && capabilities?.available !== "after-download") {
+      return null;
+    }
+
+    const session = await aiObj.create({
+      systemPrompt: this.buildSystemPrompt(),
+    });
+
+    const userPrompt = this.buildUserPrompt(transcript, snapshot);
+    const result = await session.prompt(userPrompt);
+    session.destroy?.();
+
+    return this.parseAndValidate(result, transcript);
+  }
+
+  private async planWithWebLLM(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan | null> {
+    if (!this.llm) return null;
 
     const requestId = nextRequestId();
     const messages = this.buildMessages(transcript, snapshot);
     const grammarSchema = JSON.stringify(AGENT_PLAN_SCHEMA);
 
-    console.log(
-      `[Planner] Requesting plan for: "${transcript}" (requestId=${requestId}, ` +
-      `${messages[1]?.content?.length ?? 0} chars in user msg)`
-    );
-
     const t0 = performance.now();
 
-    return new Promise<AgentPlan>((resolve, reject) => {
+    return new Promise<AgentPlan | null>((resolve, reject) => {
+      // Timeout for WebLLM before falling back to autonomous reasoner
       const timer = setTimeout(() => {
         this.llm?.abort(requestId);
-        reject(new Error(`[Planner] LLM timed out after ${LLM_TIMEOUT_MS}ms`));
+        reject(new Error(`[Planner] WebLLM timed out after ${LLM_TIMEOUT_MS}ms`));
       }, LLM_TIMEOUT_MS);
 
       this.llm!.onResult(requestId, (rawJson: string) => {
         clearTimeout(timer);
         const elapsed = performance.now() - t0;
-        console.log(`[Planner] Got plan in ${elapsed.toFixed(0)}ms`);
-
+        console.log(`[Planner] Got plan from WebLLM in ${elapsed.toFixed(0)}ms`);
         try {
           const plan = this.parseAndValidate(rawJson, transcript);
           resolve(plan);
@@ -164,11 +207,227 @@ export class Planner {
 
       this.llm!.onError(requestId, (message: string) => {
         clearTimeout(timer);
-        reject(new Error(`[Planner] LLM error: ${message}`));
+        reject(new Error(`[Planner] WebLLM error: ${message}`));
       });
 
       this.llm!.postGenerate(requestId, messages, grammarSchema);
     });
+  }
+
+  /**
+   * Autonomous Semantic Reasoner:
+   * Analyzes arbitrary user natural language commands against the page DOM snapshot,
+   * title, headings, and readable text to make intelligent decisions.
+   */
+  public planWithAutonomousReasoner(transcript: string, snapshot: PageSnapshot): AgentPlan {
+    const raw = transcript.trim();
+    const text = raw.toLowerCase().replace(/[.,!?;:]+$/g, "");
+
+    // ── 1. Summarization & Page Understanding ─────────────────────────────────
+    const isSummaryRequest =
+      text.includes("summarize") ||
+      text.includes("overview") ||
+      /(?:what\s+is\s+this|explain\s+this|tell\s+me\s+about\s+this)\s+(?:page|website|article|site)/i.test(text);
+
+    if (isSummaryRequest) {
+      const title = snapshot.title || "this page";
+      const headings = snapshot.headings?.slice(0, 4) || [];
+      const bodySnippet = snapshot.textSummary?.slice(0, 300) || "";
+
+      let summary = `This page is titled "${title}".`;
+      if (bodySnippet.length > 30) {
+        summary += ` It discusses: ${bodySnippet.replace(/\s+/g, " ").slice(0, 180)}...`;
+      }
+      if (headings.length > 0) {
+        summary += ` Key sections include: ${headings.join(", ")}.`;
+      }
+
+      return {
+        intent: `Summarize "${title}"`,
+        risk: RiskTier.R0,
+        requiresConfirmation: false,
+        actions: [
+          { type: "done", summary },
+        ],
+      };
+    }
+
+    // ── 2. Information Retrieval / Q&A on Page Content ────────────────────────
+    const isQuestion =
+      /^(?:what|where|who|when|how\s+much|how\s+many|is\s+there|does\s+(?:it|this)|check\s+if|find\s+(?:the|out))\b/i.test(text);
+
+    if (isQuestion && snapshot.textSummary) {
+      // Extract target search terms from the question
+      const terms = text
+        .replace(/^(?:what\s+is|where\s+is|who\s+is|when\s+is|how\s+much\s+is|is\s+there|check\s+if|find\s+the|find\s+out|tell\s+me)\s+/i, "")
+        .split(/\s+/)
+        .filter((w) => w.length > 2 && !["the", "and", "for", "with", "from", "this", "page"].includes(w));
+
+      if (terms.length > 0) {
+        const sentences = snapshot.textSummary.split(/[.\n]+/);
+        let bestSentence = "";
+        let maxScore = 0;
+
+        for (const sentence of sentences) {
+          const sLower = sentence.toLowerCase();
+          let score = 0;
+          for (const term of terms) {
+            if (sLower.includes(term)) score += 1;
+          }
+          if (score > maxScore) {
+            maxScore = score;
+            bestSentence = sentence.trim();
+          }
+        }
+
+        if (maxScore > 0 && bestSentence.length > 10) {
+          return {
+            intent: `Answer question: "${transcript}"`,
+            risk: RiskTier.R0,
+            requiresConfirmation: false,
+            actions: [
+              { type: "done", summary: `According to the page: "${bestSentence.slice(0, 200)}".` },
+            ],
+          };
+        }
+      }
+    }
+
+    // ── 3. Search & Input Queries ─────────────────────────────────────────────
+    const isSearchQuery =
+      /^(?:search\s+for|search|find|look\s+for|google)\s+(.+)$/i.exec(text);
+
+    if (isSearchQuery) {
+      const query = isSearchQuery[1]?.trim() || "";
+      const searchInput = snapshot.elements.find(
+        (el) =>
+          el.tag === "input" &&
+          (el.inputType === "search" ||
+           el.label?.toLowerCase().includes("search") ||
+           el.role === "searchbox" ||
+           el.inputType === "text")
+      );
+
+      if (searchInput) {
+        return {
+          intent: `Search for "${query}"`,
+          risk: RiskTier.R1,
+          requiresConfirmation: false,
+          actions: [
+            { type: "type", handle: searchInput.handle, text: query },
+            { type: "done", summary: `Searched for "${query}".` },
+          ],
+        };
+      } else {
+        return {
+          intent: `Search Google for "${query}"`,
+          risk: RiskTier.R1,
+          requiresConfirmation: false,
+          actions: [
+            { type: "navigate", url: `https://www.google.com/search?q=${encodeURIComponent(query)}` },
+            { type: "done", summary: `Searching Google for "${query}".` },
+          ],
+        };
+      }
+    }
+
+    // ── 4. Goal-Oriented Action Matching (Click / Select / Navigate) ──────────
+    const cleanIntent = text
+      .replace(/^(?:can\s+you\s+|please\s+|could\s+you\s+|i\s+want\s+to\s+|i\s+would\s+like\s+to\s+)/i, "")
+      .replace(/^(?:click|tap|press|select|open|view|go\s+to|navigate\s+to|show\s+me)\s+(?:on\s+)?(?:the\s+)?/i, "")
+      .trim();
+
+    const synonymMap: Record<string, string[]> = {
+      login: ["sign in", "log in", "login", "account", "profile"],
+      signup: ["sign up", "register", "join", "get started", "start free", "create account"],
+      pricing: ["pricing", "plans", "tier", "subscription", "upgrade", "pro", "premium", "cost"],
+      cart: ["cart", "bag", "basket", "checkout", "buy now", "purchase", "order"],
+      about: ["about", "about us", "company", "team", "story"],
+      contact: ["contact", "support", "help", "get in touch", "contact us"],
+      docs: ["docs", "documentation", "api", "guides", "manual"],
+      reviews: ["reviews", "ratings", "testimonials", "feedback"],
+      download: ["download", "install", "get the app"],
+      cookies: ["accept", "agree", "allow", "consent", "got it", "i agree"],
+      menu: ["menu", "navigation", "nav", "drawer", "hamburger"],
+      settings: ["settings", "preferences", "options", "config"],
+    };
+
+    let bestEl: ElementHandle | null = null;
+    let highestScore = 0;
+
+    const intentWords = cleanIntent.split(/\s+/).filter((w) => w.length > 2);
+
+    for (const el of snapshot.elements) {
+      if (el.disabled) continue;
+
+      const label = (el.label || el.value || "").toLowerCase();
+      if (!label && el.tag !== "button" && el.tag !== "input") continue;
+
+      let score = 0;
+
+      // Exact match
+      if (label === cleanIntent) score += 100;
+      else if (label.includes(cleanIntent) && cleanIntent.length > 2) score += 75;
+
+      // Word overlap
+      for (const word of intentWords) {
+        if (label.includes(word)) score += 30;
+      }
+
+      // Synonym expansion matching
+      for (const [key, synonyms] of Object.entries(synonymMap)) {
+        if (cleanIntent.includes(key) || synonyms.some((s) => cleanIntent.includes(s))) {
+          if (synonyms.some((s) => label.includes(s))) {
+            score += 50;
+          }
+        }
+      }
+
+      // Boost for viewport visibility
+      if (el.inViewport) score += 10;
+
+      // Prefer buttons and links for click actions
+      if (el.tag === "button" || el.role === "button") score += 10;
+      if (el.tag === "a" || el.role === "link") score += 5;
+
+      if (score > highestScore) {
+        highestScore = score;
+        bestEl = el;
+      }
+    }
+
+    if (bestEl && highestScore >= 30) {
+      const targetLabel = bestEl.label || "the requested item";
+      const isDangerous =
+        targetLabel.toLowerCase().includes("delete") ||
+        targetLabel.toLowerCase().includes("remove") ||
+        targetLabel.toLowerCase().includes("purchase") ||
+        targetLabel.toLowerCase().includes("pay");
+
+      return {
+        intent: `Click "${targetLabel}"`,
+        risk: isDangerous ? RiskTier.R3 : RiskTier.R1,
+        requiresConfirmation: isDangerous,
+        actions: [
+          { type: "click", handle: bestEl.handle },
+          { type: "done", summary: `Clicked "${targetLabel}".` },
+        ],
+      };
+    }
+
+    // ── 5. General / Unmatched Fallback ───────────────────────────────────────
+    const pageTitle = snapshot.title ? `"${snapshot.title}"` : "this page";
+    return {
+      intent: `Understood command: "${raw}"`,
+      risk: RiskTier.R0,
+      requiresConfirmation: false,
+      actions: [
+        {
+          type: "done",
+          summary: `I analyzed ${pageTitle} for "${raw}". I couldn't locate a directly matching button or section. You can ask me to summarize the page, search for a topic, click any visible link, or navigate to a new site.`,
+        },
+      ],
+    };
   }
 
   // ─── Message Building ───────────────────────────────────────────────────────

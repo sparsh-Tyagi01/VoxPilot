@@ -27,7 +27,7 @@ import {
 } from "@shared/constants.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 import { AgentState } from "@shared/types.js";
-import type { SessionState, AgentPlan } from "@shared/types.js";
+import type { SessionState, AgentPlan, PageSnapshot } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
 import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
 import { VaultService } from "@vault/vault.js";
@@ -723,20 +723,77 @@ async function handleMessage(
     }
 
     case "REQUEST_SNAPSHOT": {
-      // Relay snapshot request to content script, then forward response to offscreen
+      // Relay snapshot request to content script, or capture directly via chrome.scripting
       try {
-        const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const targetTabId = (msg.tabId && msg.tabId > 0) ? msg.tabId : currentTab?.id;
+        const targetTab = await getTargetTab();
+        const targetTabId = (msg.tabId && msg.tabId > 0) ? msg.tabId : targetTab?.id;
         if (!targetTabId) {
           throw new Error("No active tab found for snapshot");
         }
-        const response = await sendToContentScript(targetTabId, {
-          type: "CAPTURE_SNAPSHOT",
-        });
-        if (response?.type === "SNAPSHOT_RESPONSE") {
+
+        let snapshot: PageSnapshot | null = null;
+        try {
+          const response = await sendToContentScript(targetTabId, {
+            type: "CAPTURE_SNAPSHOT",
+          });
+          if (response?.type === "SNAPSHOT_RESPONSE") {
+            snapshot = response.snapshot;
+          }
+        } catch (csErr) {
+          console.warn("[SW] Content script snapshot unavailable, capturing via scripting:", csErr);
+        }
+
+        // Direct capture fallback if content script is unavailable or not mounted
+        if (!snapshot) {
+          const [execResult] = await chrome.scripting.executeScript({
+            target: { tabId: targetTabId },
+            func: () => {
+              const elements: any[] = [];
+              const raw = Array.from(document.querySelectorAll(
+                "button, a[href], input, select, textarea, [role='button'], [role='link'], [role='tab']"
+              ));
+              let idx = 0;
+              for (const el of raw.slice(0, 100)) {
+                const tag = el.tagName.toLowerCase();
+                const label = el.getAttribute("aria-label") || (el as HTMLElement).innerText?.trim() || (el as HTMLInputElement).placeholder || (el as HTMLInputElement).value || "";
+                if (!label && tag === "a") continue;
+                elements.push({
+                  handle: `e${idx++}`,
+                  tag,
+                  label: label.slice(0, 100),
+                  role: el.getAttribute("role") || tag,
+                  inViewport: true,
+                });
+              }
+              const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
+                .map((h) => (h as HTMLElement).innerText?.trim())
+                .filter(Boolean)
+                .slice(0, 15);
+              const mainEl = document.querySelector("main, article, [role='main'], #content, .content") || document.body;
+              return {
+                url: window.location.href,
+                title: document.title,
+                elements,
+                headings,
+                textSummary: (mainEl as HTMLElement)?.innerText?.trim().slice(0, 2500) || "",
+                capturedAt: Date.now(),
+                truncated: false,
+              };
+            },
+          }).catch((err) => {
+            console.error("[SW] Direct scripting snapshot failed:", err);
+            return [null];
+          });
+
+          if (execResult?.result) {
+            snapshot = execResult.result as PageSnapshot;
+          }
+        }
+
+        if (snapshot) {
           await chrome.runtime.sendMessage({
             type: "PAGE_SNAPSHOT",
-            snapshot: response.snapshot,
+            snapshot,
           });
         }
       } catch (err: unknown) {

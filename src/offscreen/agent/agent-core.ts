@@ -304,12 +304,9 @@ export class AgentCore {
         console.log("[AgentCore] Fast-path intent matched — skipping LLM.");
         plan = fastPlan;
       } else {
-        // ── Step 4: LLM Planning ───────────────────────────────────────────
+        // ── Step 4: Autonomous Planning ─────────────────────────────────────
         this.transitionTo(AgentState.Planning);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Planning });
-
-        // Ensure LLM model has finished loading before attempting inference
-        await this.llmReady;
 
         // Request a fresh page snapshot
         const tabId = await this.getActiveTabId();
@@ -318,6 +315,7 @@ export class AgentCore {
 
         if (this.killRequested) { this.handleKill(); return; }
 
+        // Plan with Planner (uses Chrome AI -> WebLLM -> Autonomous Semantic Reasoner)
         plan = await this.planner.plan(text, this.currentSnapshot!);
       }
 
@@ -581,14 +579,22 @@ export class AgentCore {
   /**
    * Wait for the current page snapshot to be delivered via onPageSnapshot().
    */
-  private async waitForSnapshot(timeoutMs = 5_000): Promise<void> {
+  private async waitForSnapshot(timeoutMs = 3_000): Promise<void> {
     // If we already have a fresh snapshot, use it immediately.
     if (this.currentSnapshot) return;
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.snapshotResolve = null;
-        reject(new Error("Timed out waiting for page snapshot"));
+        console.warn("[AgentCore] Snapshot wait timed out, continuing with fallback snapshot");
+        this.currentSnapshot = {
+          url: "",
+          title: "Current Webpage",
+          elements: [],
+          capturedAt: Date.now(),
+          truncated: false,
+        };
+        resolve();
       }, timeoutMs);
 
       this.snapshotResolve = () => {

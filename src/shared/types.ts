@@ -251,6 +251,10 @@ export interface PageSnapshot {
   title: string;
   /** All interactive elements found by snapshot.ts */
   elements: ElementHandle[];
+  /** Key headings found on page (h1, h2, h3) */
+  headings?: string[];
+  /** Brief extract of readable page content (first 2,000 chars) */
+  textSummary?: string;
   /** Timestamp when snapshot was captured (ms since epoch) */
   capturedAt: number;
   /** Whether the snapshot was truncated (> MAX_ELEMENTS) */

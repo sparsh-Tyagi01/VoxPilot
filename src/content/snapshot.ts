@@ -211,10 +211,22 @@ export class SnapshotBuilder {
       console.warn(`[VoxPilot snapshot] Built in ${elapsed.toFixed(1)}ms (target: ≤50ms) with ${elements.length} elements`);
     }
 
+    // Extract key headings for semantic understanding
+    const headings = Array.from(document.querySelectorAll<HTMLElement>("h1, h2, h3"))
+      .map((h) => h.innerText?.trim())
+      .filter((t): t is string => Boolean(t && t.length > 2))
+      .slice(0, 15);
+
+    // Extract readable main body text
+    const mainEl = document.querySelector<HTMLElement>("main, article, [role='main'], #content, .content") || document.body;
+    const textSummary = mainEl?.innerText?.trim().slice(0, 2500) || "";
+
     return {
       url: window.location.href,
       title: document.title,
       elements,
+      headings,
+      textSummary,
       capturedAt: Date.now(),
       truncated,
     };
