@@ -18,7 +18,6 @@ import { AudioCapture } from "./audio/capture.js";
 import { VAD } from "./audio/vad.js";
 import { TTS } from "./audio/tts.js";
 import { AgentCore } from "./agent/agent-core.js";
-import { ModelStore } from "./model-store.js";
 import { ModelProfile } from "@shared/types.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 
@@ -207,8 +206,7 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
     }
 
     case "START_MODEL_DOWNLOAD": {
-      // Onboarding initiated explicit model download (FR-MODEL-01, FR-MODEL-02)
-      const modelStore = new ModelStore();
+      // Onboarding initiated explicit real model download (FR-MODEL-01, FR-MODEL-02)
       const profileMap: Record<string, ModelProfile> = {
         lite: ModelProfile.Fast,
         standard: ModelProfile.Balanced,
@@ -218,17 +216,18 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
         powerful: ModelProfile.Powerful,
       };
       const profile = profileMap[msg.profile] ?? ModelProfile.Fast;
-      console.log(`[Offscreen] Starting model download for profile: ${profile}`);
-      await modelStore.downloadProfile(profile, (modelId, loaded, total) => {
-        void sendToSW({
-          type: "MODEL_LOAD_PROGRESS",
-          llm: { loaded, total, text: `Downloading ${modelId}...` },
-        });
-      });
-      void sendToSW({
-        type: "MODEL_LOAD_PROGRESS",
-        llm: { loaded: 100, total: 100, text: "Models ready" },
-      });
+      console.log(`[Offscreen] Starting real model download for profile: ${profile}`);
+
+      if (!agentCore) {
+        tts = new TTS();
+        agentCore = new AgentCore({ tts });
+      }
+
+      try {
+        await agentCore.loadProfile(profile);
+      } catch (err: unknown) {
+        console.error("[Offscreen] Real model load failed:", err);
+      }
       break;
     }
 
@@ -236,6 +235,33 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       console.log(`[Offscreen] Profile changed to: ${msg.profile}`);
       break;
     }
+
+    case "GET_SESSION_STATE":
+    case "GET_AUDIT_LOG":
+    case "DIRECT_TRANSCRIPT":
+    case "AGENT_STATE_CHANGED":
+    case "AUDIO_LEVEL":
+    case "TOGGLE_LISTENING":
+    case "MODEL_LOAD_PROGRESS":
+    case "SESSION_STATE_UPDATE":
+    case "TRANSCRIPT_UPDATE":
+    case "PLAN_READY":
+    case "EXECUTION_DONE":
+    case "CONFIRM_PLAN":
+    case "CANCEL_PLAN":
+    case "TTS_DONE":
+    case "TRIGGER_MACRO":
+    case "SAVE_MACRO":
+    case "DELETE_MACRO":
+    case "GET_MACROS":
+    case "VAULT_PASSPHRASE_RESPONSE":
+    case "VAULT_FILL_RESPONSE":
+    case "VAULT_FILL_REQUEST":
+    case "OFFSCREEN_ERROR":
+    case "REQUEST_SNAPSHOT":
+    case "PLAN_PRODUCED":
+      // Handled by Service Worker or Panel — ignored by Offscreen
+      break;
 
     case "KEEPALIVE":
       // No-op — just prevents GC by receiving a message

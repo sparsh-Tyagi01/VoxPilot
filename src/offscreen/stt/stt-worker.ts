@@ -37,7 +37,14 @@ import {
  * Chrome version, and WASM q8 meets latency budgets for Whisper tiny/base.
  * We try WebGPU first, then fall back to WASM.
  */
-if (env.backends.onnx?.wasm) { env.backends.onnx.wasm.proxy = false; } // No proxy worker — we ARE a worker.
+if (env.backends.onnx?.wasm) {
+  env.backends.onnx.wasm.proxy = false; // No proxy worker — we ARE a worker.
+  // Use local onnx runtime binaries from the extension origin to avoid remote script CSP violations
+  const onnxBase = (typeof self !== "undefined" && self.location?.origin)
+    ? self.location.origin + "/onnx/"
+    : "/onnx/";
+  env.backends.onnx.wasm.wasmPaths = onnxBase;
+}
 env.allowLocalModels = false;          // Model files come from HuggingFace Hub CDN only.
 env.useBrowserCache = true;            // Use browser Cache Storage for persistence.
 

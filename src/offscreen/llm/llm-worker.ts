@@ -123,6 +123,32 @@ async function loadEngine(modelId: string): Promise<void> {
     console.log(`[LLM Worker] Engine ready for "${modelId}".`);
     post({ type: "ready" });
   } catch (err: unknown) {
+    // If f16 quantized model fails due to GPU shader-f16 limitation, try universal f32 version
+    if (modelId.includes("q4f16_1")) {
+      const fallbackModelId = modelId.replace("q4f16_1", "q4f32_1");
+      console.warn(`[LLM Worker] "${modelId}" failed, attempting universal f32 fallback "${fallbackModelId}"…`, err);
+      try {
+        engine = await webllm.CreateMLCEngine(fallbackModelId, {
+          initProgressCallback: (report: webllm.InitProgressReport) => {
+            post({
+              type: "progress",
+              loaded: report.progress * 100,
+              total: 100,
+              text: report.text,
+            });
+          },
+          logLevel: "WARN",
+        });
+        currentModelId = fallbackModelId;
+        isLoading = false;
+        console.log(`[LLM Worker] Fallback engine ready for "${fallbackModelId}".`);
+        post({ type: "ready" });
+        return;
+      } catch (f32Err: unknown) {
+        console.error(`[LLM Worker] Universal f32 engine also failed for "${fallbackModelId}":`, f32Err);
+      }
+    }
+
     isLoading = false;
     engine = null;
     postError("", `Failed to load engine for "${modelId}": ${err instanceof Error ? err.message : String(err)}`, err);
@@ -146,11 +172,22 @@ async function loadEngine(modelId: string): Promise<void> {
 async function generate(
   requestId: string,
   messages: ChatMessage[],
-  grammar?: string,
+  _grammar?: string,
 ): Promise<void> {
   if (!engine) {
-    postError(requestId, "Engine not loaded. Send 'load' message first.");
-    return;
+    // Attempt auto-recovery if model was previously set
+    if (currentModelId) {
+      console.log(`[LLM Worker] Engine missing or reset, attempting auto-reload of "${currentModelId}"…`);
+      try {
+        await loadEngine(currentModelId);
+      } catch (reloadErr) {
+        postError(requestId, `Engine not loaded and reload failed: ${String(reloadErr)}`);
+        return;
+      }
+    } else {
+      postError(requestId, "Engine not loaded. Send 'load' message first.");
+      return;
+    }
   }
 
   const controller = new AbortController();
@@ -160,28 +197,25 @@ async function generate(
   const t0 = performance.now();
 
   try {
-    // Build request options. grammar is used for constrained JSON decoding.
+    // Build request options with standard JSON object format.
+    // Avoid passing complex schema to schema parser to prevent Metal WebGPU GrammarMatcher crashes.
     const requestOptions: webllm.ChatCompletionRequestStreaming = {
       messages: messages as webllm.ChatCompletionMessageParam[],
       temperature: 0.1,
       top_p: 0.9,
-      max_tokens: 1024,
+      max_tokens: 512,
       stream: true,
       stream_options: { include_usage: true },
     };
 
-    // Apply JSON grammar constraint when available.
-    if (grammar) {
-      (requestOptions as unknown as Record<string, unknown>)["response_format"] = {
-        type: "json_object",
-        schema: grammar,
-      };
-    }
+    (requestOptions as unknown as Record<string, unknown>)["response_format"] = {
+      type: "json_object",
+    };
 
     let fullText = "";
     let usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
-    const asyncGen = await engine.chat.completions.create(requestOptions);
+    const asyncGen = await engine!.chat.completions.create(requestOptions);
 
     for await (const chunk of asyncGen) {
       // Check for abort signal between chunks.
@@ -213,6 +247,12 @@ async function generate(
     post({ type: "result", requestId, text: fullText, usage });
   } catch (err: unknown) {
     abortControllers.delete(requestId);
+    // If device was lost or engine crashed, reset engine state so it auto-recovers
+    const errStr = String(err);
+    if (errStr.includes("Device was lost") || errStr.includes("Model not loaded") || errStr.includes("GrammarMatcher") || errStr.includes("deleted object")) {
+      console.warn("[LLM Worker] WebGPU device lost or engine invalid — resetting engine for auto-reload:", err);
+      engine = null;
+    }
     // Suppress abort errors — they're expected.
     if (err instanceof Error && err.name === "AbortError") return;
     postError(requestId, `Generation failed: ${err instanceof Error ? err.message : String(err)}`, err);

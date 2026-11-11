@@ -122,10 +122,10 @@ export class Planner {
 
   /**
    * Generate an AgentPlan from a user transcript and the current page snapshot.
-   * Multi-tier pipeline:
-   * 1. Attempts Chrome Built-in AI (Prompt API / Gemini Nano) if supported.
-   * 2. Attempts WebLLM worker (Llama 3.2) if loaded and ready.
-   * 3. Falls back gracefully to Autonomous Semantic Reasoner (instant on-device reasoning).
+   * Real on-device neural models only:
+   * 1. Chrome Built-in AI (Prompt API / Gemini Nano) if supported.
+   * 2. WebLLM worker (Llama 3.2 on WebGPU).
+   * No heuristic/mock fallbacks — only real model output.
    */
   async plan(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan> {
     // 1. Try Chrome Built-in AI (Prompt API / Gemini Nano)
@@ -136,10 +136,10 @@ export class Planner {
         return chromeAiPlan;
       }
     } catch (e) {
-      console.warn("[Planner] Chrome AI attempt skipped:", e);
+      console.warn("[Planner] Chrome AI attempt error:", e);
     }
 
-    // 2. Try WebLLM worker if wired
+    // 2. Try WebLLM worker (Llama 3.2 on WebGPU)
     if (this.llm) {
       try {
         const webLlmPlan = await this.planWithWebLLM(transcript, snapshot);
@@ -148,13 +148,14 @@ export class Planner {
           return webLlmPlan;
         }
       } catch (err) {
-        console.warn("[Planner] WebLLM planning unavailable or timed out, falling back to autonomous reasoner:", err);
+        console.error("[Planner] Real WebLLM planning error:", err);
+        throw new Error(`Real WebLLM model failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
-    // 3. Autonomous Semantic Reasoner (Zero-dependency, instant on-device decision engine)
-    console.log(`[Planner] Deciding plan via Autonomous Semantic Reasoner for: "${transcript}"`);
-    return this.planWithAutonomousReasoner(transcript, snapshot);
+    throw new Error(
+      "Real on-device AI model is not ready or failed to generate output. Please ensure model download has completed."
+    );
   }
 
   private async tryPlanWithChromeAI(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan | null> {
@@ -474,6 +475,14 @@ R4 = irreversible (download, delete, purchase — always requires confirmation)`
       ? `\n(NOTE: snapshot truncated to first ${MAX_SNAPSHOT_ELEMENTS} elements)`
       : "";
 
+    let pageContent = "";
+    if (snapshot.headings && snapshot.headings.length > 0) {
+      pageContent += `\nHEADINGS:\n${snapshot.headings.map(h => `- ${sanitizePageContent(h)}`).join("\n")}\n`;
+    }
+    if (snapshot.textSummary) {
+      pageContent += `\nPAGE TEXT CONTENT:\n${sanitizePageContent(snapshot.textSummary.slice(0, 2000))}\n`;
+    }
+
     // ── SECURITY: ALL page-sourced content MUST pass through sanitizePageContent() ──
     // Any new field added from PageSnapshot must be sanitized. This comment is
     // the enforcement point for FR-SAFE-05 audit reviews. No raw page data may
@@ -483,7 +492,8 @@ R4 = irreversible (download, delete, purchase — always requires confirmation)`
       `<page_data>\n` +
       `URL: ${sanitizePageContent(snapshot.url)}\n` +
       `Title: ${sanitizePageContent(snapshot.title)}\n` +
-      `Captured: ${new Date(snapshot.capturedAt).toISOString()}${truncationNote}\n\n` +
+      `Captured: ${new Date(snapshot.capturedAt).toISOString()}${truncationNote}\n` +
+      pageContent + `\n` +
       `ELEMENTS:\n${elementList}\n` +
       `</page_data>`;
 

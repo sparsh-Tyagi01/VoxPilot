@@ -16,9 +16,7 @@
     "alarms"
   ],
 
-  "optional_permissions": ["debugger"],
-
-  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "host_permissions": ["https://*/*", "http://*/*"],
 
   "background": {
     "service_worker": "src/sw/sw.ts",
@@ -63,7 +61,7 @@
   ],
 
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://huggingface.co/api/ https://raw.githubusercontent.com"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://raw.githubusercontent.com https://cdn.jsdelivr.net"
   },
 
   "web_accessible_resources": [
@@ -71,7 +69,8 @@
       "resources": [
         "src/offscreen/offscreen.html",
         "src/onboarding/onboarding.html",
-        "src/settings/settings.html"
+        "src/settings/settings.html",
+        "onnx/*"
       ],
       "matches": ["<all_urls>"]
     }

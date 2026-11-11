@@ -357,6 +357,18 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
   } else {
     // Auto-execute low-risk plans
     await executePlanActions(targetTabId, plan);
+
+    // Speak done action summary (summarization, Q&A answers, action completions)
+    const doneAction = plan.actions.find((a) => a.type === "done") as { type: "done"; summary: string } | undefined;
+    if (doneAction?.summary) {
+      console.log(`[SW] Speaking plan summary: "${doneAction.summary}"`);
+      void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
+    }
+
+    // Return to Listening state after execution
+    await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
+    broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+    broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true, summary: doneAction?.summary } as any);
   }
 
   return true;

@@ -25,7 +25,7 @@
  * - NFR-PERF-01: Latency budgets
  */
 
-import { AgentState, RiskTier } from "@shared/types.js";
+import { AgentState, RiskTier, ModelProfile } from "@shared/types.js";
 import type { AgentPlan, PageSnapshot } from "@shared/types.js";
 import {
   RISK_TIER_CONFIG,
@@ -89,10 +89,12 @@ export class AgentCore {
   /** Resolves when the STT worker signals 'ready'. */
   private sttReady!: Promise<void>;
   private sttReadyResolve!: () => void;
+  private sttReadyReject!: (err: Error) => void;
 
   /** Resolves when the LLM worker signals 'ready'. */
   private llmReady!: Promise<void>;
   private llmReadyResolve!: () => void;
+  private llmReadyReject!: (err: Error) => void;
 
   // ─── Pending STT call ──────────────────────────────────────────────────────
 
@@ -195,13 +197,14 @@ export class AgentCore {
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
       })
       .catch((err: unknown) => {
-        console.error("[AgentCore] STT worker initialization failed:", err);
-        this.transitionTo(AgentState.Error);
+        console.warn("[AgentCore] STT worker initialization failed, continuing in Listening mode for Web Speech fallback:", err);
+        this.transitionTo(AgentState.Listening);
         void sendToSW({
           type: "OFFSCREEN_ERROR",
           source: "agent",
-          message: `STT init failed: ${err instanceof Error ? err.message : String(err)}`,
+          message: `STT init warning: ${err instanceof Error ? err.message : String(err)}`,
         });
+        void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
       });
 
     // LLM loads in background for complex multi-step planning
@@ -617,8 +620,33 @@ export class AgentCore {
    * Called in constructor and when workers are restarted.
    */
   private resetReadinessPromises(): void {
-    this.sttReady = new Promise<void>(resolve => { this.sttReadyResolve = resolve; });
-    this.llmReady = new Promise<void>(resolve => { this.llmReadyResolve = resolve; });
+    this.sttReady = new Promise<void>((resolve, reject) => {
+      this.sttReadyResolve = resolve;
+      this.sttReadyReject = reject;
+    });
+    this.llmReady = new Promise<void>((resolve, reject) => {
+      this.llmReadyResolve = resolve;
+      this.llmReadyReject = reject;
+    });
+  }
+
+  /**
+   * Explicitly load models for a given profile (e.g. from Onboarding).
+   */
+  async loadProfile(profile: ModelProfile): Promise<void> {
+    const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
+    console.log(`[AgentCore] Loading profile "${profile}" (${profileConfig.label})…`);
+
+    if (!this.sttWorker || !this.llmWorker) {
+      await this.initialize();
+      return;
+    }
+
+    this.resetReadinessPromises();
+    this.sttWorker.postMessage({ type: "load", modelId: profileConfig.sttModelId });
+    this.llmWorker.postMessage({ type: "load", modelId: profileConfig.modelId });
+
+    await Promise.all([this.sttReady, this.llmReady]);
   }
 
   // ─── Worker Message Handlers ───────────────────────────────────────────────
@@ -631,6 +659,10 @@ export class AgentCore {
       case "ready":
         console.log("[AgentCore] STT worker ready.");
         this.sttReadyResolve();
+        void sendToSW({
+          type: "MODEL_LOAD_PROGRESS",
+          stt: { loaded: 100, total: 100 },
+        } as any);
         break;
 
       case "result":
@@ -638,6 +670,7 @@ export class AgentCore {
         break;
 
       case "error":
+        this.sttReadyReject?.(new Error(msg.message));
         this.sttReject?.(new Error(msg.message));
         break;
 
@@ -664,12 +697,27 @@ export class AgentCore {
       case "ready":
         console.log("[AgentCore] LLM worker ready.");
         this.llmReadyResolve();
+        void sendToSW({
+          type: "MODEL_LOAD_PROGRESS",
+          progress: 1.0,
+          phase: "ready",
+          loaded: 100,
+          total: 100,
+          done: true,
+          text: "Models ready!",
+          llm: { loaded: 100, total: 100, text: "Models ready!" },
+        } as any);
         break;
 
       case "progress":
-        // Forward LLM download progress to panel via SW.
+        // Forward LLM download progress to panel and onboarding via SW.
         void sendToSW({
           type: "MODEL_LOAD_PROGRESS",
+          progress: msg.loaded / 100,
+          phase: "downloading",
+          loaded: msg.loaded,
+          total: msg.total,
+          text: msg.text,
           llm: { loaded: msg.loaded, total: msg.total, text: msg.text },
         } as any);
         break;
@@ -699,6 +747,9 @@ export class AgentCore {
       }
 
       case "error": {
+        if (!msg.requestId) {
+          this.llmReadyReject?.(new Error(msg.message));
+        }
         const errorCb = this.llmErrorCallbacks.get(msg.requestId);
         this.llmResultCallbacks.delete(msg.requestId);
         this.llmErrorCallbacks.delete(msg.requestId);

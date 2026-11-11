@@ -1,11 +1,88 @@
-import { describe, it, expect } from "vitest";
-import { Planner } from "../src/offscreen/agent/planner.js";
+import { describe, it, expect, beforeEach } from "vitest";
+import { Planner, type PlannerLLMInterface } from "../src/offscreen/agent/planner.js";
 import { PlanValidator } from "../src/offscreen/agent/plan-validator.js";
 import type { PageSnapshot } from "../src/shared/types.js";
 
-describe("Planner - Autonomous Semantic Decision Engine", () => {
-  const planner = new Planner();
+describe("Planner - Real Neural Model Planner", () => {
+  let planner: Planner;
   const validator = new PlanValidator();
+
+  const resultCallbacks = new Map<string, (text: string) => void>();
+  const errorCallbacks = new Map<string, (msg: string) => void>();
+
+  const mockLLM: PlannerLLMInterface = {
+    postGenerate: (requestId, messages, _grammar) => {
+      const userMsg = messages.find(m => m.role === "user")?.content ?? "";
+      const taskLine = userMsg.split("\n")[0]?.toLowerCase() ?? "";
+      let json = "";
+      if (taskLine.includes("summarize")) {
+        json = JSON.stringify({
+          intent: 'Summarize "Awesome Tech Store - Premium Electronics"',
+          risk: 0,
+          requiresConfirmation: false,
+          actions: [{ type: "done", summary: "Awesome Tech Store offers electronics." }]
+        });
+      } else if (taskLine.includes("pro plan")) {
+        json = JSON.stringify({
+          intent: "Answer pricing question",
+          risk: 0,
+          requiresConfirmation: false,
+          actions: [{ type: "done", summary: "The annual pro plan costs 99 dollars." }]
+        });
+      } else if (taskLine.includes("pricing options")) {
+        json = JSON.stringify({
+          intent: "View pricing plans",
+          risk: 1,
+          requiresConfirmation: false,
+          actions: [{ type: "click", handle: "e1" }, { type: "done", summary: "Clicked View Pricing Plans" }]
+        });
+      } else if (taskLine.includes("shopping cart")) {
+        json = JSON.stringify({
+          intent: "Add item to cart",
+          risk: 1,
+          requiresConfirmation: false,
+          actions: [{ type: "click", handle: "e2" }, { type: "done", summary: "Added to Bag" }]
+        });
+      } else if (taskLine.includes("login page")) {
+        json = JSON.stringify({
+          intent: "Go to login",
+          risk: 1,
+          requiresConfirmation: false,
+          actions: [{ type: "click", handle: "e3" }, { type: "done", summary: "Navigating to login" }]
+        });
+      } else if (taskLine.includes("accept cookies")) {
+        json = JSON.stringify({
+          intent: "Accept cookies",
+          risk: 1,
+          requiresConfirmation: false,
+          actions: [{ type: "click", handle: "e4" }, { type: "done", summary: "Accepted cookies" }]
+        });
+      } else if (taskLine.includes("wireless headphones")) {
+        json = JSON.stringify({
+          intent: "Search wireless headphones",
+          risk: 1,
+          requiresConfirmation: false,
+          actions: [{ type: "type", handle: "e0", text: "wireless headphones" }, { type: "done", summary: "Searched for wireless headphones" }]
+        });
+      } else {
+        json = JSON.stringify({
+          intent: "Unrecognized request",
+          risk: 0,
+          requiresConfirmation: false,
+          actions: [{ type: "done", summary: "I couldn't locate actions for this request on the page." }]
+        });
+      }
+      setTimeout(() => resultCallbacks.get(requestId)?.(json), 0);
+    },
+    onResult: (requestId, cb) => { resultCallbacks.set(requestId, cb); },
+    onError: (requestId, cb) => { errorCallbacks.set(requestId, cb); },
+    abort: (requestId) => { resultCallbacks.delete(requestId); errorCallbacks.delete(requestId); },
+  };
+
+  beforeEach(() => {
+    planner = new Planner();
+    planner.setLLMInterface(mockLLM);
+  });
 
   const mockSnapshot: PageSnapshot = {
     url: "https://example.com/shop",
@@ -120,4 +197,10 @@ describe("Planner - Autonomous Semantic Decision Engine", () => {
     expect((plan.actions[0] as any)?.summary).toContain("couldn't locate");
     expect(() => validator.validate(plan)).not.toThrow();
   });
+
+  it("throws an error when no real model is ready (zero fallback guarantee)", async () => {
+    const barePlanner = new Planner();
+    await expect(barePlanner.plan("summarize", mockSnapshot)).rejects.toThrow("Real on-device AI model is not ready");
+  });
 });
+

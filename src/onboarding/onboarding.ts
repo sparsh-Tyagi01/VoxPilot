@@ -136,48 +136,42 @@ document.getElementById("btn-step2-back")?.addEventListener("click", () => goToS
 
 /**
  * Wait for model download to complete via real MODEL_LOAD_PROGRESS messages.
- *
- * The service worker forwards MODEL_LOAD_PROGRESS messages (originating from
- * offscreen LLM/STT workers) to all extension pages including onboarding.
- * Falls back to simulated progress after 2 s if no real messages arrive.
+ * Only real model download progress from offscreen workers is accepted (no simulation fallbacks).
  */
 function waitForModelDownload(): Promise<void> {
   return new Promise((resolve, reject) => {
-    let receivedRealProgress = false;
-
-    // 2-second grace period — fall back to simulation for cached models
-    const fallbackTimer = setTimeout(async () => {
-      if (!receivedRealProgress) {
-        chrome.runtime.onMessage.removeListener(progressListener);
-        await simulateDownload();
-        resolve();
-      }
-    }, 2_000);
-
-    // 10-minute safety timeout for large model downloads on slow connections
+    // 15-minute safety timeout for real model downloads
     const timeoutTimer = setTimeout(() => {
       chrome.runtime.onMessage.removeListener(progressListener);
-      clearTimeout(fallbackTimer);
-      reject(new Error("Model download timed out after 10 minutes"));
-    }, 10 * 60 * 1_000);
+      reject(new Error("Model download timed out after 15 minutes. Check your internet connection and retry."));
+    }, 15 * 60 * 1_000);
 
     const progressListener = (msg: unknown): boolean => {
       if (typeof msg !== "object" || msg === null) return false;
       const m = msg as Record<string, unknown>;
 
       if (m["type"] === "MODEL_LOAD_PROGRESS") {
-        receivedRealProgress = true;
-        clearTimeout(fallbackTimer);
+        let pct = 0;
+        let statusText = "";
 
-        const pct = typeof m["progress"] === "number" ? Math.round(m["progress"] * 100) : 0;
-        const phase = String(m["phase"] ?? "downloading");
+        if (typeof m["progress"] === "number") {
+          pct = Math.round(m["progress"] * 100);
+        } else if (typeof (m["llm"] as any)?.loaded === "number") {
+          const llm = m["llm"] as any;
+          pct = llm.total > 0 ? Math.round((llm.loaded / llm.total) * 100) : Math.round(llm.loaded);
+        } else if (typeof (m["stt"] as any)?.loaded === "number") {
+          const stt = m["stt"] as any;
+          pct = stt.total > 0 ? Math.round((stt.loaded / stt.total) * 100) : Math.round(stt.loaded);
+        }
+
+        pct = Math.min(100, Math.max(0, pct));
+        statusText = String(m["text"] || (m["llm"] as any)?.text || `Downloading model files… ${pct}%`);
 
         progressFill.style.width = `${pct}%`;
         progressFill.setAttribute("aria-valuenow", String(pct));
-        downloadStatus.textContent =
-          `${phase === "loading" ? "Loading" : "Downloading"} models… ${pct}%`;
+        downloadStatus.textContent = statusText;
 
-        if (m["done"] === true || pct >= 100) {
+        if (m["done"] === true || pct >= 100 || m["phase"] === "ready") {
           clearTimeout(timeoutTimer);
           chrome.runtime.onMessage.removeListener(progressListener);
           downloadStatus.textContent = "✓ Models ready!";
@@ -190,18 +184,6 @@ function waitForModelDownload(): Promise<void> {
 
     chrome.runtime.onMessage.addListener(progressListener);
   });
-}
-
-/** Simulated download progress (fallback for cached/fast model loads). */
-async function simulateDownload(): Promise<void> {
-  for (let pct = 0; pct <= 100; pct += 5) {
-    progressFill.style.width = `${pct}%`;
-    progressFill.setAttribute("aria-valuenow", String(pct));
-    downloadStatus.textContent = `Downloading models… ${pct}%`;
-    await sleep(80);
-  }
-  downloadStatus.textContent = "✓ Models ready!";
-  downloadStatus.style.color = "#10b981";
 }
 
 // ─── Step 3: Done ─────────────────────────────────────────────────────────────
