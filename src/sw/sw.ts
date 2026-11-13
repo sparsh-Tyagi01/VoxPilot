@@ -369,6 +369,7 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
     await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
     broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
     broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true, summary: doneAction?.summary } as any);
+    await relayToOffscreen({ type: "EXECUTION_DONE" as any, success: true });
   }
 
   return true;
@@ -527,7 +528,11 @@ async function toggleListening(): Promise<void> {
     // Brief pause to let the offscreen document initialize
     await new Promise<void>((r) => setTimeout(r, 300));
 
-    await chrome.runtime.sendMessage({ type: "START_AUDIO" }).catch(() => {});
+    // Read the user's selected profile from storage (set during onboarding)
+    const { selected_profile: storedProfile } = await chrome.storage.local.get("selected_profile");
+    const profileToUse = typeof storedProfile === "string" ? storedProfile : "lite";
+
+    await chrome.runtime.sendMessage({ type: "START_AUDIO", profile: profileToUse }).catch(() => {});
     await updateSessionState({
       listeningEnabled: true,
       activeTabId: tabId,
@@ -652,9 +657,9 @@ async function handleMessage(
       });
       broadcastToPanel({ type: "TRANSCRIPT_UPDATE", text, isFinal: true });
 
-      // Deduplication check: if identical command within 1.5 seconds, skip re-executing
+      // Deduplication check: if identical command within 400ms, skip re-executing (rapid double-dispatch guard)
       const now = Date.now();
-      if (text.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 1500) {
+      if (text.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 400) {
         console.log(`[SW] Duplicate command suppressed: "${text}"`);
         sendResponse({ ok: true, deduplicated: true });
         break;
@@ -691,6 +696,7 @@ async function handleMessage(
           void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
         }
         broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true });
+        await relayToOffscreen({ type: "EXECUTION_DONE" as any, success: true } as any);
       } else {
         // Fallback for complex queries or unmatched commands: forward to offscreen agent LLM planner
         console.log(`[SW] No fast-path match for "${text}" — forwarding to AgentCore for planning`);
@@ -803,7 +809,7 @@ async function handleMessage(
         }
 
         if (snapshot) {
-          await chrome.runtime.sendMessage({
+          await relayToOffscreen({
             type: "PAGE_SNAPSHOT",
             snapshot,
           });
@@ -873,6 +879,11 @@ async function handleMessage(
           errorCount: errorCount + 1,
         });
       }
+
+      // Relay EXECUTION_DONE to offscreen so AgentCore transitions back to Listening
+      broadcastToPanel({ type: "EXECUTION_DONE" as any, success: msg.success } as any);
+      await relayToOffscreen({ type: "EXECUTION_DONE" as any, success: msg.success } as any);
+
       sendResponse({ ok: true });
       break;
     }

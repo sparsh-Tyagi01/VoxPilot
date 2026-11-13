@@ -23,7 +23,6 @@
  */
 
 import type { AgentPlan, PageSnapshot, ElementHandle } from "@shared/types.js";
-import { RiskTier } from "@shared/types.js";
 import { AGENT_PLAN_SCHEMA } from "@shared/schema.js";
 import { MAX_SNAPSHOT_ELEMENTS, LLM_TIMEOUT_MS } from "@shared/constants.js";
 import type { ChatMessage } from "../llm/llm-worker.js";
@@ -175,7 +174,7 @@ export class Planner {
     const result = await session.prompt(userPrompt);
     session.destroy?.();
 
-    return this.parseAndValidate(result, transcript);
+    return this.parseAndValidate(result, transcript, snapshot);
   }
 
   private async planWithWebLLM(transcript: string, snapshot: PageSnapshot): Promise<AgentPlan | null> {
@@ -199,7 +198,7 @@ export class Planner {
         const elapsed = performance.now() - t0;
         console.log(`[Planner] Got plan from WebLLM in ${elapsed.toFixed(0)}ms`);
         try {
-          const plan = this.parseAndValidate(rawJson, transcript);
+          const plan = this.parseAndValidate(rawJson, transcript, snapshot);
           resolve(plan);
         } catch (err: unknown) {
           reject(err);
@@ -213,222 +212,6 @@ export class Planner {
 
       this.llm!.postGenerate(requestId, messages, grammarSchema);
     });
-  }
-
-  /**
-   * Autonomous Semantic Reasoner:
-   * Analyzes arbitrary user natural language commands against the page DOM snapshot,
-   * title, headings, and readable text to make intelligent decisions.
-   */
-  public planWithAutonomousReasoner(transcript: string, snapshot: PageSnapshot): AgentPlan {
-    const raw = transcript.trim();
-    const text = raw.toLowerCase().replace(/[.,!?;:]+$/g, "");
-
-    // ── 1. Summarization & Page Understanding ─────────────────────────────────
-    const isSummaryRequest =
-      text.includes("summarize") ||
-      text.includes("overview") ||
-      /(?:what\s+is\s+this|explain\s+this|tell\s+me\s+about\s+this)\s+(?:page|website|article|site)/i.test(text);
-
-    if (isSummaryRequest) {
-      const title = snapshot.title || "this page";
-      const headings = snapshot.headings?.slice(0, 4) || [];
-      const bodySnippet = snapshot.textSummary?.slice(0, 300) || "";
-
-      let summary = `This page is titled "${title}".`;
-      if (bodySnippet.length > 30) {
-        summary += ` It discusses: ${bodySnippet.replace(/\s+/g, " ").slice(0, 180)}...`;
-      }
-      if (headings.length > 0) {
-        summary += ` Key sections include: ${headings.join(", ")}.`;
-      }
-
-      return {
-        intent: `Summarize "${title}"`,
-        risk: RiskTier.R0,
-        requiresConfirmation: false,
-        actions: [
-          { type: "done", summary },
-        ],
-      };
-    }
-
-    // ── 2. Information Retrieval / Q&A on Page Content ────────────────────────
-    const isQuestion =
-      /^(?:what|where|who|when|how\s+much|how\s+many|is\s+there|does\s+(?:it|this)|check\s+if|find\s+(?:the|out))\b/i.test(text);
-
-    if (isQuestion && snapshot.textSummary) {
-      // Extract target search terms from the question
-      const terms = text
-        .replace(/^(?:what\s+is|where\s+is|who\s+is|when\s+is|how\s+much\s+is|is\s+there|check\s+if|find\s+the|find\s+out|tell\s+me)\s+/i, "")
-        .split(/\s+/)
-        .filter((w) => w.length > 2 && !["the", "and", "for", "with", "from", "this", "page"].includes(w));
-
-      if (terms.length > 0) {
-        const sentences = snapshot.textSummary.split(/[.\n]+/);
-        let bestSentence = "";
-        let maxScore = 0;
-
-        for (const sentence of sentences) {
-          const sLower = sentence.toLowerCase();
-          let score = 0;
-          for (const term of terms) {
-            if (sLower.includes(term)) score += 1;
-          }
-          if (score > maxScore) {
-            maxScore = score;
-            bestSentence = sentence.trim();
-          }
-        }
-
-        if (maxScore > 0 && bestSentence.length > 10) {
-          return {
-            intent: `Answer question: "${transcript}"`,
-            risk: RiskTier.R0,
-            requiresConfirmation: false,
-            actions: [
-              { type: "done", summary: `According to the page: "${bestSentence.slice(0, 200)}".` },
-            ],
-          };
-        }
-      }
-    }
-
-    // ── 3. Search & Input Queries ─────────────────────────────────────────────
-    const isSearchQuery =
-      /^(?:search\s+for|search|find|look\s+for|google)\s+(.+)$/i.exec(text);
-
-    if (isSearchQuery) {
-      const query = isSearchQuery[1]?.trim() || "";
-      const searchInput = snapshot.elements.find(
-        (el) =>
-          el.tag === "input" &&
-          (el.inputType === "search" ||
-           el.label?.toLowerCase().includes("search") ||
-           el.role === "searchbox" ||
-           el.inputType === "text")
-      );
-
-      if (searchInput) {
-        return {
-          intent: `Search for "${query}"`,
-          risk: RiskTier.R1,
-          requiresConfirmation: false,
-          actions: [
-            { type: "type", handle: searchInput.handle, text: query },
-            { type: "done", summary: `Searched for "${query}".` },
-          ],
-        };
-      } else {
-        return {
-          intent: `Search Google for "${query}"`,
-          risk: RiskTier.R1,
-          requiresConfirmation: false,
-          actions: [
-            { type: "navigate", url: `https://www.google.com/search?q=${encodeURIComponent(query)}` },
-            { type: "done", summary: `Searching Google for "${query}".` },
-          ],
-        };
-      }
-    }
-
-    // ── 4. Goal-Oriented Action Matching (Click / Select / Navigate) ──────────
-    const cleanIntent = text
-      .replace(/^(?:can\s+you\s+|please\s+|could\s+you\s+|i\s+want\s+to\s+|i\s+would\s+like\s+to\s+)/i, "")
-      .replace(/^(?:click|tap|press|select|open|view|go\s+to|navigate\s+to|show\s+me)\s+(?:on\s+)?(?:the\s+)?/i, "")
-      .trim();
-
-    const synonymMap: Record<string, string[]> = {
-      login: ["sign in", "log in", "login", "account", "profile"],
-      signup: ["sign up", "register", "join", "get started", "start free", "create account"],
-      pricing: ["pricing", "plans", "tier", "subscription", "upgrade", "pro", "premium", "cost"],
-      cart: ["cart", "bag", "basket", "checkout", "buy now", "purchase", "order"],
-      about: ["about", "about us", "company", "team", "story"],
-      contact: ["contact", "support", "help", "get in touch", "contact us"],
-      docs: ["docs", "documentation", "api", "guides", "manual"],
-      reviews: ["reviews", "ratings", "testimonials", "feedback"],
-      download: ["download", "install", "get the app"],
-      cookies: ["accept", "agree", "allow", "consent", "got it", "i agree"],
-      menu: ["menu", "navigation", "nav", "drawer", "hamburger"],
-      settings: ["settings", "preferences", "options", "config"],
-    };
-
-    let bestEl: ElementHandle | null = null;
-    let highestScore = 0;
-
-    const intentWords = cleanIntent.split(/\s+/).filter((w) => w.length > 2);
-
-    for (const el of snapshot.elements) {
-      if (el.disabled) continue;
-
-      const label = (el.label || el.value || "").toLowerCase();
-      if (!label && el.tag !== "button" && el.tag !== "input") continue;
-
-      let score = 0;
-
-      // Exact match
-      if (label === cleanIntent) score += 100;
-      else if (label.includes(cleanIntent) && cleanIntent.length > 2) score += 75;
-
-      // Word overlap
-      for (const word of intentWords) {
-        if (label.includes(word)) score += 30;
-      }
-
-      // Synonym expansion matching
-      for (const [key, synonyms] of Object.entries(synonymMap)) {
-        if (cleanIntent.includes(key) || synonyms.some((s) => cleanIntent.includes(s))) {
-          if (synonyms.some((s) => label.includes(s))) {
-            score += 50;
-          }
-        }
-      }
-
-      // Boost for viewport visibility
-      if (el.inViewport) score += 10;
-
-      // Prefer buttons and links for click actions
-      if (el.tag === "button" || el.role === "button") score += 10;
-      if (el.tag === "a" || el.role === "link") score += 5;
-
-      if (score > highestScore) {
-        highestScore = score;
-        bestEl = el;
-      }
-    }
-
-    if (bestEl && highestScore >= 30) {
-      const targetLabel = bestEl.label || "the requested item";
-      const isDangerous =
-        targetLabel.toLowerCase().includes("delete") ||
-        targetLabel.toLowerCase().includes("remove") ||
-        targetLabel.toLowerCase().includes("purchase") ||
-        targetLabel.toLowerCase().includes("pay");
-
-      return {
-        intent: `Click "${targetLabel}"`,
-        risk: isDangerous ? RiskTier.R3 : RiskTier.R1,
-        requiresConfirmation: isDangerous,
-        actions: [
-          { type: "click", handle: bestEl.handle },
-          { type: "done", summary: `Clicked "${targetLabel}".` },
-        ],
-      };
-    }
-
-    // ── 5. General / Unmatched Fallback ───────────────────────────────────────
-    const pageTitle = snapshot.title ? `"${snapshot.title}"` : "this page";
-    return {
-      intent: `Understood command: "${raw}"`,
-      risk: RiskTier.R0,
-      requiresConfirmation: false,
-      actions: [
-        {
-          type: "done",
-          summary: `I analyzed ${pageTitle} for "${raw}". I couldn't locate a directly matching button or section. You can ask me to summarize the page, search for a topic, click any visible link, or navigate to a new site.`,
-        },
-      ],
-    };
   }
 
   // ─── Message Building ───────────────────────────────────────────────────────
@@ -453,7 +236,7 @@ export class Planner {
     return `You are VoxPilot, an on-device voice AI browser agent. Convert the user's voice command into a structured JSON action plan.
 
 RULES:
-1. Only use element handles ([e0], [e1], ...) that appear in the ELEMENTS list inside <page_data>.
+1. Only use element handles (e0, e1, ...) that appear in the ELEMENTS list inside <page_data>.
 2. Prefer the LOWEST risk tier that accomplishes the task (read < click < type < navigate).
 3. For passwords or sensitive fields, use fill_from_vault (never type the value directly).
 4. If the task is ambiguous or impossible, use the "ask" action to request clarification.
@@ -466,7 +249,43 @@ R0 = read-only (safe, no confirmation needed)
 R1 = single non-destructive action (safe, no confirmation needed)
 R2 = multi-step or form submission (safe, no confirmation needed)
 R3 = data-modifying or sends data externally (requires user confirmation)
-R4 = irreversible (download, delete, purchase — always requires confirmation)`;
+R4 = irreversible (download, delete, purchase — always requires confirmation)
+
+EXAMPLES:
+TASK: "Summarize this page"
+{
+  "intent": "Summarize page content",
+  "actions": [
+    { "type": "done", "summary": "This page is an article about..." }
+  ]
+}
+
+TASK: "Click on login"
+{
+  "intent": "Click login button",
+  "actions": [
+    { "type": "click", "handle": "e2", "label": "Login" },
+    { "type": "done", "summary": "Clicked the login button." }
+  ]
+}
+
+TASK: "Scroll down a bit"
+{
+  "intent": "Scroll down",
+  "actions": [
+    { "type": "scroll", "direction": "down", "amount": 800 },
+    { "type": "done", "summary": "Scrolled down the page." }
+  ]
+}
+
+TASK: "Search for weather in Tokyo"
+{
+  "intent": "Search for weather in Tokyo",
+  "actions": [
+    { "type": "type", "handle": "e0", "text": "weather in Tokyo", "clear": true },
+    { "type": "done", "summary": "Entered search for weather in Tokyo." }
+  ]
+}`;
   }
 
   private buildUserPrompt(transcript: string, snapshot: PageSnapshot): string {
@@ -533,19 +352,25 @@ R4 = irreversible (download, delete, purchase — always requires confirmation)`
   // ─── Parse & Validate ───────────────────────────────────────────────────────
 
   /**
-   * Parse the raw JSON string from the LLM and validate it as an AgentPlan.
-   *
-   * The LLM uses constrained decoding (grammar sampling) so the JSON structure
-   * should always be valid, but we still parse defensively.
+   * Parse the raw JSON string from the LLM and normalize it into an AgentPlan.
+   * Defensively extracts JSON, unwraps nested keys, normalizes handles,
+   * ensures done actions with summaries are present, and builds a valid plan.
    */
-  private parseAndValidate(rawJson: string, transcript: string): AgentPlan {
-    // Strip any accidental markdown fences (model may still wrap despite instructions).
-    const cleaned = rawJson
+  private parseAndValidate(rawJson: string, transcript: string, snapshot?: PageSnapshot): AgentPlan {
+    // Strip any accidental markdown fences
+    let cleaned = rawJson
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/, "")
       .trim();
 
-    let parsed: unknown;
+    // Isolate JSON object if there is surrounding chatter
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleaned = cleaned.slice(firstBrace, lastBrace + 1);
+    }
+
+    let parsed: any;
     try {
       parsed = JSON.parse(cleaned);
     } catch (err: unknown) {
@@ -555,17 +380,78 @@ R4 = irreversible (download, delete, purchase — always requires confirmation)`
       );
     }
 
-    // Basic structural validation — full AJV validation happens in PlanValidator
-    // which is called by AgentCore after plan() returns.
-    const plan = parsed as AgentPlan;
-    if (!plan || typeof plan !== "object" || !Array.isArray(plan.actions) || plan.actions.length === 0) {
-      throw new Error(`[Planner] LLM plan missing required fields: ${JSON.stringify(parsed).slice(0, 300)}`);
+    // Unwrap if wrapped in { "plan": ... }
+    if (parsed && typeof parsed === "object" && parsed.plan && typeof parsed.plan === "object") {
+      parsed = parsed.plan;
     }
 
-    // Ensure intent is present (may be missing on very short outputs).
-    if (!plan.intent) {
-      plan.intent = transcript.slice(0, 200);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error(`[Planner] LLM plan is not an object: ${JSON.stringify(parsed).slice(0, 300)}`);
     }
+
+    // Ensure actions is an array
+    let actions: any[] = Array.isArray(parsed.actions) ? parsed.actions : [];
+
+    // If actions is empty but summary or explanation is provided, build a done action
+    const topSummary = typeof parsed.summary === "string" ? parsed.summary : undefined;
+    if (actions.length === 0 && topSummary) {
+      actions.push({ type: "done", summary: topSummary });
+    }
+
+    // Normalize each action
+    actions = actions.map((act) => {
+      if (!act || typeof act !== "object") return null;
+      const normalized: Record<string, unknown> = { ...(act as Record<string, unknown>) };
+
+      // Handle target -> handle normalization
+      if (!normalized["handle"] && normalized["target"]) {
+        normalized["handle"] = normalized["target"];
+        delete normalized["target"];
+      }
+
+      // Handle normalization & resolution to e[0-9]+
+      if (typeof normalized["handle"] === "string") {
+        const rawH = (normalized["handle"] as string).replace(/[\[\]]/g, "").trim();
+        if (/^e[0-9]+$/i.test(rawH)) {
+          normalized["handle"] = rawH.toLowerCase();
+        } else if (snapshot?.elements && snapshot.elements.length > 0) {
+          // Resolve element by label or tag match against snapshot
+          const match = snapshot.elements.find(
+            (el) => el.label?.toLowerCase().includes(rawH.toLowerCase()) || el.handle.toLowerCase() === rawH.toLowerCase()
+          );
+          normalized["handle"] = match ? match.handle : (snapshot.elements[0]?.handle || "e0");
+        } else {
+          normalized["handle"] = "e0";
+        }
+      }
+
+      // Ensure summary exists on done action
+      if (normalized["type"] === "done" && !normalized["summary"]) {
+        normalized["summary"] = topSummary || parsed.intent || transcript.slice(0, 200);
+      }
+
+      return normalized;
+    }).filter(Boolean);
+
+    // If still no done action, add one at the end with the summary or intent
+    const hasDone = actions.some((a) => a && (a as any).type === "done");
+    if (!hasDone) {
+      actions.push({
+        type: "done",
+        summary: topSummary || parsed.intent || `Completed: ${transcript.slice(0, 100)}`,
+      });
+    }
+
+    const intent = typeof parsed.intent === "string" && parsed.intent.length > 0
+      ? parsed.intent.slice(0, 300)
+      : transcript.slice(0, 200);
+
+    const plan: AgentPlan = {
+      intent,
+      risk: typeof parsed.risk === "number" ? parsed.risk : 0,
+      requiresConfirmation: Boolean(parsed.requiresConfirmation),
+      actions,
+    };
 
     return plan;
   }

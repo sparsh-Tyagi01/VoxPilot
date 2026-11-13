@@ -404,6 +404,23 @@ function stopPanelAudioCapture(): void {
 
 let lastDispatchedSpoken = "";
 let lastDispatchedTime = 0;
+let webSpeechRestartTimer: number | null = null;
+
+function scheduleWebSpeechRestart(): void {
+  if (webSpeechRestartTimer) {
+    clearTimeout(webSpeechRestartTimer);
+    webSpeechRestartTimer = null;
+  }
+  if (!currentListeningState) return;
+
+  webSpeechRestartTimer = window.setTimeout(() => {
+    webSpeechRestartTimer = null;
+    if (currentListeningState) {
+      stopWebSpeech();
+      startWebSpeech();
+    }
+  }, 150);
+}
 
 function startWebSpeech(): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -444,14 +461,17 @@ function startWebSpeech(): void {
         // Recognize fast-path commands immediately when complete and unambiguous
         const isFastCommand = /^(?:can\s+you\s+|please\s+)?(?:scroll\s+(?:down|up|to\s+(?:the\s+)?top|to\s+(?:the\s+)?bottom)|go\s+(?:down|up|back|forward)|page\s+(?:down|up)|go\s+to\s+(?:the\s+)?(?:top|bottom)|back|forward|stop|abort|cancel|undo|revert|zoom\s+(?:in|out)|reload|refresh|new\s+tab|close\s+tab|next\s+tab|previous\s+tab|prev\s+tab)(?:\s+(?:a\s+)?(?:bit|little))?(?:\s+please)?$/i.test(clean);
 
-        const shouldDispatch = Boolean(final.trim()) || isFastCommand;
+        const isFinalResult = Boolean(final.trim());
+        const shouldDispatch = isFinalResult || isFastCommand;
         const now = Date.now();
-        const isNewOrRepeatedCommand = clean !== lastDispatchedSpoken || (now - lastDispatchedTime > 1500);
+        const isNewCommand = clean !== lastDispatchedSpoken;
+        const isRepeatedFinal = isFinalResult && (now - lastDispatchedTime > 500);
+        const isRepeatedFast = isFastCommand && (now - lastDispatchedTime > 1200);
 
-        if (shouldDispatch && isNewOrRepeatedCommand && (now - lastDispatchedTime > 600)) {
+        if (shouldDispatch && (isNewCommand || isRepeatedFinal || isRepeatedFast) && (now - lastDispatchedTime > 350)) {
           lastDispatchedSpoken = clean;
           lastDispatchedTime = now;
-          console.log(`[Panel WebSpeech] Dispatching recognized command: "${spoken}" (isFinal=${Boolean(final.trim())})`);
+          console.log(`[Panel WebSpeech] Dispatching recognized command: "${spoken}" (isFinal=${isFinalResult})`);
           chrome.runtime.sendMessage({
             type: "DIRECT_TRANSCRIPT",
             text: spoken,
@@ -465,6 +485,10 @@ function startWebSpeech(): void {
       console.warn("[Panel WebSpeech] Notice:", event.error);
       if (event.error === "not-allowed") {
         showPermissionBanner("Microphone access is blocked. Click below to allow.");
+        stopWebSpeech();
+      } else {
+        // Non-fatal error (no-speech, network, aborted) — schedule fresh restart
+        scheduleWebSpeechRestart();
       }
     };
 
@@ -472,12 +496,7 @@ function startWebSpeech(): void {
       isWebSpeechRunning = false;
       // Auto-restart if listening is still enabled
       if (currentListeningState) {
-        try {
-          webSpeechRecognition.start();
-          isWebSpeechRunning = true;
-        } catch {
-          // ignore restart collisions
-        }
+        scheduleWebSpeechRestart();
       }
     };
 
@@ -490,9 +509,15 @@ function startWebSpeech(): void {
 }
 
 function stopWebSpeech(): void {
+  if (webSpeechRestartTimer) {
+    clearTimeout(webSpeechRestartTimer);
+    webSpeechRestartTimer = null;
+  }
   if (webSpeechRecognition) {
     try {
-      webSpeechRecognition.stop();
+      webSpeechRecognition.onend = null;
+      webSpeechRecognition.onerror = null;
+      webSpeechRecognition.abort();
     } catch {}
     webSpeechRecognition = null;
   }
@@ -668,20 +693,19 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown) => {
     case "MODEL_LOAD_PROGRESS": {
       // Show model download progress bar (FR-MODEL-01).
       let pct = 0;
-      let phase = "Loading speech model";
-
-      if (msg.stt && msg.stt.total > 0 && msg.stt.loaded < msg.stt.total) {
+      if (typeof msg.progress === "number") {
+        pct = Math.round(msg.progress * 100);
+      } else if (typeof msg.loaded === "number") {
+        pct = Math.round(msg.loaded);
+      } else if (msg.stt && msg.stt.total > 0 && msg.stt.loaded < msg.stt.total) {
         pct = Math.round((msg.stt.loaded / msg.stt.total) * 100);
-        phase = "Downloading speech model";
-      } else if (msg.llm && msg.llm.total > 0 && msg.llm.loaded < msg.llm.total) {
+      } else if (msg.llm && msg.llm.total > 0) {
         pct = Math.round((msg.llm.loaded / msg.llm.total) * 100);
-        phase = "Downloading AI planner";
-      } else if (msg.stt && msg.stt.total > 0) {
-        pct = 100;
-        phase = "Speech ready";
       }
 
-      const done = pct >= 100 && (!msg.llm || msg.llm.loaded >= msg.llm.total);
+      pct = Math.min(100, Math.max(0, pct));
+      const phase = String(msg.text || (msg.done ? "Models ready!" : `Downloading models… ${pct}%`));
+      const done = Boolean(msg.done);
       showModelProgress(pct, phase, done);
       break;
     }

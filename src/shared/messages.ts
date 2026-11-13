@@ -120,6 +120,8 @@ export interface SpeakingMsg extends BaseMessage {
 /** SW instructs offscreen to start the audio pipeline. */
 export interface StartAudioMsg extends BaseMessage {
   type: "START_AUDIO";
+  /** Optional model profile to use (selected during onboarding). Defaults to "lite". */
+  profile?: string;
 }
 
 /** SW instructs offscreen to stop the audio pipeline. */
@@ -211,8 +213,14 @@ export interface TtsDoneMsg extends BaseMessage {
 /** Offscreen reports STT/LLM model download progress. */
 export interface ModelLoadProgressMsg extends BaseMessage {
   type: "MODEL_LOAD_PROGRESS";
-  stt?: { loaded: number; total: number };
-  llm?: { loaded: number; total: number; text?: string };
+  progress?: number;
+  loaded?: number;
+  total?: number;
+  done?: boolean;
+  phase?: string;
+  text?: string;
+  stt?: { loaded: number; total: number; ready?: boolean };
+  llm?: { loaded: number; total: number; text?: string; ready?: boolean };
 }
 
 /** Offscreen streams a single LLM output token to the panel. */

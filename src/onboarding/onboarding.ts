@@ -137,6 +137,7 @@ document.getElementById("btn-step2-back")?.addEventListener("click", () => goToS
 /**
  * Wait for model download to complete via real MODEL_LOAD_PROGRESS messages.
  * Only real model download progress from offscreen workers is accepted (no simulation fallbacks).
+ * Only resolves when BOTH speech recognition and AI planner models are fully loaded and ready (done === true).
  */
 function waitForModelDownload(): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -156,26 +157,27 @@ function waitForModelDownload(): Promise<void> {
 
         if (typeof m["progress"] === "number") {
           pct = Math.round(m["progress"] * 100);
+        } else if (typeof m["loaded"] === "number") {
+          pct = Math.round(m["loaded"] as number);
         } else if (typeof (m["llm"] as any)?.loaded === "number") {
           const llm = m["llm"] as any;
           pct = llm.total > 0 ? Math.round((llm.loaded / llm.total) * 100) : Math.round(llm.loaded);
-        } else if (typeof (m["stt"] as any)?.loaded === "number") {
-          const stt = m["stt"] as any;
-          pct = stt.total > 0 ? Math.round((stt.loaded / stt.total) * 100) : Math.round(stt.loaded);
         }
 
         pct = Math.min(100, Math.max(0, pct));
-        statusText = String(m["text"] || (m["llm"] as any)?.text || `Downloading model files… ${pct}%`);
+        statusText = String(m["text"] || `Downloading model files… ${pct}%`);
 
         progressFill.style.width = `${pct}%`;
         progressFill.setAttribute("aria-valuenow", String(pct));
         downloadStatus.textContent = statusText;
 
-        if (m["done"] === true || pct >= 100 || m["phase"] === "ready") {
+        // ONLY resolve when BOTH models report ready via done === true
+        if (m["done"] === true) {
           clearTimeout(timeoutTimer);
           chrome.runtime.onMessage.removeListener(progressListener);
           downloadStatus.textContent = "✓ Models ready!";
           downloadStatus.style.color = "#10b981";
+          progressFill.style.width = "100%";
           resolve();
         }
       }

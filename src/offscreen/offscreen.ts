@@ -36,15 +36,27 @@ let pipelineRunning = false;
 /**
  * Initialize all subsystems.
  * Called on START_AUDIO message from the service worker.
+ * @param profileStr - The model profile string from onboarding (e.g. "lite", "balanced").
  */
-async function startAudioPipeline(): Promise<void> {
+async function startAudioPipeline(profileStr?: string): Promise<void> {
   if (pipelineRunning) {
     console.warn("[Offscreen] Audio pipeline already running — ignoring START_AUDIO.");
     return;
   }
 
+  // Map profile string to ModelProfile enum
+  const profileMap: Record<string, ModelProfile> = {
+    lite: ModelProfile.Fast,
+    standard: ModelProfile.Balanced,
+    enhanced: ModelProfile.Powerful,
+    fast: ModelProfile.Fast,
+    balanced: ModelProfile.Balanced,
+    powerful: ModelProfile.Powerful,
+  };
+  const profile = (profileStr && profileMap[profileStr]) || ModelProfile.Fast;
+
   try {
-    console.log("[Offscreen] Initializing audio pipeline...");
+    console.log(`[Offscreen] Initializing audio pipeline with profile "${profile}"...`);
 
     // Initialize TTS first (fastest, no worker required)
     tts = new TTS();
@@ -79,7 +91,7 @@ async function startAudioPipeline(): Promise<void> {
 
     await audioCapture.start();
     await vad.start();
-    await agentCore.initialize();
+    await agentCore.initialize(profile);
 
     pipelineRunning = true;
     console.log("[Offscreen] Audio pipeline started successfully.");
@@ -159,7 +171,7 @@ chrome.runtime.onMessage.addListener(
 async function handleMessage(msg: VoxPilotMessage): Promise<void> {
   switch (msg.type) {
     case "START_AUDIO":
-      await startAudioPipeline();
+      await startAudioPipeline(msg.profile);
       break;
 
     case "STOP_AUDIO":
@@ -223,16 +235,23 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
         agentCore = new AgentCore({ tts });
       }
 
-      try {
-        await agentCore.loadProfile(profile);
-      } catch (err: unknown) {
+      // Fire-and-forget: loadProfile takes many minutes to download models.
+      // Progress is reported via MODEL_LOAD_PROGRESS messages throughout.
+      // Do NOT await here — Chrome's message channel has a ~5s response timeout.
+      agentCore.loadProfile(profile).catch((err: unknown) => {
         console.error("[Offscreen] Real model load failed:", err);
-      }
+      });
       break;
     }
 
     case "PROFILE_CHANGED": {
       console.log(`[Offscreen] Profile changed to: ${msg.profile}`);
+      break;
+    }
+
+    case "EXECUTION_DONE": {
+      // Plan execution finished in tab — reset AgentCore to Listening state
+      agentCore?.onExecutionDone();
       break;
     }
 
@@ -246,7 +265,6 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
     case "SESSION_STATE_UPDATE":
     case "TRANSCRIPT_UPDATE":
     case "PLAN_READY":
-    case "EXECUTION_DONE":
     case "CONFIRM_PLAN":
     case "CANCEL_PLAN":
     case "TTS_DONE":
@@ -260,6 +278,9 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
     case "OFFSCREEN_ERROR":
     case "REQUEST_SNAPSHOT":
     case "PLAN_PRODUCED":
+    case "LLM_TOKEN":
+    case "VAULT_PASSPHRASE_REQUEST":
+    case "VAULT_UNLOCK_FAILED":
       // Handled by Service Worker or Panel — ignored by Offscreen
       break;
 

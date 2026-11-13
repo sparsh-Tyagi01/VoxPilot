@@ -121,6 +121,12 @@ export class AgentCore {
   /** Set to true when "stop" / kill switch is triggered mid-operation. */
   private killRequested = false;
 
+  // ─── Model loading state tracking ──────────────────────────────────────────
+  private sttProgress = 0;
+  private llmProgress = 0;
+  private isSttReady = false;
+  private isLlmReady = false;
+
   constructor(config: AgentCoreConfig) {
     this.tts = config.tts;
     this.intentRouter = new IntentRouter();
@@ -136,13 +142,10 @@ export class AgentCore {
 
   /**
    * Spawn STT and LLM workers, load models, and wire up the Planner.
-   * Called once when the offscreen document starts.
-   *
-   * Returns when both workers have signalled 'ready' (models loaded).
-   * The UI shows a loading indicator during this phase.
+   * Called once when the offscreen document starts or during profile change.
    */
-  async initialize(): Promise<void> {
-    console.log("[AgentCore] Initializing workers…");
+  async initialize(profile: ModelProfile = DEFAULT_MODEL_PROFILE): Promise<void> {
+    console.log(`[AgentCore] Initializing workers with profile "${profile}"…`);
 
     // ── STT Worker ──────────────────────────────────────────────────────────
     this.sttWorker = new Worker(
@@ -174,22 +177,16 @@ export class AgentCore {
     this.planner.setLLMInterface(llmInterface);
 
     // ── Determine model IDs for current profile ─────────────────────────────
-    const profileConfig = MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
+    const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
 
     // Post load requests
     this.sttWorker.postMessage({ type: "load", modelId: profileConfig.sttModelId });
     this.llmWorker.postMessage({ type: "load", modelId: profileConfig.modelId });
 
-    // Notify SW that model loading has begun (panel shows progress bar)
-    await sendToSW({
-      type: "MODEL_LOAD_PROGRESS",
-      stt: { loaded: 0, total: 100 },
-      llm: { loaded: 0, total: 100, text: "Starting…" },
-    } as any);
+    // Emit initial progress
+    this.emitModelProgress("Initializing neural models… 0%");
 
     // Transition to Listening as soon as STT worker is ready (Whisper loaded).
-    // Fast-path commands ("scroll down", "click", "back", "stop", "undo") only need STT
-    // and can execute immediately without waiting for the large LLM to download/compile.
     this.sttReady
       .then(async () => {
         console.log("[AgentCore] STT ready — transitioning to Listening.");
@@ -312,22 +309,23 @@ export class AgentCore {
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Planning });
 
         // Request a fresh page snapshot
+        this.currentSnapshot = null;
         const tabId = await this.getActiveTabId();
         await sendToSW({ type: "REQUEST_SNAPSHOT", tabId });
         await this.waitForSnapshot();
 
         if (this.killRequested) { this.handleKill(); return; }
 
-        // Plan with Planner (uses Chrome AI -> WebLLM -> Autonomous Semantic Reasoner)
+        // Plan with Planner (real neural model only)
         plan = await this.planner.plan(text, this.currentSnapshot!);
       }
 
       if (this.killRequested) { this.handleKill(); return; }
 
-      // ── Step 5: Validate & Classify Risk ─────────────────────────────────
-      this.validator.validate(plan);
-      const risk = this.riskClassifier.classify(plan);
-      plan = { ...plan, risk };
+      // ── Step 5: Classify Risk & Validate ─────────────────────────────────
+      const risk = (typeof plan.risk === "number" && plan.risk >= 0 && plan.risk <= 4)
+        ? plan.risk
+        : this.riskClassifier.classify(plan);
 
       const riskConfig = RISK_TIER_CONFIG[risk];
 
@@ -335,9 +333,12 @@ export class AgentCore {
       // R3/R4 plans MUST ALWAYS require explicit user confirmation.
       const needsConfirm = risk >= RiskTier.R3
         ? true  // ← Hardcoded safety floor.
-        : riskConfig.requiresConfirmation;
+        : (typeof plan.requiresConfirmation === "boolean" ? plan.requiresConfirmation : riskConfig.requiresConfirmation);
 
-      plan = { ...plan, requiresConfirmation: needsConfirm };
+      plan = { ...plan, risk, requiresConfirmation: needsConfirm };
+
+      // Strictly validate normalized plan with PlanValidator
+      this.validator.validate(plan);
 
       // Send plan to SW — it coordinates confirmation UI and execution relay
       await sendToSW({ type: "PLAN_PRODUCED", plan });
@@ -348,6 +349,14 @@ export class AgentCore {
       } else {
         this.transitionTo(AgentState.Executing);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Executing });
+
+        // Safety watchdog: auto-return to Listening if SW or execution stalls
+        setTimeout(() => {
+          if (this.state === AgentState.Executing) {
+            console.warn("[AgentCore] Execution watchdog timed out — recovering to Listening state");
+            this.onExecutionDone();
+          }
+        }, 12_000);
       }
 
     } catch (err: unknown) {
@@ -405,6 +414,17 @@ export class AgentCore {
       this.transitionTo(AgentState.Listening);
       await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
     }
+  }
+
+  /**
+   * Called when execution of a plan completes.
+   * Returns the agent to the Listening state and cleans up the active snapshot.
+   */
+  onExecutionDone(): void {
+    console.log("[AgentCore] Execution complete — returning to Listening state.");
+    this.currentSnapshot = null;
+    this.transitionTo(AgentState.Listening);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
   }
 
   /**
@@ -631,14 +651,63 @@ export class AgentCore {
   }
 
   /**
+   * Emit weighted model download progress to SW (panel & onboarding).
+   * Whisper STT = 15% weight, WebLLM = 85% weight.
+   * Only emits done === true when BOTH STT and LLM workers are ready.
+   */
+  private emitModelProgress(detailText?: string): void {
+    const isAllReady = this.isSttReady && this.isLlmReady;
+    const weightedProgress = isAllReady ? 1.0 : (this.sttProgress * 0.15 + this.llmProgress * 0.85);
+    const pct = isAllReady ? 100 : Math.min(99, Math.round(weightedProgress * 100));
+
+    let text = detailText;
+    if (isAllReady) {
+      text = "✓ Models ready!";
+    } else if (!text) {
+      if (!this.isSttReady) {
+        text = `Downloading speech recognition model… ${Math.round(this.sttProgress * 100)}%`;
+      } else {
+        text = `Downloading AI planner model… ${Math.round(this.llmProgress * 100)}%`;
+      }
+    }
+
+    void sendToSW({
+      type: "MODEL_LOAD_PROGRESS",
+      progress: isAllReady ? 1.0 : weightedProgress,
+      loaded: pct,
+      total: 100,
+      done: isAllReady,
+      phase: isAllReady ? "ready" : (this.isSttReady ? "llm" : "stt"),
+      text,
+      stt: {
+        loaded: Math.round(this.sttProgress * 100),
+        total: 100,
+        ready: this.isSttReady,
+      },
+      llm: {
+        loaded: Math.round(this.llmProgress * 100),
+        total: 100,
+        ready: this.isLlmReady,
+        text: detailText,
+      },
+    } as any);
+  }
+
+  /**
    * Explicitly load models for a given profile (e.g. from Onboarding).
    */
   async loadProfile(profile: ModelProfile): Promise<void> {
     const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
     console.log(`[AgentCore] Loading profile "${profile}" (${profileConfig.label})…`);
 
+    this.isSttReady = false;
+    this.isLlmReady = false;
+    this.sttProgress = 0;
+    this.llmProgress = 0;
+
     if (!this.sttWorker || !this.llmWorker) {
-      await this.initialize();
+      await this.initialize(profile);
+      await Promise.all([this.sttReady, this.llmReady]);
       return;
     }
 
@@ -658,11 +727,10 @@ export class AgentCore {
     switch (msg.type) {
       case "ready":
         console.log("[AgentCore] STT worker ready.");
+        this.sttProgress = 1.0;
+        this.isSttReady = true;
         this.sttReadyResolve();
-        void sendToSW({
-          type: "MODEL_LOAD_PROGRESS",
-          stt: { loaded: 100, total: 100 },
-        } as any);
+        this.emitModelProgress("Speech recognition ready.");
         break;
 
       case "result":
@@ -675,11 +743,10 @@ export class AgentCore {
         break;
 
       case "progress":
-        // Forward STT download progress to panel via SW.
-        void sendToSW({
-          type: "MODEL_LOAD_PROGRESS",
-          stt: { loaded: msg.loaded, total: msg.total },
-        } as any);
+        if (msg.total > 0) {
+          this.sttProgress = Math.min(1.0, msg.loaded / msg.total);
+        }
+        this.emitModelProgress(`Downloading speech recognition model… ${Math.round(this.sttProgress * 100)}%`);
         break;
 
       default: {
@@ -696,30 +763,17 @@ export class AgentCore {
     switch (msg.type) {
       case "ready":
         console.log("[AgentCore] LLM worker ready.");
+        this.llmProgress = 1.0;
+        this.isLlmReady = true;
         this.llmReadyResolve();
-        void sendToSW({
-          type: "MODEL_LOAD_PROGRESS",
-          progress: 1.0,
-          phase: "ready",
-          loaded: 100,
-          total: 100,
-          done: true,
-          text: "Models ready!",
-          llm: { loaded: 100, total: 100, text: "Models ready!" },
-        } as any);
+        this.emitModelProgress("AI planner ready.");
         break;
 
       case "progress":
-        // Forward LLM download progress to panel and onboarding via SW.
-        void sendToSW({
-          type: "MODEL_LOAD_PROGRESS",
-          progress: msg.loaded / 100,
-          phase: "downloading",
-          loaded: msg.loaded,
-          total: msg.total,
-          text: msg.text,
-          llm: { loaded: msg.loaded, total: msg.total, text: msg.text },
-        } as any);
+        if (msg.total > 0) {
+          this.llmProgress = Math.min(1.0, msg.loaded / msg.total);
+        }
+        this.emitModelProgress(msg.text || `Downloading AI planner model… ${Math.round(this.llmProgress * 100)}%`);
         break;
 
       case "token": {
