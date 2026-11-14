@@ -8,8 +8,10 @@
  *   - autoGainControl: true   — normalizes volume across different microphones
  *
  * Audio flow:
- *   MediaStream → MediaStreamAudioSourceNode → ScriptProcessorNode* → onAudioData callback
- *   (* AudioWorklet preferred; ScriptProcessor used as fallback for compatibility)
+ *   MediaStream → MediaStreamAudioSourceNode → AudioWorkletNode → onAudioData callback
+ *
+ * The AudioWorkletProcessor (public/audio-processor.js) accumulates 128-frame
+ * render quanta into 2048-frame chunks and posts them back via MessagePort.
  *
  * The captured audio is Float32Array at AUDIO_SAMPLE_RATE (16 kHz), suitable for
  * direct input to Whisper (which is also trained on 16 kHz audio).
@@ -21,7 +23,7 @@ import { AUDIO_SAMPLE_RATE } from "@shared/constants.js";
 export interface AudioCaptureConfig {
   /**
    * Callback invoked with each audio chunk from the microphone.
-   * Called at the ScriptProcessor buffer rate (every ~64-128ms at 16 kHz).
+   * Called at ~128ms intervals (2048 frames at 16 kHz).
    * @param data Float32Array of mono PCM samples at AUDIO_SAMPLE_RATE
    */
   onAudioData: (data: Float32Array) => void;
@@ -33,8 +35,9 @@ export interface AudioCaptureConfig {
   onAudioLevel?: (level: number) => void;
 
   /**
-   * Buffer size for the ScriptProcessorNode (must be power of 2).
-   * Default: 2048 (~128ms at 16 kHz) for responsive feedback.
+   * Buffer size in frames passed to the AudioWorklet accumulator.
+   * Must match the TARGET_FRAMES constant in audio-processor.js.
+   * Default: 2048 (~128ms at 16 kHz).
    */
   bufferSize?: number;
 }
@@ -42,7 +45,11 @@ export interface AudioCaptureConfig {
 /**
  * Resample a Float32Array audio buffer to target sample rate using linear interpolation.
  */
-function resampleBuffer(input: Float32Array, fromRate: number, toRate: number): Float32Array {
+function resampleBuffer(
+  input: Float32Array,
+  fromRate: number,
+  toRate: number
+): Float32Array {
   if (fromRate === toRate) return new Float32Array(input);
   const ratio = fromRate / toRate;
   const newLength = Math.round(input.length / ratio);
@@ -63,10 +70,11 @@ export class AudioCapture {
   private stream: MediaStream | null = null;
   private audioContext: AudioContext | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
-  private processorNode: ScriptProcessorNode | null = null;
+  private workletNode: AudioWorkletNode | null = null;
   private gainNode: GainNode | null = null;
   private lastLevelEmitTime = 0;
-  private readonly config: Required<Omit<AudioCaptureConfig, "onAudioLevel">> & Pick<AudioCaptureConfig, "onAudioLevel">;
+  private readonly config: Required<Omit<AudioCaptureConfig, "onAudioLevel">> &
+    Pick<AudioCaptureConfig, "onAudioLevel">;
 
   constructor(config: AudioCaptureConfig) {
     this.config = {
@@ -78,7 +86,7 @@ export class AudioCapture {
   /**
    * Request microphone access and start the audio pipeline.
    * @throws {DOMException} if the user denies microphone permission
-   * @throws {NotFoundError} if no microphone is available
+   * @throws {Error} if no microphone is available or AudioWorklet fails to load
    */
   async start(): Promise<void> {
     if (this.stream) {
@@ -86,7 +94,7 @@ export class AudioCapture {
       return;
     }
 
-    // Request microphone with fallback for OS compatibility
+    // ── 1. Request microphone ─────────────────────────────────────────────────
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -98,51 +106,58 @@ export class AudioCapture {
         video: false,
       });
     } catch {
-      // Fallback with basic audio constraint (e.g. if hardware rejects advanced constraints)
+      // Fallback: basic audio constraint (some hardware rejects advanced constraints)
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: false,
       });
     }
 
-    // Create AudioContext at the target sample rate (fallback to native rate if constructor rejects option)
+    // ── 2. Create AudioContext at 16 kHz ──────────────────────────────────────
     try {
       this.audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
     } catch {
+      // Some environments reject the sampleRate option; use native rate + resample
       this.audioContext = new AudioContext();
     }
 
-    // CRITICAL: AudioContext created without direct user gesture starts suspended.
-    // In suspended state, the audio clock does NOT tick and onaudioprocess never fires.
+    // AudioContext created without a user gesture starts suspended.
     if (this.audioContext.state === "suspended") {
       await this.audioContext.resume();
     }
-    console.log(`[AudioCapture] AudioContext state: ${this.audioContext.state}, rate: ${this.audioContext.sampleRate} Hz`);
-
-    // Connect: MediaStream → AudioSourceNode → ScriptProcessorNode → GainNode(0) → output
-    this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
-    this.processorNode = this.audioContext.createScriptProcessor(
-      this.config.bufferSize,
-      1, // input channels (mono)
-      1  // output channels (mono)
+    console.log(
+      `[AudioCapture] AudioContext state: ${this.audioContext.state}, ` +
+      `rate: ${this.audioContext.sampleRate} Hz`
     );
 
-    // Mute gain node prevents mic feedback loop through speakers while keeping graph running
+    // ── 3. Load AudioWorklet module ───────────────────────────────────────────
+    const workletUrl = chrome.runtime.getURL("audio-processor.js");
+    await this.audioContext.audioWorklet.addModule(workletUrl);
+
+    // ── 4. Build graph: MediaStream → Source → Worklet → Gain(0) → output ────
+    this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
+    this.workletNode = new AudioWorkletNode(
+      this.audioContext,
+      "voxpilot-audio-processor"
+    );
+
+    // Mute gain node prevents mic feedback through speakers while keeping graph running
     this.gainNode = this.audioContext.createGain();
     this.gainNode.gain.value = 0;
 
     const nativeRate = this.audioContext.sampleRate;
 
-    // Audio processing callback — runs at buffer boundary
-    this.processorNode.onaudioprocess = (event: AudioProcessingEvent) => {
-      const channelData = event.inputBuffer.getChannelData(0);
+    // ── 5. Receive processed chunks from the worklet ──────────────────────────
+    this.workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
+      const raw = event.data;
 
-      // Resample to 16 kHz if the system AudioContext is running at 44.1k/48k
-      const chunk = nativeRate === AUDIO_SAMPLE_RATE
-        ? new Float32Array(channelData)
-        : resampleBuffer(channelData, nativeRate, AUDIO_SAMPLE_RATE);
+      // Resample to 16 kHz if the system AudioContext runs at 44.1k/48k
+      const chunk =
+        nativeRate === AUDIO_SAMPLE_RATE
+          ? raw
+          : resampleBuffer(raw, nativeRate, AUDIO_SAMPLE_RATE);
 
-      // Calculate RMS audio level
+      // Calculate RMS audio level for the VU meter
       let sumSq = 0;
       for (let i = 0; i < chunk.length; i++) {
         const s = chunk[i] ?? 0;
@@ -160,13 +175,13 @@ export class AudioCapture {
       this.config.onAudioData(chunk);
     };
 
-    // Connect the graph
-    this.sourceNode.connect(this.processorNode);
-    this.processorNode.connect(this.gainNode);
+    // ── 6. Connect graph ──────────────────────────────────────────────────────
+    this.sourceNode.connect(this.workletNode);
+    this.workletNode.connect(this.gainNode);
     this.gainNode.connect(this.audioContext.destination);
 
     console.log(
-      `[AudioCapture] Started. Sample rate: ${this.audioContext.sampleRate} Hz ` +
+      `[AudioCapture] Started (AudioWorkletNode). Sample rate: ${this.audioContext.sampleRate} Hz ` +
       `(${nativeRate === AUDIO_SAMPLE_RATE ? "native 16k" : "resampling to 16k"}), ` +
       `buffer: ${this.config.bufferSize} frames.`
     );
@@ -177,8 +192,11 @@ export class AudioCapture {
    * Safe to call even if not started.
    */
   stop(): void {
+    // Close the worklet message port to stop receiving messages
+    this.workletNode?.port.close();
+
     // Disconnect graph
-    this.processorNode?.disconnect();
+    this.workletNode?.disconnect();
     this.sourceNode?.disconnect();
     this.gainNode?.disconnect();
 
@@ -188,7 +206,7 @@ export class AudioCapture {
     // Close AudioContext
     this.audioContext?.close().catch(console.error);
 
-    this.processorNode = null;
+    this.workletNode = null;
     this.sourceNode = null;
     this.gainNode = null;
     this.stream = null;

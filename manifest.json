@@ -70,7 +70,8 @@
         "src/offscreen/offscreen.html",
         "src/onboarding/onboarding.html",
         "src/settings/settings.html",
-        "onnx/*"
+        "onnx/*",
+        "audio-processor.js"
       ],
       "matches": ["<all_urls>"]
     }

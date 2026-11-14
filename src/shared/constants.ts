@@ -35,8 +35,11 @@ export const CONTENT_SCRIPT_TIMEOUT_MS = 10_000;
 /** Maximum time to wait for LLM to produce a plan. */
 export const LLM_TIMEOUT_MS = 30_000;
 
-/** Maximum time to wait for STT to transcribe an utterance. */
-export const STT_TIMEOUT_MS = 15_000;
+/** Maximum time to wait for STT to transcribe an utterance.
+ * First inference on CPU (WASM) can take 25-40s due to JIT compilation.
+ * Subsequent inferences are typically 1-5s.
+ */
+export const STT_TIMEOUT_MS = 60_000;
 
 /** Debounce delay for DOM mutations before re-snapshotting. */
 export const DOM_MUTATION_DEBOUNCE_MS = 200;
