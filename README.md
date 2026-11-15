@@ -9,11 +9,15 @@
 
 ---
 
+For the performance redesign, hardware strategy, target architecture, and prioritized engineering backlog, read the [architecture and optimization roadmap](docs/ARCHITECTURE_AND_OPTIMIZATION_ROADMAP.md).
+
+Implementation progress, benchmark instructions, and unfinished roadmap items are tracked in [implementation status](docs/IMPLEMENTATION_STATUS.md).
+
 ## Popup and background listening
 
 Click the toolbar icon to open the compact popup. Start listening, then close the popup to keep using voice control; Pause or **Alt+V** turns the microphone off. Models loaded during setup stay available across mic pauses. Loading saved models is shown separately from downloading files.
 
-See [release readiness and troubleshooting](docs/RELEASE_READINESS.md) for verification commands, Chrome smoke tests, and remaining release gaps. Run `npm run check` to validate source and create `dist/`. After rebuilding, reload the extension at `chrome://extensions` and refresh target webpages. The intended capabilities below include Silero VAD and Kokoro/Piper TTS; the current implementation uses energy-based VAD and browser SpeechSynthesis.
+See [release readiness and troubleshooting](docs/RELEASE_READINESS.md) for verification commands, Chrome smoke tests, and remaining release gaps. Run `npm run check` to validate source and create `dist/`. After rebuilding, reload the extension at `chrome://extensions` and refresh target webpages. Silero VAD runs locally in a CPU/WASM worker; speech output uses local browser SpeechSynthesis voices. Kokoro/Piper TTS remains planned. Silence and unrecognized voice input do not speak the direct-command tutorial.
 
 ## What is VoxPilot?
 
@@ -95,11 +99,14 @@ Extension Pages:
 
 ## Model Profiles
 
-| Profile | LLM | STT | Storage | GPU VRAM |
-|---------|-----|-----|---------|----------|
-| **Lite** | Rules only | Whisper tiny (WASM) | ≈300 MB | None |
-| **Standard** ⭐ | Llama 3.2 1B | Whisper base | ≈1.2 GB | 2 GB |
-| **Enhanced** | Llama 3.2 3B | Whisper base | ≈3.0 GB | 4 GB |
+| Mode | Planner | Speech | Loading policy |
+|---|---|---|---|
+| **Essential (default)** | None | Whisper tiny, CPU/WASM | Speech only; no GPU needed |
+| **Assist** | Optional Llama 3.2 1B | Whisper tiny | Planner loads on the first complex request |
+| **Advanced** | Optional Llama 3.2 3B | Whisper base | Planner loads on demand |
+| **Expert** | Optional Llama 3.1 8B | Whisper base | Explicit choice for capable GPUs |
+
+Idle planners release GPU resources after two minutes. Old stored profile names remain supported. Downloaded weights and initialized inference engines have different lifetimes. Real latency and hardware requirements must be measured; see [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
 ---
 

@@ -10,7 +10,7 @@
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "lint": "eslint src",
-    "check": "npm run type-check && npm run lint && npm test && npm run build:prod"
+    "check": "npm run type-check && npm run lint && npm test && npm run build:prod && node scripts/verify-build.mjs"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0-beta.23",
@@ -28,7 +28,9 @@
     "@ricky0123/vad-web": "^0.0.19",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
-    "canvas": "^3.2.3"
+    "canvas": "^3.2.3",
+    "onnxruntime-common": "1.22.0-dev.20250409-89f8206ba4",
+    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4"
   },
   "overrides": {
     "@huggingface/transformers": {

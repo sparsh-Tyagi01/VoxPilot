@@ -10,6 +10,8 @@
  * Build outputs land in `dist/` which is the extension load path.
  */
 
+import { rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import { crx } from "@crxjs/vite-plugin";
 import manifest from "./manifest.json";
@@ -39,6 +41,13 @@ export default defineConfig(({ mode }) => ({
      * 4. Patches the output manifest for the dist/ folder
      */
     crx({ manifest }),
+    {
+      name: "omit-unused-public-onnx",
+      async closeBundle() {
+        // STT now references version-matched emitted assets, not these public copies.
+        await rm(fileURLToPath(new URL("./dist/onnx", import.meta.url)), { recursive: true, force: true });
+      },
+    },
   ],
 
   build: {

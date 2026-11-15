@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentState, RiskTier } from "../src/shared/types.js";
 import type { AgentPlan, SessionState } from "../src/shared/types.js";
 import { SESSION_KEYS } from "../src/shared/constants.js";
+import { EXECUTION_RECEIPT_KEY } from "../src/sw/execution-journal.js";
 
 const history = vi.hoisted(() => ({ append: vi.fn(async () => undefined) }));
 vi.mock("../src/shared/history.js", () => ({
@@ -26,6 +27,7 @@ function createChrome() {
   return {
     storage: { session: area(session), local: area(local) },
     runtime: {
+      id: "voxpilot",
       onMessage: { addListener: vi.fn((listener: MessageListener) => { handleMessage = listener; }), removeListener: vi.fn() },
       sendMessage: vi.fn(async (_message: unknown) => ({ ok: true })),
       getURL: (path: string) => `chrome-extension://voxpilot/${path}`,
@@ -35,7 +37,9 @@ function createChrome() {
     tabs: {
       query: vi.fn(async () => [{ id: 12, windowId: 1, index: 0, active: true, url: "https://example.com" }]),
       sendMessage: vi.fn((_tab: number, message: { type: string }, _options: unknown, callback: (value: unknown) => void) => {
-        callback(message.type === "EXECUTE_IN_PAGE"
+        callback(message.type === "CAPTURE_SNAPSHOT"
+          ? { type: "SNAPSHOT_RESPONSE", snapshot: { documentId: "macro-document", url: "https://example.com", title: "test", capturedAt: 1, truncated: false, elements: [{ handle: "e100", label: "Submit" }] } }
+          : message.type === "EXECUTE_IN_PAGE"
           ? { type: "EXECUTION_DONE", success: !pageFailure, ...(pageFailure ? { error: pageFailure } : {}) }
           : { ok: true });
       }),
@@ -54,7 +58,7 @@ const confirmedPlan: AgentPlan = {
   intent: "Submit form", risk: RiskTier.R3, requiresConfirmation: true,
   actions: [{ type: "click", handle: "e1", label: "Submit" }, { type: "done", summary: "Submitted." }],
 };
-const request = (message: unknown): Promise<Record<string, unknown>> => new Promise(resolve => { handleMessage(message, { id: "voxpilot" }, value => resolve(value as Record<string, unknown>)); });
+const request = (message: unknown): Promise<Record<string, unknown>> => new Promise(resolve => { handleMessage(message, { id: "voxpilot", url: `chrome-extension://voxpilot/${["AGENT_STATE_CHANGED", "AUDIO_LEVEL", "MODEL_LOAD_PROGRESS", "TRANSCRIPT", "PLAN_PRODUCED", "REQUEST_SNAPSHOT", "OFFSCREEN_ERROR", "TTS_DONE", "LLM_TOKEN", "PERFORMANCE_SAMPLE", "RELAY_ACTION"].includes((message as { type: string }).type) ? "src/offscreen/offscreen.html" : "src/panel/panel.html"}` }, value => resolve(value as Record<string, unknown>)); });
 const executeCalls = () => api.tabs.sendMessage.mock.calls.filter(([, message]) => message.type === "EXECUTE_IN_PAGE");
 
 beforeEach(async () => {
@@ -70,6 +74,14 @@ beforeEach(async () => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("service worker orchestration", () => {
+  it("interrupts old execution after worker restart without replaying page actions", async () => {
+    session[SESSION_KEYS.SESSION_STATE] = { ...state(), agentState: AgentState.Executing, currentPlan: confirmedPlan, executionId: "interrupted" };
+    session[EXECUTION_RECEIPT_KEY] = { executionId: "interrupted", status: "running", updatedAt: Date.now(), steps: [{ index: 0, kind: "click", status: "dispatched" }] };
+    expect(await request({ type: "GET_SESSION_STATE" })).toMatchObject({ currentPlan: null, executionId: null, agentState: AgentState.Listening });
+    expect(session[EXECUTION_RECEIPT_KEY]).toMatchObject({ status: "interrupted", steps: [{ status: "uncertain" }] });
+    expect(executeCalls()).toHaveLength(0);
+    expect(await request({ type: "CONFIRM_PLAN" })).toMatchObject({ ok: false });
+  });
   it("does not answer offscreen or UI messages and steal another context's response", () => {
     for (const target of ["offscreen", "ui"]) {
       const respond = vi.fn();
@@ -79,14 +91,14 @@ describe("service worker orchestration", () => {
   });
 
   it("restores model readiness from the live offscreen session when the popup reopens", async () => {
-    const status = { type: "MODEL_LOAD_PROGRESS", profile: "fast", phase: "ready", done: true, progress: 1 };
+    const status = { type: "MODEL_LOAD_PROGRESS", profile: "essential", phase: "ready", done: true, progress: 1 };
     await request(status);
     expect(await request({ type: "GET_MODEL_STATUS" })).toEqual(status);
     expect(api.offscreen.createDocument).not.toHaveBeenCalled();
   });
 
   it("does not present stale ready status after the offscreen document is gone", async () => {
-    session["model_load_status"] = { type: "MODEL_LOAD_PROGRESS", done: true, phase: "ready", profile: "fast" };
+    session["model_load_status"] = { type: "MODEL_LOAD_PROGRESS", done: true, phase: "ready", profile: "essential" };
     api.offscreen.hasDocument.mockResolvedValue(false);
     expect(await request({ type: "GET_MODEL_STATUS" })).toMatchObject({ phase: "idle", done: false });
   });
@@ -103,7 +115,7 @@ describe("service worker orchestration", () => {
   });
 
   it("keeps cached model readiness when setup requests the same live profile", async () => {
-    const ready = { type: "MODEL_LOAD_PROGRESS", profile: "fast", phase: "ready", done: true, progress: 1 };
+    const ready = { type: "MODEL_LOAD_PROGRESS", profile: "essential", phase: "ready", done: true, progress: 1 };
     session["model_load_status"] = ready;
     expect(await request({ type: "START_MODEL_DOWNLOAD", profile: "lite" })).toEqual({ ok: true });
     expect(session["model_load_status"]).toEqual(ready);
@@ -120,6 +132,22 @@ describe("service worker orchestration", () => {
     expect(api.runtime.sendMessage).toHaveBeenCalledWith({ type: "EXECUTION_DONE", success: true, target: "offscreen" });
     expect(await request({ type: "CONFIRM_PLAN" })).toMatchObject({ ok: false });
     expect(executeCalls()).toHaveLength(1);
+  });
+
+  it("keeps the original document identity through confirmation and page execution", async () => {
+    await request({ type: "PLAN_PRODUCED", plan: confirmedPlan, documentId: "original-document" });
+    await request({ type: "CONFIRM_PLAN" });
+    expect(executeCalls()[0]?.[1]).toMatchObject({ documentId: "original-document" });
+  });
+
+  it("grounds macro targets freshly and requires confirmation for submission", async () => {
+    local["voxpilot_macros_v1"] = [{ id: "macro-1", name: "Submit", actions: [{ type: "click", handle: "e1", label: "Submit" }], useCount: 0 }];
+    expect(await request({ type: "TRIGGER_MACRO", macroId: "macro-1" })).toMatchObject({ ok: true });
+    expect(executeCalls()).toHaveLength(0);
+    expect(session[SESSION_KEYS.SESSION_STATE]).toMatchObject({ agentState: AgentState.Confirming, currentPlan: { requiresConfirmation: true } });
+    await request({ type: "CONFIRM_PLAN" });
+    expect(executeCalls()[0]?.[1]).toMatchObject({ documentId: "macro-document", plan: { actions: [{ type: "click", handle: "e100", label: "Submit" }] } });
+    expect(session[EXECUTION_RECEIPT_KEY]).toMatchObject({ status: "completed" });
   });
 
   it("claims a pending approval atomically when popup and page confirm together", async () => {
@@ -143,4 +171,21 @@ describe("service worker orchestration", () => {
       return value.type === "EXECUTION_DONE" && value.success === true;
     })).toBe(false);
   });
+  it("does not wait for spoken feedback to finish a verified action", async () => {
+    local["voice_settings"] = { spokenConfirmations: true };
+    api.runtime.sendMessage.mockImplementation(async (message: unknown) => {
+      if ((message as { type: string }).type === "SPEAK") return new Promise(() => {});
+      return { ok: true };
+    });
+    const result = await request({ type: "PLAN_PRODUCED", plan: { intent: "scroll", risk: 0, requiresConfirmation: false, actions: [{ type: "scroll", direction: "down" }, { type: "done", summary: "Scrolled" }] } });
+    expect(result.ok).toBe(true);
+    const current = session[SESSION_KEYS.SESSION_STATE] as SessionState;
+    expect(current.agentState).toBe(AgentState.Listening);
+  });
+  it("a late TTS failure cannot invalidate a newer command", async () => {
+    session[SESSION_KEYS.SESSION_STATE] = { ...state(), agentState: AgentState.Planning };
+    await request({ type: "OFFSCREEN_ERROR", source: "tts", message: "voice unavailable" });
+    expect((session[SESSION_KEYS.SESSION_STATE] as SessionState).agentState).toBe(AgentState.Planning);
+  });
+
 });

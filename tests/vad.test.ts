@@ -7,7 +7,7 @@ describe("VAD resource limits", () => {
     const onSpeechEnd = vi.fn();
     const vad = new VAD({ onSpeechStart: vi.fn(), onSpeechEnd });
     await vad.start();
-    const noise = new Float32Array(2048).fill(0.1);
+    const noise = Float32Array.from({ length: 2048 }, (_, i) => Math.sin(i / 7) * 0.1);
     for (let i = 0; i < 235; i++) vad.processAudioChunk(noise);
     expect(onSpeechEnd).toHaveBeenCalledOnce();
     expect(onSpeechEnd.mock.calls[0]![0].length).toBe(16_000 * 30);
@@ -19,7 +19,7 @@ describe("VAD resource limits", () => {
     const onSpeechEnd = vi.fn();
     const vad = new VAD({ onSpeechStart: vi.fn(), onSpeechEnd, onSpeechDiscard });
     await vad.start();
-    vad.processAudioChunk(new Float32Array(128).fill(0.1));
+    vad.processAudioChunk(Float32Array.from({ length: 128 }, (_, i) => Math.sin(i / 7) * 0.1));
     vad.processAudioChunk(new Float32Array(128));
     await vi.advanceTimersByTimeAsync(300);
     expect(onSpeechDiscard).toHaveBeenCalledOnce();

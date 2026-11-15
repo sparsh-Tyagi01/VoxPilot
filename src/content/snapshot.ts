@@ -62,7 +62,7 @@ const IMPLICIT_ROLES: Record<string, string> = {
  * Extract a human-readable label from a DOM element.
  * Priority: aria-label > aria-labelledby > associated <label> > placeholder > text content.
  */
-function extractLabel(el: Element): string | undefined {
+export function extractLabel(el: Element): string | undefined {
   // 1. aria-label
   const ariaLabel = el.getAttribute("aria-label")?.trim();
   if (ariaLabel) return ariaLabel.slice(0, 100);
@@ -142,6 +142,15 @@ function isEffectivelyHidden(el: Element): boolean {
 export class SnapshotBuilder {
   /** The handle registry — shared with ActionExecutor. */
   readonly handles: HandleRegistry = new HandleRegistry();
+  readonly documentId = crypto.randomUUID();
+  private candidates: Element[] | null = null;
+  private revision = 0;
+  private readonly observer = new MutationObserver(() => { this.candidates = null; this.revision++; });
+  constructor() {
+    this.observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+  }
+  dispose(): void { this.observer.disconnect(); this.candidates = null; }
+
 
   /**
    * Build a snapshot of the current page.
@@ -151,7 +160,7 @@ export class SnapshotBuilder {
    *
    * @returns PageSnapshot — compact representation of actionable elements.
    */
-  build(): PageSnapshot {
+  build(includeText = true): PageSnapshot {
     const startMs = performance.now();
     // Leave room for headings, readable text, and serialization metadata.
     const elementDeadline = startMs + Math.max(1, SNAPSHOT_TIMEOUT_MS - 10);
@@ -160,7 +169,9 @@ export class SnapshotBuilder {
     this.handles.reset();
 
     // Query all candidate elements
-    const candidates = document.querySelectorAll<Element>(ACTIONABLE_SELECTOR);
+    if (this.observer.takeRecords().length) { this.candidates = null; this.revision++; }
+    this.candidates ??= Array.from(document.querySelectorAll<Element>(ACTIONABLE_SELECTOR));
+    const candidates = this.candidates;
 
     const elements: ElementHandle[] = [];
     let truncated = false;
@@ -215,14 +226,14 @@ export class SnapshotBuilder {
 
     // Use textContent to avoid the synchronous layout calculation required by innerText.
     // Extract key headings for semantic understanding
-    const headings = Array.from(document.querySelectorAll<HTMLElement>("h1, h2, h3"))
+    const headings = Array.from(includeText ? document.querySelectorAll<HTMLElement>("h1, h2, h3") : [])
       .slice(0, 15)
       .map((h) => h.textContent?.trim().slice(0, 150))
       .filter((t): t is string => Boolean(t && t.length > 2))
       .slice(0, 15);
 
     // Extract readable main body text
-    const mainEl = document.querySelector<HTMLElement>("main, article, [role='main'], #content, .content") || document.body;
+    const mainEl = includeText ? document.querySelector<HTMLElement>("main, article, [role='main'], #content, .content") || document.body : null;
     const textParts: string[] = [];
     let textLength = 0;
     if (mainEl) {
@@ -245,6 +256,7 @@ export class SnapshotBuilder {
     }
 
     return {
+      documentId: this.documentId, revision: this.revision,
       url: window.location.href,
       title: document.title,
       elements,

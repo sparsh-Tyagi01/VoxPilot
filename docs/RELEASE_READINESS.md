@@ -1,12 +1,14 @@
 # Release readiness
 
+For the subsequent CPU-first implementation, current feature limits, and remaining roadmap work, see [implementation status](IMPLEMENTATION_STATUS.md).
+
 The automated checks cover request handling, worker recovery, model reuse, progress races, plan execution, and packaging. The compact popup was rendered in isolated Chrome at its shipped 340px width in paused, listening, confirmation, and error states with mocked runtime messages. A passing build does not verify real WebGPU inference or qualify this extension for a production release.
 
 ## Runtime changes
 
 - The toolbar icon opens a 340px popup. It owns no microphone or inference workers; closing it leaves listening running. Pause or Alt+V releases the microphone and keeps loaded models resident for reuse. The toolbar ON badge shows background listening. Restarting Chrome or reloading the extension requires reopening cached models, which is shown as loading rather than a new download.
-- Setup and listening reuse one offscreen AgentCore. The offscreen document uses USER_MEDIA and WORKERS reasons; it no longer gets closed on ordinary pause or inherits AUDIO_PLAYBACK's 30-second idle lifetime. Runtime messages explicitly target SW, offscreen, or UI, so popup state requests have a single responder.
-- Setup subscribes before model preparation begins and restores the latest profile-specific status when reopened. Worker file progress is aggregated monotonically; 100% means both workers are ready. Missing Content-Length does not invent a byte count. Cached initialization uses an indeterminate loading indicator.
+- Setup and listening reuse one offscreen AgentCore. Essential setup initializes CPU speech only; optional planners initialize on demand. The offscreen document uses USER_MEDIA and WORKERS reasons; it no longer gets closed on ordinary pause or inherits AUDIO_PLAYBACK's 30-second idle lifetime. Runtime messages explicitly target SW, offscreen, or UI, so popup state requests have a single responder.
+- Setup subscribes before model preparation begins and restores the latest profile-specific status when reopened. Worker file progress is aggregated monotonically; 100% means the requested features are ready; Essential does not require a planner. Missing Content-Length does not invent a byte count. Cached initialization uses an indeterminate loading indicator.
 - The offscreen Whisper worker is the only recognizer. Panel WebSpeech and its missing-language-pack loop have been removed. STT requests are single-flight; bounded barge-in speech can cancel a busy command without starting another one.
 - Planner requests use a smaller prompt and grammar, a 60-second first-token deadline, a 20-second token-inactivity deadline, and a 120-second overall limit. An actively producing stream is not stopped at the old fixed 30-second boundary.
 - Fast commands are grounded against a fresh page snapshot. Approved actions execute once in order in the original tab. Page-action failures are not retried by guessing a target or automatically submitting forms. Concurrent confirmations claim a plan atomically; pause/stop cancels remaining actions. Browser navigation uses an exact internal command allowlist.
@@ -45,7 +47,7 @@ This handles browser/driver failure; it cannot guarantee that a device will not 
 
 ## Remaining release work
 
-- TTS currently uses browser SpeechSynthesis; Kokoro/Piper is not implemented. VAD currently uses energy thresholds; Silero is not integrated. Verify voices and noisy environments accordingly.
+- TTS uses local browser SpeechSynthesis voices; Kokoro/Piper is not implemented. Silero VAD is bundled and runs in a CPU/WASM worker, with a conservative energy fallback. Digital-silence browser execution has been smoke tested; microphone accuracy and representative noisy environments still need evaluation.
 - Runtime and page execution are covered by mocked Chrome API regression tests. Complete real Chrome integration coverage for forms, multi-frame pages, browser lifecycle recovery, and permission prompts before release. Page commands currently target the top frame so handles cannot be confused across frames.
 - Complete accessibility, permissions/privacy, and Chrome Web Store review. Automated unit tests do not establish those properties.
 

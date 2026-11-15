@@ -17,6 +17,7 @@
  */
 
 import type { AgentAction, AgentPlan, ClickAction, TypeAction, SelectAction, ToggleAction, ScrollAction, NavigateAction, TabAction, ReadAction, FillFromVaultAction } from "@shared/types.js";
+import { extractLabel } from "./snapshot.js";
 import type { HandleRegistry } from "./handles.js";
 
 /**
@@ -67,9 +68,14 @@ export class ActionExecutor {
   private async doClick(action: ClickAction): Promise<void> {
     const el = this.resolveHandle(action.handle);
 
+    if (action.label && extractLabel(el)?.trim() !== action.label.trim()) throw new Error("The target label changed after planning. Repeat the command for fresh grounding.");
+    if ((el as HTMLInputElement).disabled) throw new Error("The target is disabled.");
     // Scroll element into view first
     el.scrollIntoView({ behavior: "smooth", block: "nearest" });
     await this.yield();
+    // Scrolling yields to page scripts; validate again immediately before acting.
+    if (!el.isConnected || (action.label && extractLabel(el)?.trim() !== action.label.trim())) throw new Error("The target changed before the click. Repeat the command.");
+    if ((el as HTMLInputElement).disabled || el.getAttribute("aria-disabled") === "true") throw new Error("The target is disabled.");
 
     // Dispatch synthetic click event chain
     this.dispatchMouseEvent(el, "mouseover");
@@ -95,9 +101,11 @@ export class ActionExecutor {
       throw new Error(`Handle ${action.handle} does not resolve to an HTMLElement`);
     }
 
+    if (el instanceof HTMLInputElement && el.type === "password") throw new Error("Use the vault for password fields.");
     // Focus the element
     el.focus();
     await this.yield();
+    if (!el.isConnected || (el instanceof HTMLInputElement && el.type === "password") || ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && (el.disabled || el.readOnly))) throw new Error("The field changed or is no longer editable.");
 
     // Strategy 1: React/Vue/Angular native value setter + change events
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -123,34 +131,7 @@ export class ActionExecutor {
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
 
-      // Dispatch Enter to submit search if it is a search input or handle is search
-      const isSearch =
-        action.handle.toLowerCase().includes("search") ||
-        el.type === "search" ||
-        (el.name && el.name.toLowerCase().includes("search")) ||
-        (el.placeholder && el.placeholder.toLowerCase().includes("search"));
-
-      if (isSearch || el.type === "text") {
-        this.dispatchKeyboardEvent(el, "keydown", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
-        this.dispatchKeyboardEvent(el, "keypress", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
-        this.dispatchKeyboardEvent(el, "keyup", "Enter", { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
-
-        if (isSearch) {
-          const form = el.form || el.closest("form");
-          if (form) {
-            try {
-              if (typeof form.requestSubmit === "function") {
-                form.requestSubmit();
-              } else {
-                form.submit();
-              }
-            } catch {
-              // Ignore form submit errors
-            }
-          }
-        }
-      }
-
+      // Typing is a field edit only. Submission requires a separately approved click.
       await this.yield();
       return;
     }

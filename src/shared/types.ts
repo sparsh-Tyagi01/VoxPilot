@@ -65,6 +65,7 @@ export enum RiskTier {
  * Lower = faster but less capable; Higher = slower but smarter.
  */
 export enum ModelProfile {
+  Essential = "essential",
   /** Llama 3.2 1B — fastest, lowest memory (~700 MB) */
   Fast = "fast",
   /** Llama 3.2 3B — balanced */
@@ -245,6 +246,8 @@ export interface ElementHandle {
  * Full snapshot of the current page state, sent to the LLM as context.
  */
 export interface PageSnapshot {
+  documentId?: string;
+  revision?: number;
   /** Current page URL */
   url: string;
   /** document.title */
@@ -314,6 +317,7 @@ export interface SessionState {
   lastTranscript: string;
   /** Current plan being confirmed/executed */
   currentPlan: AgentPlan | null;
+  currentDocumentId?: string | null;
   /** Identifies the plan that may still execute after async page work. */
   executionId?: string | null;
   /** Whether the offscreen document is alive */

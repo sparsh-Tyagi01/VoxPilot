@@ -40,7 +40,7 @@ chrome.runtime.onMessage.addListener(
 
       case "CAPTURE_SNAPSHOT": {
         // Build DOM snapshot synchronously (must complete in ≤50ms per NFR-PERF-08)
-        const snapshot = snapshotBuilder.build();
+        const snapshot = snapshotBuilder.build(msg.type === "CAPTURE_SNAPSHOT" ? msg.includeText !== false : true);
         sendResponse({ type: "SNAPSHOT_RESPONSE", snapshot });
         return false; // synchronous response
       }
@@ -49,6 +49,7 @@ chrome.runtime.onMessage.addListener(
         // Execute the plan actions asynchronously
         (async () => {
           try {
+            if (msg.documentId && msg.documentId !== snapshotBuilder.documentId) throw new Error("The page changed after planning. Repeat the command on the current page.");
             await executor.executePlan(msg.plan);
             sendResponse({ type: "EXECUTION_DONE", success: true });
           } catch (err: unknown) {

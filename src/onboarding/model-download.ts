@@ -1,3 +1,4 @@
+import { normalizeModelProfile } from "@shared/model-profiles.js";
 import type { ModelLoadProgressMsg } from "@shared/messages.js";
 
 export interface DownloadProgress {
@@ -6,9 +7,7 @@ export interface DownloadProgress {
   determinate: boolean;
 }
 
-export function canonicalProfile(profile: string): string {
-  return ({ lite: "fast", standard: "balanced", enhanced: "powerful" } as Record<string, string>)[profile] ?? profile;
-}
+export const canonicalProfile = normalizeModelProfile;
 
 /** Subscribe before starting, so cached models cannot finish before the listener exists. */
 export function downloadModels(

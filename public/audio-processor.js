@@ -17,12 +17,12 @@
 class VoxPilotAudioProcessor extends AudioWorkletProcessor {
   /**
    * Accumulation buffer — collects 128-frame blocks until we reach
-   * TARGET_FRAMES (2048), matching the old ScriptProcessorNode buffer size
-   * so downstream VAD/STT code receives identically-sized chunks.
+   * the requested duration at the native device sample rate (32 ms by default).
    */
-  constructor() {
+  constructor(options) {
     super();
-    this._TARGET_FRAMES = 2048;
+    const frameMs = Math.min(64, Math.max(16, options?.processorOptions?.frameMs ?? 32));
+    this._TARGET_FRAMES = Math.round(sampleRate * frameMs / 1000);
     this._buffer = new Float32Array(this._TARGET_FRAMES);
     this._filled = 0;
   }
@@ -50,8 +50,9 @@ class VoxPilotAudioProcessor extends AudioWorkletProcessor {
       srcOffset += toCopy;
 
       if (this._filled === this._TARGET_FRAMES) {
-        // Send a copy (the buffer will be reused)
-        this.port.postMessage(this._buffer.slice());
+        // Transfer ownership and allocate the next packet.
+        this.port.postMessage(this._buffer, [this._buffer.buffer]);
+        this._buffer = new Float32Array(this._TARGET_FRAMES);
         this._filled = 0;
       }
     }

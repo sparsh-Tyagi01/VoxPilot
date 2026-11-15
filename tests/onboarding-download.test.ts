@@ -5,7 +5,7 @@ let listeners: Set<(value: unknown) => boolean>;
 let sendMessage: ReturnType<typeof vi.fn>;
 const emit = (value: unknown) => listeners.forEach(listener => listener(value));
 const progress = (value: number, extra: Record<string, unknown> = {}) => ({
-  type: "MODEL_LOAD_PROGRESS", profile: "fast", phase: "downloading", progress: value, ...extra,
+  type: "MODEL_LOAD_PROGRESS", profile: "essential", phase: "downloading", progress: value, ...extra,
 });
 
 beforeEach(() => {

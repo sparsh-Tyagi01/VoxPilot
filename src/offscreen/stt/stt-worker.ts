@@ -18,11 +18,12 @@
  * Input  → { type: 'cancel' }
  *
  * Output ← { type: 'ready' }
- * Output ← { type: 'result',   text: string; confidence: number; language: string }
+ * Output ← { type: 'result',   text: string; confidence: number | null; language: string }
  * Output ← { type: 'progress', loaded: number; total: number; modelId: string }
  * Output ← { type: 'error',    message: string; stack?: string }
  */
 
+import { hasUsableSpeech } from "../audio/speech-gate.js";
 import {
   pipeline,
   env,
@@ -37,11 +38,13 @@ import {
  */
 if (env.backends.onnx?.wasm) {
   env.backends.onnx.wasm.proxy = false; // No proxy worker — we ARE a worker.
-  // Use local onnx runtime binaries from the extension origin to avoid remote script CSP violations
-  const onnxBase = (typeof self !== "undefined" && self.location?.origin)
-    ? self.location.origin + "/onnx/"
-    : "/onnx/";
-  env.backends.onnx.wasm.wasmPaths = onnxBase;
+  // Emit one version-matched runtime pair from the installed package. This also
+  // avoids shipping a second 21 MB copy through public/onnx.
+  env.backends.onnx.wasm.numThreads = 1;
+  env.backends.onnx.wasm.wasmPaths = {
+    wasm: new URL("../../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm", import.meta.url).href,
+    mjs: new URL("../../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs", import.meta.url).href,
+  };
 }
 env.allowLocalModels = false;          // Model files come from HuggingFace Hub CDN only.
 env.useBrowserCache = true;            // Use browser Cache Storage for persistence.
@@ -57,7 +60,7 @@ type STTWorkerInput =
 /** Messages the worker sends to the main thread. */
 type STTWorkerOutput =
   | { type: "ready" }
-  | { type: "result"; text: string; confidence: number; language: string }
+  | { type: "result"; text: string; confidence: number | null; language: string }
   | { type: "error"; message: string; stack?: string }
   | { type: "progress"; loaded: number; total: number; modelId: string; downloading?: boolean };
 
@@ -165,6 +168,10 @@ async function transcribe(audio: Float32Array): Promise<void> {
     postError("Audio must contain 0–30 seconds of finite 16 kHz PCM samples.");
     return;
   }
+  if (!hasUsableSpeech(audio)) {
+    post({ type: "result", text: "", confidence: null, language: "en" });
+    return;
+  }
   isTranscribing = true;
   const durationSeconds = audio.length / 16_000;
   console.log(`[STT Worker] Transcribing ${durationSeconds.toFixed(2)}s…`);
@@ -192,7 +199,7 @@ async function transcribe(audio: Float32Array): Promise<void> {
     post({
       type: "result",
       text,
-      confidence: 1.0, // Whisper ONNX via transformers.js doesn't expose token-level confidence.
+      confidence: null, // Whisper ONNX via transformers.js doesn't expose token-level confidence.
       language: "en",
     });
   } catch (err: unknown) {

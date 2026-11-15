@@ -1,3 +1,5 @@
+import { normalizeModelProfile } from "@shared/model-profiles.js";
+import { benchmarkSpeech } from "../diagnostics/speech-benchmark.js";
 /**
  * @file src/settings/settings.ts
  * @description Settings page logic for VoxPilot.
@@ -58,7 +60,8 @@ async function loadVoiceSettings(): Promise<void> {
   if (voice_settings) {
     idleTimeoutInput.value      = String(voice_settings.idleTimeoutSec ?? 120);
     bargeInToggle.checked       = voice_settings.bargeIn ?? true;
-    cloudSpeechToggle.checked   = voice_settings.cloudSpeech ?? false;
+    cloudSpeechToggle.checked   = false;
+    (document.getElementById("spoken-confirmations") as HTMLInputElement).checked = voice_settings.spokenConfirmations === true;
   }
 }
 
@@ -67,10 +70,13 @@ async function saveVoiceSettings(): Promise<void> {
     voice_settings: {
       idleTimeoutSec: parseInt(idleTimeoutInput.value, 10),
       bargeIn: bargeInToggle.checked,
-      cloudSpeech: cloudSpeechToggle.checked,
+      cloudSpeech: false,
+      spokenConfirmations: (document.getElementById("spoken-confirmations") as HTMLInputElement).checked,
     },
   });
 }
+
+document.getElementById("spoken-confirmations")?.addEventListener("change", () => { void saveVoiceSettings(); });
 
 idleTimeoutInput.addEventListener("change", () => saveVoiceSettings().catch(console.error));
 bargeInToggle.addEventListener("change", () => saveVoiceSettings().catch(console.error));
@@ -96,7 +102,7 @@ const sttThresholdInput   = document.getElementById("stt-threshold") as HTMLInpu
 
 async function loadModelSettings(): Promise<void> {
   const data = await chrome.storage.local.get(["selected_profile", "stt_threshold"]);
-  if (data["selected_profile"]) modelProfileSelect.value = data["selected_profile"] as string;
+  if (data["selected_profile"]) modelProfileSelect.value = normalizeModelProfile(String(data["selected_profile"]));
   if (data["stt_threshold"])    sttThresholdInput.value  = String(data["stt_threshold"]);
 }
 
@@ -158,7 +164,12 @@ vaultPassphrase.addEventListener("keydown", (e) => {
   if (e.key === "Enter") (document.getElementById("btn-unlock") as HTMLButtonElement)?.click();
 });
 
-document.getElementById("btn-lock-vault")?.addEventListener("click", () => {
+async function lockRuntimeVault(): Promise<void> {
+  await chrome.runtime.sendMessage({ type: "VAULT_LOCK" });
+}
+
+document.getElementById("btn-lock-vault")?.addEventListener("click", async () => {
+  await lockRuntimeVault();
   vault.lock();
   vaultLockedDiv.hidden = false;
   vaultUnlockedDiv.hidden = true;
@@ -189,6 +200,7 @@ document.getElementById("btn-change-passphrase")?.addEventListener("click", asyn
     return;
   }
 
+  await lockRuntimeVault();
   const ok = await vault.changePassphrase(currentPass, newPass);
   if (ok) {
     window.alert("✓ Passphrase changed successfully. Your vault has been re-encrypted.");
@@ -228,6 +240,7 @@ function renderVaultFields(): void {
     editBtn.addEventListener("click", async () => {
       const newValue = window.prompt(`Enter ${label}:`, currentValue ?? "");
       if (newValue !== null) {
+        await lockRuntimeVault();
         await vault.setField(key, newValue, label, sensitive);
         currentValue = newValue;
         valueEl.textContent = newValue
@@ -250,6 +263,7 @@ document.getElementById("btn-delete-vault")?.addEventListener("click", async () 
     "Delete all vault data?\n\nThis removes your name, email, address, and payment data permanently."
   );
   if (confirmed) {
+    await lockRuntimeVault();
     await vault.deleteAll();
     window.alert("Vault data deleted.");
     vaultLockedDiv.hidden = false;
@@ -262,6 +276,8 @@ document.getElementById("btn-delete-all")?.addEventListener("click", async () =>
     "Delete ALL VoxPilot data?\n\nThis removes settings, history, macros, vault, and downloaded models. You will need to re-run setup."
   );
   if (confirmed) {
+    await lockRuntimeVault();
+    vault.lock();
     await chrome.storage.local.clear();
     await chrome.storage.session.clear();
     window.alert("All data deleted. Please re-run setup.");
@@ -270,8 +286,11 @@ document.getElementById("btn-delete-all")?.addEventListener("click", async () =>
 });
 
 document.getElementById("btn-show-audit")?.addEventListener("click", async () => {
-  // TODO: Show audit log in a modal or section
-  window.alert("Network audit log: 0 external requests made in this session.\n\nAll processing is local.");
+  const report: unknown = await chrome.runtime.sendMessage({ type: "GET_DIAGNOSTICS" });
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url; link.download = "voxpilot-performance.json"; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
 // ─── About ────────────────────────────────────────────────────────────────────
@@ -284,3 +303,22 @@ if (aboutVersion) aboutVersion.textContent = manifest.version;
 
 Promise.all([loadVoiceSettings(), loadModelSettings()]).catch(console.error);
 
+
+// Diagnostic runs are explicit and use a short local audio file, never microphone capture.
+document.getElementById("btn-benchmark")?.addEventListener("click", async () => {
+  const button = document.getElementById("btn-benchmark") as HTMLButtonElement;
+  const status = document.getElementById("benchmark-status")!;
+  const file = (document.getElementById("benchmark-file") as HTMLInputElement).files?.[0];
+  if (!file) { status.textContent = "Choose a short spoken-command audio file first."; return; }
+  button.disabled = true;
+  try {
+    const state = await chrome.runtime.sendMessage({ type: "GET_SESSION_STATE" }) as { listeningEnabled: boolean };
+    if (state.listeningEnabled) throw new Error("Pause listening before running the benchmark.");
+    const report = await benchmarkSpeech(file, text => { status.textContent = text; });
+    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "voxpilot-speech-benchmark.json"; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    status.textContent = "Benchmark complete. Recognition timings exported; no audio or transcript included.";
+  } catch (error) { status.textContent = error instanceof Error ? error.message : String(error); }
+  finally { button.disabled = false; }
+});

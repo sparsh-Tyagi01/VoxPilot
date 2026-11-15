@@ -3,8 +3,8 @@
  * @description Transcript and action history storage.
  *
  * History is opt-in (FR-HIST-03). When disabled, nothing is persisted.
- * Entries are stored encrypted if the vault is unlocked, or as plain JSON
- * if the user opted for unencrypted history.
+ * Entries are stored as local JSON, with content redacted by default. This store
+ * does not claim encryption; opt-in history is independent of the credential vault.
  *
  * SRS references:
  * - FR-HIST-01: View history of voice commands and their outcomes
@@ -57,13 +57,13 @@ const MAX_HISTORY = 200;
  */
 export async function appendHistory(entry: HistoryEntry): Promise<void> {
   // Check opt-in preference
-  const pref = await chrome.storage.local.get(STORAGE_KEYS.STORE_TRANSCRIPTS);
+  const pref = await chrome.storage.local.get([STORAGE_KEYS.STORE_TRANSCRIPTS, STORAGE_KEYS.PRIVACY_ANONYMIZE]);
   if (!pref[STORAGE_KEYS.STORE_TRANSCRIPTS]) return;
 
   const entries = await loadHistory();
 
   // Prepend newest entry
-  entries.unshift(entry);
+  entries.unshift(pref[STORAGE_KEYS.PRIVACY_ANONYMIZE] !== false ? anonymizeEntry(entry) : entry);
 
   // Rotate: keep only the most recent MAX_HISTORY entries
   const trimmed = entries.slice(0, MAX_HISTORY);
@@ -100,17 +100,22 @@ export function generateHistoryId(): string {
 export function anonymizeEntry(entry: HistoryEntry): HistoryEntry {
   const { url: _u, pageTitle: _pt, ...rest } = entry;
   return {
-    ...rest,
-    // Also strip element-level labels from the plan if present
-    plan: entry.plan
-      ? {
-          ...entry.plan,
-          actions: entry.plan.actions.map(action => {
-            // For type actions, blank out the value if it looks like PII
-            // Type action anonymization reserved for future implementation
-            return action;
-          }),
+    ...rest, transcript: "[redacted]",
+    ...(entry.error ? { error: "Operation failed (details redacted)" } : {}),
+    plan: entry.plan ? {
+      ...entry.plan, intent: "[redacted]",
+      actions: entry.plan.actions.map(action => {
+        switch (action.type) {
+          case "type": return { ...action, text: "" };
+          case "click": return { type: "click", handle: action.handle };
+          case "navigate": return { type: "navigate", url: "https://redacted.invalid/" };
+          case "tab": { const { url: _url, ...safe } = action; return safe; }
+          case "select": return { ...action, option: "[redacted]" };
+          case "ask": return { type: "ask", question: "[redacted]" };
+          case "done": return { type: "done", summary: "[redacted]" };
+          default: return { ...action };
         }
-      : null,
+      }),
+    } : null,
   };
 }

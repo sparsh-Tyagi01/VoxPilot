@@ -25,6 +25,9 @@ import {
   CONTENT_SCRIPT_TIMEOUT_MS,
 } from "@shared/constants.js";
 import type { ModelLoadProgressMsg, VoxPilotMessage } from "@shared/messages.js";
+import { normalizeModelProfile } from "@shared/model-profiles.js";
+import { authorizedSender } from "./message-policy.js";
+import { PerformanceMetrics } from "../diagnostics/metrics.js";
 import { AgentState } from "@shared/types.js";
 import type { SessionState, AgentPlan } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
@@ -33,13 +36,21 @@ import { VaultService } from "@vault/vault.js";
 import { PlanValidator } from "../offscreen/agent/plan-validator.js";
 import { RiskClassifier } from "../offscreen/agent/risk-classifier.js";
 import { executeBrowserPlan } from "./plan-execution.js";
+import { ExecutionJournal } from "./execution-journal.js";
+import { groundMacroActions } from "./macro-grounding.js";
 
 // In-flight locks serialize events; durable state remains in storage.session.
+const metrics = new PerformanceMetrics();
+// In-memory only: termination of this service worker locks the vault automatically.
+const vaultSession = new VaultService();
+let vaultLockVersion = 0;
+const journal = new ExecutionJournal();
+let recovery: Promise<void> | null = null;
 let sessionWrite: Promise<unknown> = Promise.resolve();
 let listeningOperation: Promise<void> = Promise.resolve();
 let offscreenCreation: Promise<void> | null = null;
 const MODEL_STATUS_KEY = "model_load_status";
-const canonicalProfile = (profile: string): string => ({ lite: "fast", standard: "balanced", enhanced: "powerful" }[profile] ?? profile);
+const canonicalProfile = normalizeModelProfile;
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -131,20 +142,40 @@ async function getTargetTab(): Promise<chrome.tabs.Tab | null> {
   return tab ?? null;
 }
 
+/** On worker restart, interrupt unfinished work. Side effects are never replayed. */
+function recoverInterruptedExecution(): Promise<void> {
+  recovery ??= (async () => {
+    const interruptedId = await journal.recover();
+    const state = await getSessionState();
+    if (state.agentState !== AgentState.Executing || !state.currentPlan) return;
+    if (interruptedId && state.executionId !== interruptedId) return;
+    await updateSessionState({ currentPlan: null, executionId: null, currentDocumentId: null, agentState: state.listeningEnabled ? AgentState.Listening : AgentState.Idle });
+    broadcastToPanel({ type: "COMMAND_NOTICE", text: "The previous command was interrupted. Check the page before repeating it." });
+    if (await hasOffscreenDocument()) await relayToOffscreen({ type: "EXECUTION_DONE", success: false });
+  })();
+  return recovery;
+}
+
 async function completePlan(tabId: number, plan: AgentPlan): Promise<void> {
   await updateSessionState({ agentState: AgentState.Executing });
+  const actionStarted = performance.now();
+  const executionState = await getSessionState();
+  const executionId = executionState.executionId!;
   try {
-    const executionId = (await getSessionState()).executionId;
+    await journal.begin(executionId);
     await relayToOffscreen({ type: "AGENT_STATE_CHANGED", state: AgentState.Executing });
     await executeBrowserPlan(tabId, plan, sendToContentScript, async () => {
       const state = await getSessionState();
       return state.listeningEnabled && state.executionId === executionId && state.agentState === AgentState.Executing;
-    });
+    }, executionState.currentDocumentId ?? undefined, (index, kind, status) => journal.step(executionId, index, kind, status));
+    await journal.finish(executionId, true);
+    metrics.add({ stage: "action_execution", durationMs: performance.now() - actionStarted, success: true });
     const done = plan.actions.find(action => action.type === "done");
     const question = plan.actions.find(action => action.type === "ask");
     const speech = question?.question ?? done?.summary;
-    if (speech && !plan.actions.some(action => action.type === "read")) {
-      await relayToOffscreen({ type: "SPEAK", text: speech });
+    const { voice_settings } = await chrome.storage.local.get("voice_settings");
+    if (speech && (question || voice_settings?.spokenConfirmations === true) && !plan.actions.some(action => action.type === "read")) {
+      void relayToOffscreen({ type: "SPEAK", text: speech }).catch(error => console.warn("[SW] Feedback failed:", error));
     }
     await appendHistory({
       id: generateHistoryId(), timestamp: new Date().toISOString(),
@@ -155,6 +186,8 @@ async function completePlan(tabId: number, plan: AgentPlan): Promise<void> {
     broadcastToPanel({ type: "EXECUTION_DONE", success: true });
     await relayToOffscreen({ type: "EXECUTION_DONE", success: true });
   } catch (error) {
+    metrics.add({ stage: "action_execution", durationMs: performance.now() - actionStarted, success: false });
+    await journal.finish(executionId, false);
     const state = await getSessionState();
     if (String(error).includes("Command cancelled.")) {
       broadcastToPanel({ type: "EXECUTION_DONE", success: false });
@@ -170,7 +203,7 @@ async function completePlan(tabId: number, plan: AgentPlan): Promise<void> {
 /**
  * Dispatch an AgentPlan to the appropriate tab or overlay.
  */
-async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
+async function dispatchPlan(plan: AgentPlan, documentId?: string): Promise<boolean> {
   new PlanValidator().validate(plan);
   const previous = await getSessionState();
   const targetTabId = previous.activeTabId ?? (await getTargetTab())?.id;
@@ -178,7 +211,7 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
   const risk = new RiskClassifier().classify(plan);
   plan = { ...plan, risk, requiresConfirmation: plan.requiresConfirmation || risk >= 3 };
   await updateSessionState({
-    currentPlan: plan, activeTabId: targetTabId, executionId: crypto.randomUUID(),
+    currentPlan: plan, currentDocumentId: documentId ?? null, activeTabId: targetTabId, executionId: crypto.randomUUID(),
     agentState: plan.requiresConfirmation ? AgentState.Confirming : AgentState.Executing,
   });
   broadcastToPanel({ type: "PLAN_READY", plan });
@@ -320,6 +353,7 @@ async function sendToContentScript(
  * Keeps models resident while toggling microphone capture.
  */
 async function toggleListening(): Promise<void> {
+  await recoverInterruptedExecution();
   const next = listeningOperation.then(toggleListeningNow);
   listeningOperation = next.catch(() => {});
   return next;
@@ -340,7 +374,7 @@ async function toggleListeningNow(): Promise<void> {
   } else {
     const tab = await getTargetTab();
     const { selected_profile } = await chrome.storage.local.get("selected_profile");
-    const profile = typeof selected_profile === "string" ? selected_profile : "fast";
+    const profile = typeof selected_profile === "string" ? selected_profile : "essential";
     await ensureOffscreenDocument();
     // Persist intent first so readiness events do not overwrite an active mic state.
     await updateSessionState({ activeTabId: tab?.id ?? null, listeningEnabled: true, agentState: AgentState.Idle });
@@ -381,6 +415,11 @@ chrome.runtime.onMessage.addListener(
     const msg = rawMsg as VoxPilotMessage;
     if (!msg || typeof msg.type !== "string" || msg.target === "offscreen" || msg.target === "ui") return false;
 
+    if (!authorizedSender(msg.type, sender, chrome.runtime.id)) {
+      sendResponse({ ok: false, error: "This context cannot issue that command." });
+      return false;
+    }
+
     // Run async handler and plumb errors to console
     handleMessage(msg, sender, sendResponse).catch(async (err: unknown) => {
       const error = err instanceof Error ? err.message : String(err);
@@ -400,6 +439,7 @@ async function handleMessage(
   sender: chrome.runtime.MessageSender,
   sendResponse: (response?: unknown) => void
 ): Promise<void> {
+  await recoverInterruptedExecution();
   switch (msg.type) {
     // ── Panel → SW ─────────────────────────────────────────────────────────
     case "TOGGLE_LISTENING": {
@@ -418,6 +458,20 @@ async function handleMessage(
       break;
     }
 
+    case "PERFORMANCE_SAMPLE": {
+      if (msg.sample && typeof msg.sample === "object") metrics.add(msg.sample);
+      sendResponse({ ok: true });
+      break;
+    }
+    case "COMMAND_NOTICE": {
+      broadcastToPanel(msg);
+      sendResponse({ ok: true });
+      break;
+    }
+    case "GET_DIAGNOSTICS": {
+      sendResponse({ ...metrics.snapshot(), execution: await journal.read() });
+      break;
+    }
     case "GET_MODEL_STATUS": {
       const saved = await chrome.storage.session.get(MODEL_STATUS_KEY);
       const status = saved[MODEL_STATUS_KEY] as ModelLoadProgressMsg | undefined;
@@ -467,21 +521,23 @@ async function handleMessage(
         sendResponse({ ok: false, error: `Macro "${msg.macroId}" not found` });
         break;
       }
+      const macroState = await getSessionState();
+      if (!macroState.listeningEnabled || macroState.currentPlan) throw new Error("Start listening and finish the current command before running a macro.");
+      const target = await getTargetTab();
+      if (target?.id === undefined) throw new Error("Open the macro's webpage first.");
+      if (macro.recordedOnUrl && (!target.url || new URL(macro.recordedOnUrl).origin !== new URL(target.url).origin)) throw new Error("Open the website where this macro was recorded.");
+      let actions = macro.actions;
+      let documentId: string | undefined;
+      if (actions.some(action => "handle" in action && action.handle)) {
+        const response = await sendToContentScript(target.id, { type: "CAPTURE_SNAPSHOT", includeText: false });
+        if (response?.type !== "SNAPSHOT_RESPONSE") throw new Error("The page could not provide fresh macro targets.");
+        actions = groundMacroActions(actions, response.snapshot);
+        documentId = response.snapshot.documentId;
+      }
+      await updateSessionState({ activeTabId: target.id });
+      await dispatchPlan({ intent: `Run macro: ${macro.name}`, risk: 1, requiresConfirmation: false, actions }, documentId);
       macro.useCount++;
       await saveMacros(macros);
-      const macroState = await getSessionState();
-      if (macroState.activeTabId !== null) {
-        const macroPlan: AgentPlan = {
-          intent: `Run macro: ${macro.name}`,
-          risk: 1,
-          requiresConfirmation: false,
-          actions: macro.actions,
-        };
-        await sendToContentScript(macroState.activeTabId, {
-          type: "EXECUTE_IN_PAGE",
-          plan: macroPlan,
-        });
-      }
       sendResponse({ ok: true });
       break;
     }
@@ -522,7 +578,7 @@ async function handleMessage(
     }
 
     case "PLAN_PRODUCED": {
-      await dispatchPlan(msg.plan);
+      await dispatchPlan(msg.plan, msg.documentId);
       sendResponse({ ok: true });
       break;
     }
@@ -531,7 +587,7 @@ async function handleMessage(
       const tab = await getTargetTab();
       const tabId = msg.tabId > 0 ? msg.tabId : tab?.id;
       if (tabId === undefined || isInternalUrl(tab?.url)) throw new Error("Open a regular webpage to use page commands.");
-      const response = await sendToContentScript(tabId, { type: "CAPTURE_SNAPSHOT" });
+      const response = await sendToContentScript(tabId, { type: "CAPTURE_SNAPSHOT", ...(msg.includeText !== undefined ? { includeText: msg.includeText } : {}) });
       if (response?.type !== "SNAPSHOT_RESPONSE") throw new Error("Could not read this page. Refresh it and try again.");
       await updateSessionState({ activeTabId: tabId });
       await relayToOffscreen({ type: "PAGE_SNAPSHOT", snapshot: response.snapshot });
@@ -540,6 +596,11 @@ async function handleMessage(
     }
 
     case "OFFSCREEN_ERROR": {
+      if (msg.source === "tts") {
+        console.warn("[SW] Spoken feedback unavailable; command state preserved.");
+        sendResponse({ ok: true });
+        break;
+      }
       console.error(`[SW] Offscreen error (${msg.source}): ${msg.message}`);
       const { errorCount } = await getSessionState();
       await updateSessionState({
@@ -617,6 +678,11 @@ async function handleMessage(
     }
 
     case "IN_PAGE_CONFIRM": {
+      const current = await getSessionState();
+      if (sender.tab?.id !== current.activeTabId || (sender.frameId ?? 0) !== 0) {
+        sendResponse({ ok: false, error: "Confirmation came from a different page." });
+        break;
+      }
       if (msg.confirmed) {
         await handleMessage({ type: "CONFIRM_PLAN" }, sender, sendResponse);
       } else {
@@ -631,6 +697,7 @@ async function handleMessage(
         sendResponse({ ok: false, error: "Maximum 50 macros reached" });
         break;
       }
+      const recordedOnUrl = (await getTargetTab())?.url;
       const newMacro = {
         id: generateMacroId(),
         name: msg.name,
@@ -638,6 +705,7 @@ async function handleMessage(
         actions: msg.actions,
         createdAt: new Date().toISOString(),
         useCount: 0,
+        ...(recordedOnUrl ? { recordedOnUrl } : {}),
       };
       macros.push(newMacro);
       await saveMacros(macros);
@@ -699,6 +767,12 @@ async function handleMessage(
 
     // ─── Vault Fill (FR-VAULT-04) ─────────────────────────────────────────────
 
+    case "VAULT_LOCK": {
+      vaultLockVersion++;
+      vaultSession.lock();
+      sendResponse({ ok: true });
+      break;
+    }
     case "VAULT_FILL_REQUEST": {
       // Security contract: Only the SW can access vault values.
       // The decrypted value is sent directly to the requesting tab's content
@@ -710,9 +784,12 @@ async function handleMessage(
         sendResponse({ ok: false, error: "No tab ID in VAULT_FILL_REQUEST sender" });
         break;
       }
+      const vaultExecution = await getSessionState();
+      const lockVersion = vaultLockVersion;
+      if (vaultExecution.agentState !== AgentState.Executing || vaultExecution.activeTabId !== senderTabId || !vaultExecution.currentPlan?.actions.some(action => action.type === "fill_from_vault" && action.handle === msg.handle && action.vaultField === msg.fieldKey)) throw new Error("Vault fill is not part of the approved command.");
 
-      // Create a per-request vault service instance (SW is stateless)
-      const vaultSvc = new VaultService();
+      // Reuse a short-lived memory session; worker termination drops the key.
+      const vaultSvc = vaultSession;
 
       // If the vault is locked, we need the user's passphrase.
       // We'll prompt via the panel (broadcast VAULT_PASSPHRASE_REQUEST),
@@ -736,6 +813,8 @@ async function handleMessage(
             _respond: (response?: unknown) => void
           ): boolean => {
             if (
+              _passphraseSource.id === chrome.runtime.id &&
+              _passphraseSource.url?.startsWith(chrome.runtime.getURL("")) &&
               typeof passphraseMsg === "object" &&
               passphraseMsg !== null &&
               (passphraseMsg as { type?: string }).type === "VAULT_PASSPHRASE_RESPONSE" &&
@@ -762,6 +841,7 @@ async function handleMessage(
           break;
         }
 
+        if (lockVersion !== vaultLockVersion) throw new Error("Vault locked while waiting for the passphrase.");
         const unlocked = await vaultSvc.unlock(passphrase);
         if (!unlocked) {
           broadcastToPanel({ type: "VAULT_UNLOCK_FAILED", requestId });
@@ -774,6 +854,9 @@ async function handleMessage(
           break;
         }
       }
+
+      const currentVaultExecution = await getSessionState();
+      if (lockVersion !== vaultLockVersion || currentVaultExecution.executionId !== vaultExecution.executionId || currentVaultExecution.agentState !== AgentState.Executing) throw new Error("Vault fill cancelled.");
 
       // Retrieve the vault field value (never logged, never stored)
       const value = vaultSvc.getField(msg.fieldKey as import("@shared/types.js").VaultFieldKey);
@@ -794,7 +877,7 @@ async function handleMessage(
         type: "VAULT_FILL_RESPONSE",
         handle: msg.handle,
         value,
-      });
+      }, { frameId: 0, ...(sender.documentId ? { documentId: sender.documentId } : {}) });
 
       sendResponse({ ok: true });
       break;
@@ -874,6 +957,7 @@ async function handleMessage(
     // ─── TTS / Speech ─────────────────────────────────────────────────────────
 
     case "SPEAK": {
+      broadcastToPanel({ type: "SPEAKING", text: msg.text });
       // Content script requests TTS (from a "read" action summary or "ask" response).
       // Forward to offscreen where the TTS engine runs.
       await relayToOffscreen({ type: "SPEAK", text: msg.text });
@@ -934,7 +1018,7 @@ chrome.alarms.onAlarm.addListener(async (alarm: chrome.alarms.Alarm) => {
         await ensureOffscreenDocument();
         const { selected_profile } = await chrome.storage.local.get("selected_profile");
         try {
-          await relayToOffscreen({ type: "START_AUDIO", profile: typeof selected_profile === "string" ? selected_profile : "fast" });
+          await relayToOffscreen({ type: "START_AUDIO", profile: typeof selected_profile === "string" ? selected_profile : "essential" });
         } catch (error) {
           await updateSessionState({ listeningEnabled: false, agentState: AgentState.Error });
           await updateBadge(false);

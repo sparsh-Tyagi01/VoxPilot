@@ -185,19 +185,21 @@ export interface ExecuteTextCommandMsg extends BaseMessage {
 export interface TranscriptMsg extends BaseMessage {
   type: "TRANSCRIPT";
   text: string;
-  confidence: number;
+  confidence: number | null;
   language: string;
   isFinal: boolean;
 }
 
 /** LLM produced a plan (not yet validated). */
 export interface PlanProducedMsg extends BaseMessage {
+  documentId?: string;
   type: "PLAN_PRODUCED";
   plan: AgentPlan;
 }
 
 /** Offscreen needs the current page snapshot for planning. */
 export interface RequestSnapshotMsg extends BaseMessage {
+  includeText?: boolean;
   type: "REQUEST_SNAPSHOT";
   tabId: number;
 }
@@ -247,11 +249,13 @@ export interface RelayActionMsg extends BaseMessage {
 
 /** SW instructs content script to capture a DOM snapshot. */
 export interface CaptureSnapshotMsg extends BaseMessage {
+  includeText?: boolean;
   type: "CAPTURE_SNAPSHOT";
 }
 
 /** SW instructs content script to execute a plan. */
 export interface ExecuteInPageMsg extends BaseMessage {
+  documentId?: string;
   type: "EXECUTE_IN_PAGE";
   plan: AgentPlan;
 }
@@ -444,7 +448,16 @@ export interface SpeakMsg extends BaseMessage {
 // ─── Discriminated Union ──────────────────────────────────────────────────────
 
 /** All possible VoxPilot inter-component messages. */
-export type VoxPilotMessage =
+export interface PerformanceSampleMsg extends BaseMessage {
+  type: "PERFORMANCE_SAMPLE";
+  sample: import("../diagnostics/metrics.js").PerformanceSample;
+}
+export interface GetDiagnosticsMsg extends BaseMessage { type: "GET_DIAGNOSTICS"; }
+
+export interface CommandNoticeMsg extends BaseMessage { type: "COMMAND_NOTICE"; text: string; }
+export interface VaultLockMsg extends BaseMessage { type: "VAULT_LOCK"; }
+
+export type VoxPilotMessage = VaultLockMsg | CommandNoticeMsg | PerformanceSampleMsg | GetDiagnosticsMsg
   /* Panel → SW */
   | ToggleListeningMsg
   | ConfirmPlanMsg

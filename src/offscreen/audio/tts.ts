@@ -65,8 +65,11 @@ export class TTS {
   async speak(text: string): Promise<void> {
     if (!text.trim()) return;
 
-    // Barge-in: stop whatever is currently playing
+    // Keep voice output local. No qualified voice means text feedback only.
     this.stop();
+    const localVoices = speechSynthesis.getVoices().filter(voice => voice.localService);
+    const localVoice = localVoices.find(voice => voice.voiceURI === this.config.voiceURI) ?? localVoices.find(voice => voice.default) ?? localVoices[0];
+    if (!localVoice) return;
 
     return new Promise<void>((resolve, reject) => {
       const utterance = new SpeechSynthesisUtterance(text);
@@ -75,16 +78,7 @@ export class TTS {
       utterance.pitch = this.config.pitch;
       utterance.volume = this.config.volume;
 
-      // Set voice if specified
-      if (this.config.voiceURI) {
-        const voices = speechSynthesis.getVoices();
-        const voice = voices.find((v) => v.voiceURI === this.config.voiceURI);
-        if (voice) {
-          utterance.voice = voice;
-        } else {
-          console.warn(`[TTS] Voice "${this.config.voiceURI}" not found — using default.`);
-        }
-      }
+      utterance.voice = localVoice;
 
       utterance.onend = () => {
         this.currentResolve = null;

@@ -17,6 +17,7 @@
  * direct input to Whisper (which is also trained on 16 kHz audio).
  */
 
+import { PCMResampler } from "./resampler.js";
 import { AUDIO_SAMPLE_RATE } from "@shared/constants.js";
 
 /** Configuration for AudioCapture. */
@@ -40,29 +41,6 @@ export interface AudioCaptureConfig {
    * Default: 2048 (~128ms at 16 kHz).
    */
   bufferSize?: number;
-}
-
-/**
- * Resample a Float32Array audio buffer to target sample rate using linear interpolation.
- */
-function resampleBuffer(
-  input: Float32Array,
-  fromRate: number,
-  toRate: number
-): Float32Array {
-  if (fromRate === toRate) return new Float32Array(input);
-  const ratio = fromRate / toRate;
-  const newLength = Math.round(input.length / ratio);
-  const output = new Float32Array(newLength);
-  for (let i = 0; i < newLength; i++) {
-    const origin = i * ratio;
-    const index = Math.floor(origin);
-    const decimal = origin - index;
-    const s0 = input[index] ?? 0;
-    const s1 = input[index + 1] ?? s0;
-    output[i] = s0 + decimal * (s1 - s0);
-  }
-  return output;
 }
 
 /** AudioCapture manages a live microphone stream and feeds chunks to VAD. */
@@ -138,7 +116,8 @@ export class AudioCapture {
     this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
     this.workletNode = new AudioWorkletNode(
       this.audioContext,
-      "voxpilot-audio-processor"
+      "voxpilot-audio-processor",
+      { processorOptions: { frameMs: 32 } }
     );
 
     // Mute gain node prevents mic feedback through speakers while keeping graph running
@@ -146,6 +125,7 @@ export class AudioCapture {
     this.gainNode.gain.value = 0;
 
     const nativeRate = this.audioContext.sampleRate;
+    const resampler = new PCMResampler(nativeRate, AUDIO_SAMPLE_RATE);
 
     // ── 5. Receive processed chunks from the worklet ──────────────────────────
     this.workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
@@ -155,7 +135,7 @@ export class AudioCapture {
       const chunk =
         nativeRate === AUDIO_SAMPLE_RATE
           ? raw
-          : resampleBuffer(raw, nativeRate, AUDIO_SAMPLE_RATE);
+          : resampler.process(raw);
 
       // Calculate RMS audio level for the VU meter
       let sumSq = 0;

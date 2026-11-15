@@ -110,7 +110,8 @@ function describeAction(action: AgentAction): string {
 }
 function renderPlan(plan: AgentPlan, focus = false): void {
   const done = plan.actions.find(action => action.type === "done");
-  pendingSummary = done?.type === "done" ? done.summary : plan.intent;
+  const question = plan.actions.find(action => action.type === "ask");
+  pendingSummary = plan.actions.some(action => action.type === "read") ? null : question?.question ?? (done?.type === "done" ? done.summary : plan.intent);
   planSection.hidden = false;
   planHeading.textContent = plan.requiresConfirmation ? "Confirm before continuing" : "Working on your command";
   planIntent.textContent = plan.intent;
@@ -183,6 +184,7 @@ chrome.runtime.onMessage.addListener((raw: unknown) => {
       pendingSummary = null;
       hidePlan();
       break;
+    case "COMMAND_NOTICE":
     case "SPEAKING": result.textContent = message.text; result.hidden = false; break;
     case "VAULT_PASSPHRASE_REQUEST":
       vaultRequestId = message.requestId;

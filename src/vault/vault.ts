@@ -57,6 +57,8 @@ export class VaultService {
   private data: VaultData | null = null;
 
   /** Auto-lock timer handle. */
+  private unlockedUntil = 0;
+  private generation = 0;
   private lockTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ─── Unlock / Lock ───────────────────────────────────────────────────────
@@ -70,39 +72,33 @@ export class VaultService {
    * @throws if storage is unavailable or vault is corrupted.
    */
   async unlock(passphrase: string): Promise<boolean> {
-    const salt = await this.getSalt();
-
+    this.lock();
+    const generation = this.generation;
     try {
-      this.key = await deriveKey(passphrase, salt);
+      const salt = await this.getSalt();
+      const key = await deriveKey(passphrase, salt);
+      const blob = await this.loadBlob();
+      const data = blob ? await this.decrypt(blob, key) : { fields: [], updatedAt: new Date().toISOString() };
+      // A lock or newer unlock during PBKDF2/decryption must win.
+      if (generation !== this.generation) return false;
+      this.key = key;
+      this.data = data;
+      if (!blob) await this.persist();
+      if (generation !== this.generation) return false;
+      this.scheduleAutoLock();
+      return true;
     } catch {
+      if (generation === this.generation) this.lock();
       return false;
     }
-
-    // Try to decrypt the stored vault
-    const blob = await this.loadBlob();
-
-    if (!blob) {
-      // First time — initialize empty vault
-      this.data = { fields: [], updatedAt: new Date().toISOString() };
-      await this.persist();
-    } else {
-      try {
-        this.data = await this.decrypt(blob);
-      } catch {
-        // Wrong passphrase or corrupted vault
-        this.key = null;
-        return false;
-      }
-    }
-
-    this.scheduleAutoLock();
-    return true;
   }
 
   /**
    * Lock the vault — clears the key and plaintext data from memory.
    */
   lock(): void {
+    this.generation++;
+    this.unlockedUntil = 0;
     this.key = null;
     this.data = null;
     if (this.lockTimer !== null) {
@@ -113,6 +109,7 @@ export class VaultService {
 
   /** Whether the vault is currently unlocked. */
   get isUnlocked(): boolean {
+    if (this.unlockedUntil && Date.now() >= this.unlockedUntil) this.lock();
     return this.key !== null && this.data !== null;
   }
 
@@ -198,16 +195,19 @@ export class VaultService {
    * @returns true on success, false if currentPassphrase is wrong.
    */
   async changePassphrase(currentPassphrase: string, newPassphrase: string): Promise<boolean> {
-    if (!this.isUnlocked) {
-      const ok = await this.unlock(currentPassphrase);
-      if (!ok) return false;
-    }
+    // Always verify the current passphrase, including an already unlocked session.
+    if (!await this.unlock(currentPassphrase)) return false;
+    const generation = this.generation;
+    const data = this.data!;
 
     // Generate a new salt and derive a new key
     const newSalt = generateSalt();
-    this.key = await deriveKey(newPassphrase, newSalt);
-    await this.saveSalt(newSalt);
-    await this.persist();
+    const key = await deriveKey(newPassphrase, newSalt);
+    const blob = await this.encrypt(data, key);
+    if (generation !== this.generation) return false;
+    // Keep salt and ciphertext consistent even if a lock interrupts the write.
+    await chrome.storage.local.set({ [VAULT_SALT_KEY]: toBase64(newSalt), [VAULT_STORAGE_KEY]: blob });
+    if (generation === this.generation) this.key = key;
     return true;
   }
 
@@ -225,35 +225,37 @@ export class VaultService {
   /** Encrypt and persist current in-memory vault data. */
   private async persist(): Promise<void> {
     if (!this.key || !this.data) throw new Error("Vault is locked");
+    const generation = this.generation;
+    const blob = await this.encrypt(this.data, this.key);
+    if (generation !== this.generation) throw new Error("Vault locked during save");
+    await chrome.storage.local.set({ [VAULT_STORAGE_KEY]: blob });
+  }
 
+  private async encrypt(data: VaultData, key: CryptoKey): Promise<VaultBlob> {
     const iv = generateIV();
-    const plaintext = new TextEncoder().encode(JSON.stringify(this.data));
+    const plaintext = new TextEncoder().encode(JSON.stringify(data));
 
     const ciphertextBuffer = await crypto.subtle.encrypt(
       { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
-      this.key,
+      key,
       plaintext
     );
 
-    const blob: VaultBlob = {
+    return {
       ciphertext: toBase64(new Uint8Array(ciphertextBuffer)),
       iv: toBase64(iv),
       version: 1,
     };
-
-    await chrome.storage.local.set({ [VAULT_STORAGE_KEY]: blob });
   }
 
   /** Decrypt a stored vault blob using the in-memory key. */
-  private async decrypt(blob: VaultBlob): Promise<VaultData> {
-    if (!this.key) throw new Error("Vault is locked");
-
+  private async decrypt(blob: VaultBlob, key: CryptoKey): Promise<VaultData> {
     const ciphertext = fromBase64(blob.ciphertext);
     const iv = fromBase64(blob.iv);
 
     const plaintextBuffer = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
-      this.key,
+      key,
       ciphertext.buffer as ArrayBuffer
     );
 
@@ -291,6 +293,7 @@ export class VaultService {
   // ─── Auto-Lock ───────────────────────────────────────────────────────────
 
   private scheduleAutoLock(): void {
+    this.unlockedUntil = Date.now() + VAULT_AUTO_LOCK_MS;
     this.clearAutoLock();
     this.lockTimer = setTimeout(() => {
       console.log("[VoxPilot vault] Auto-locked after idle timeout.");

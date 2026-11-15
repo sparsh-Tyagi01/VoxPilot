@@ -53,7 +53,7 @@ export interface AgentCoreConfig {
 /** STT worker message types (inbound). */
 type STTMessage =
   | { type: "ready" }
-  | { type: "result"; text: string; confidence: number; language: string }
+  | { type: "result"; text: string; confidence: number | null; language: string }
   | { type: "error"; message: string; stack?: string }
   | { type: "progress"; loaded: number; total: number; modelId: string; downloading?: boolean };
 
@@ -100,7 +100,7 @@ export class AgentCore {
 
   // ─── Pending STT call ──────────────────────────────────────────────────────
 
-  private sttResolve: ((result: { text: string; confidence: number; language: string }) => void) | null = null;
+  private sttResolve: ((result: { text: string; confidence: number | null; language: string }) => void) | null = null;
   private sttReject: ((err: Error) => void) | null = null;
 
   // ─── LLM result/token callbacks keyed by requestId ────────────────────────
@@ -134,6 +134,8 @@ export class AgentCore {
   private commandBusy = false;
   private sttModelId = "";
   private llmModelId = "";
+  private llmIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private llmRequested = false;
   private llmRecoveryAttempts = 0;
   private llmCircuitOpen = false;
   private llmRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -165,18 +167,19 @@ export class AgentCore {
    * Spawn STT and LLM workers, load models, and wire up the Planner.
    * Called once when the offscreen document starts or during profile change.
    */
-  async initialize(profile: ModelProfile = DEFAULT_MODEL_PROFILE): Promise<void> {
+  async initialize(profile: ModelProfile = DEFAULT_MODEL_PROFILE, preloadPlanner = false): Promise<void> {
     if (this.initializedProfile === profile && this.llmCircuitOpen && this.sttWorker) {
       this.emitModelError("GPU planning is unavailable. Basic commands still work. Retry model setup explicitly after restarting Chrome or freeing GPU resources.");
       return;
     }
-    if (this.initializedProfile === profile && this.sttWorker && (this.llmWorker || this.llmRecoveryTimer) && !this.initializationFailed) {
+    if (this.initializedProfile === profile && this.sttWorker && (!this.initializationFailed || Boolean(this.llmRecoveryTimer))) {
       this.emitModelProgress();
       return;
     }
     if (this.sttWorker || this.llmWorker) this.dispose();
     this.lifecycleId++;
     this.initializedProfile = profile;
+    this.llmRequested = preloadPlanner && profile !== ModelProfile.Essential;
     this.llmRecoveryAttempts = 0;
     this.llmCircuitOpen = false;
     this.initializationFailed = false;
@@ -196,7 +199,7 @@ export class AgentCore {
     this.spawnSTTWorker();
 
     this.llmModelId = profileConfig.modelId;
-    this.spawnLLMWorker();
+    if (preloadPlanner && profile !== ModelProfile.Essential) this.spawnLLMWorker();
 
     // ── Wire Planner to LLM worker ──────────────────────────────────────────
     const llmInterface = this.buildPlannerLLMInterface();
@@ -206,7 +209,7 @@ export class AgentCore {
     // Post load requests
     this.sttModelId = profileConfig.sttModelId;
     this.sttWorker!.postMessage({ type: "load", modelId: profileConfig.sttModelId });
-    this.llmWorker!.postMessage({ type: "load", modelId: profileConfig.modelId });
+    this.llmWorker?.postMessage({ type: "load", modelId: profileConfig.modelId });
 
     // Emit initial progress
     this.emitModelProgress("Opening saved models…");
@@ -273,7 +276,7 @@ export class AgentCore {
       if (operationId !== this.operationId) return;
 
       // ── Step 1: Transcribe ───────────────────────────────────────────────
-      const transcript = await this.transcribe(audio);
+      const transcript = await this.measure("recognition", () => this.transcribe(audio));
       if (operationId !== this.operationId) return;
       if (bargeIn) {
         if (this.intentRouter.isKillCommand(transcript.text)) this.triggerKill();
@@ -285,7 +288,6 @@ export class AgentCore {
         return;
       }
 
-      console.log(`[AgentCore] Transcript: "${transcript.text}" (conf: ${transcript.confidence.toFixed(2)})`);
 
       await sendToSW({
         type: "TRANSCRIPT",
@@ -310,17 +312,18 @@ export class AgentCore {
    * Execute a natural language text command directly (e.g. from Web Speech API fast-path).
    */
   async executeCommandText(text: string): Promise<void> {
-    await this.processUtterance(text);
+    await this.processUtterance(text, "text");
   }
 
   /**
    * Core pipeline: takes transcribed text, checks safety/kill/undo,
    * performs intent routing / LLM planning, validates plan, and sends to SW.
    */
-  private async processUtterance(text: string): Promise<void> {
+  private async processUtterance(text: string, source: "voice" | "text" = "voice"): Promise<void> {
     if (this.intentRouter.isKillCommand(text)) { this.triggerKill(); return; }
     if (!text.trim() || this.commandBusy || this.sttResolve || this.state === AgentState.Confirming || this.state === AgentState.Executing) return;
     this.commandBusy = true;
+    this.currentSnapshot = null;
     const operationId = ++this.operationId;
     try {
       this.transitionTo(AgentState.Routing);
@@ -343,17 +346,24 @@ export class AgentCore {
       const fastPlan = this.intentRouter.route(text);
 
       let plan: AgentPlan;
+      let snapshot: PageSnapshot | null = null;
 
       if (fastPlan) {
         console.log("[AgentCore] Fast-path intent matched — skipping LLM.");
         const needsSnapshot = fastPlan.actions.some(action => "handle" in action && action.handle);
         if (needsSnapshot) {
           this.currentSnapshot = null;
-          await sendToSW({ type: "REQUEST_SNAPSHOT", tabId: await this.getActiveTabId() });
-          await this.waitForSnapshot();
+          await sendToSW({ type: "REQUEST_SNAPSHOT", includeText: false, tabId: await this.getActiveTabId() });
+          snapshot = await this.waitForSnapshot();
           if (operationId !== this.operationId) return;
-          plan = this.groundFastPlan(fastPlan, this.currentSnapshot!);
+          plan = this.groundFastPlan(fastPlan, snapshot);
         } else plan = fastPlan;
+      } else if (this.initializedProfile === ModelProfile.Essential) {
+        // Unrecognized ambient audio is never an invitation to speak a tutorial.
+        this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+        await sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
+        if (source === "text") await sendToSW({ type: "COMMAND_NOTICE", text: "Command not recognized. Use a direct command or choose Assist in Settings." });
+        return;
       } else {
         // ── Step 4: Autonomous Planning ─────────────────────────────────────
         this.transitionTo(AgentState.Planning);
@@ -363,19 +373,21 @@ export class AgentCore {
         this.currentSnapshot = null;
         const tabId = await this.getActiveTabId();
         await sendToSW({ type: "REQUEST_SNAPSHOT", tabId });
-        await this.waitForSnapshot();
+        snapshot = await this.waitForSnapshot();
 
         if (operationId !== this.operationId) return;
 
+        await this.ensurePlannerReady();
+        if (operationId !== this.operationId) return;
         // Plan with Planner (real neural model only)
-        plan = await this.planner.plan(text, this.currentSnapshot!);
+        plan = await this.measure("planning", () => this.planner.plan(text, snapshot!));
       }
 
       if (operationId !== this.operationId) return;
 
       // ── Step 5: Classify Risk & Validate ─────────────────────────────────
       this.validator.validate(plan);
-      const risk = this.riskClassifier.classify(plan, this.currentSnapshot?.url);
+      const risk = this.riskClassifier.classify(plan, snapshot?.url);
 
       const riskConfig = RISK_TIER_CONFIG[risk];
 
@@ -393,7 +405,7 @@ export class AgentCore {
       // Set state before dispatch: the SW may synchronously finish execution.
       this.transitionTo(needsConfirm ? AgentState.Confirming : AgentState.Executing);
       await sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
-      await sendToSW({ type: "PLAN_PRODUCED", plan });
+      await sendToSW({ type: "PLAN_PRODUCED", plan, ...(snapshot?.documentId ? { documentId: snapshot.documentId } : {}) });
 
       if (needsConfirm) {
         // Await explicit confirmation from the SW.
@@ -554,6 +566,8 @@ export class AgentCore {
    * Dispose all resources. Called when offscreen document is torn down.
    */
   dispose(): void {
+    if (this.llmIdleTimer) clearTimeout(this.llmIdleTimer);
+    this.llmIdleTimer = null;
     this.lifecycleId++;
     this.initializedProfile = null;
     this.speechStarted = false;
@@ -668,6 +682,13 @@ export class AgentCore {
     return { ...plan, actions };
   }
 
+  private async measure<T>(stage: import("../../diagnostics/metrics.js").PerformanceStage, action: () => Promise<T>): Promise<T> {
+    const start = performance.now();
+    let success = false;
+    try { const result = await action(); success = true; return result; }
+    finally { void sendToSW({ type: "PERFORMANCE_SAMPLE", sample: { stage, durationMs: performance.now() - start, success } }); }
+  }
+
   private transitionTo(next: AgentState): void {
     console.log(`[AgentCore] ${this.state} → ${next}`);
     this.state = next;
@@ -707,7 +728,7 @@ export class AgentCore {
    * Send audio to the STT worker and await the transcript.
    * Uses transferable ArrayBuffer for zero-copy transfer.
    */
-  private async transcribe(audio: Float32Array): Promise<{ text: string; confidence: number; language: string }> {
+  private async transcribe(audio: Float32Array): Promise<{ text: string; confidence: number | null; language: string }> {
     if (!this.sttWorker) throw new Error("STT worker not initialized");
     if (this.sttResolve) throw new Error("Speech recognition is busy");
 
@@ -744,9 +765,9 @@ export class AgentCore {
   /**
    * Wait for the current page snapshot to be delivered via onPageSnapshot().
    */
-  private async waitForSnapshot(timeoutMs = 3_000): Promise<void> {
+  private async waitForSnapshot(timeoutMs = 3_000): Promise<PageSnapshot> {
     // If we already have a fresh snapshot, use it immediately.
-    if (this.currentSnapshot) return;
+    if (this.currentSnapshot) return this.currentSnapshot;
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -759,12 +780,12 @@ export class AgentCore {
           capturedAt: Date.now(),
           truncated: false,
         };
-        resolve();
+        resolve(this.currentSnapshot);
       }, timeoutMs);
 
       this.snapshotResolve = () => {
         clearTimeout(timer);
-        resolve();
+        resolve(this.currentSnapshot!);
       };
     });
   }
@@ -775,6 +796,25 @@ export class AgentCore {
    */
   private async getActiveTabId(): Promise<number> {
     return 0; // SW resolves active tab on REQUEST_SNAPSHOT
+  }
+
+  /** Optional planning is initialized only when a complex request actually needs it. */
+  async ensurePlannerReady(): Promise<void> {
+    if (this.initializedProfile === ModelProfile.Essential) throw new Error("AI planning is disabled in Essential mode.");
+    if (this.llmCircuitOpen) throw new Error("GPU planning is unavailable. Basic commands still work.");
+    if (this.isLlmReady) return;
+    this.llmRequested = true;
+    if (!this.llmWorker && !this.llmRecoveryTimer) {
+      this.spawnLLMWorker();
+      this.llmWorker!.postMessage({ type: "load", modelId: this.llmModelId });
+      this.emitModelProgress("Opening optional AI planner…");
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.llmReady, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Optional planner initialization timed out. Basic commands still work.")), GPU_RECOVERY_LOAD_TIMEOUT_MS);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   private spawnLLMWorker(): void {
@@ -797,6 +837,23 @@ export class AgentCore {
       this.llmResultCallbacks.clear();
       this.llmTokenCallbacks.clear();
     });
+  }
+
+  private schedulePlannerEviction(): void {
+    if (this.llmIdleTimer) clearTimeout(this.llmIdleTimer);
+    this.llmIdleTimer = setTimeout(() => {
+      this.llmIdleTimer = null;
+      if (!this.isLlmReady || this.llmCircuitOpen) return;
+      if (this.commandBusy || this.llmResultCallbacks.size) { this.schedulePlannerEviction(); return; }
+      this.llmWorker?.terminate();
+      this.llmWorker = null;
+      this.isLlmReady = false;
+      this.llmRequested = false;
+      this.llmProgress = 0;
+      this.llmReady = new Promise<void>((resolve, reject) => { this.llmReadyResolve = resolve; this.llmReadyReject = reject; });
+      void this.llmReady.catch(() => {});
+      this.emitModelProgress("Voice ready — idle planner released from GPU memory");
+    }, 120_000);
   }
 
   private recoverGPUPlanner(): void {
@@ -928,14 +985,15 @@ export class AgentCore {
    * Only emits done === true when BOTH STT and LLM workers are ready.
    */
   private emitModelProgress(detailText?: string): void {
-    const isAllReady = this.isSttReady && this.isLlmReady;
+    const plannerRequested = this.llmRequested;
+    const isAllReady = this.isSttReady && (!plannerRequested || this.isLlmReady);
     if (isAllReady) this.initializationFailed = false;
-    const weightedProgress = isAllReady ? 1.0 : (this.sttProgress * 0.15 + this.llmProgress * 0.85);
+    const weightedProgress = isAllReady ? 1.0 : plannerRequested ? (this.sttProgress * 0.15 + this.llmProgress * 0.85) : this.sttProgress;
     const pct = isAllReady ? 100 : Math.min(99, Math.round(weightedProgress * 100));
 
     let text = detailText;
     if (isAllReady) {
-      text = this.llmModelId === GPU_RECOVERY_MODEL ? "Models ready — compact planner active" : "✓ Models ready!";
+      text = !plannerRequested ? "Voice ready — optional planner not loaded" : this.llmModelId === GPU_RECOVERY_MODEL ? "Models ready — compact planner active" : "✓ Models ready!";
     } else if (!text) {
       if (!this.isSttReady) {
         text = this.sttProgress > 0 ? `Preparing speech model… ${Math.round(this.sttProgress * 100)}%` : "Opening saved speech model…";
@@ -988,7 +1046,7 @@ export class AgentCore {
     if (this.initializedProfile !== profile) throw new DOMException("Model selection changed", "AbortError");
     const loadId = this.loadId;
     try {
-      await Promise.all([this.sttReady, this.llmReady]);
+      await this.sttReady;
     } catch (err) {
       if (this.initializedProfile !== profile || loadId !== this.loadId) throw new DOMException("Model selection changed", "AbortError");
       throw err;
@@ -1042,6 +1100,7 @@ export class AgentCore {
 
     switch (msg.type) {
       case "ready":
+        this.schedulePlannerEviction();
         if (this.llmRecoveryTimer) clearTimeout(this.llmRecoveryTimer);
         this.llmRecoveryTimer = null;
         console.log("[AgentCore] LLM worker ready.");
@@ -1076,6 +1135,7 @@ export class AgentCore {
       }
 
       case "result": {
+        this.schedulePlannerEviction();
         const resultCb = this.llmResultCallbacks.get(msg.requestId);
         this.llmResultCallbacks.delete(msg.requestId);
         this.llmErrorCallbacks.delete(msg.requestId);

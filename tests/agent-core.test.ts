@@ -26,7 +26,7 @@ describe("Agent worker recovery", () => {
     FakeWorker.instances = [];
     vi.stubGlobal("Worker", FakeWorker);
     core = new AgentCore({ tts: { stop: vi.fn(), isSpeaking: false } as unknown as TTS });
-    await core.initialize();
+    await core.initialize(ModelProfile.Fast, true);
     FakeWorker.instances.forEach(worker => worker.emit({ type: "ready" }));
     await Promise.resolve();
     core.resumeListening();
@@ -86,7 +86,7 @@ describe("Agent worker recovery", () => {
   it("reuses initialized workers on repeated initialization and pause/resume", async () => {
     const oldWorkers = [...FakeWorker.instances];
     core.pauseListening();
-    await core.initialize();
+    await core.initialize(ModelProfile.Fast, true);
     core.resumeListening();
     expect(FakeWorker.instances).toHaveLength(2);
     expect(oldWorkers.every(worker => worker.terminate.mock.calls.length === 0)).toBe(true);
@@ -123,7 +123,7 @@ describe("Agent worker recovery", () => {
   });
 
   it("keeps model progress monotonic across files and reports the active profile", async () => {
-    await core.initialize(ModelProfile.Balanced);
+    await core.initialize(ModelProfile.Balanced, true);
     sendToSW.mockClear();
     const stt = FakeWorker.instances[2]!;
     const llm = FakeWorker.instances[3]!;
@@ -139,9 +139,9 @@ describe("Agent worker recovery", () => {
   });
 
   it("retries a failed load instead of reusing rejected readiness promises", async () => {
-    await core.initialize(ModelProfile.Balanced);
+    await core.initialize(ModelProfile.Balanced, true);
     FakeWorker.instances[3]!.emit({ type: "error", requestId: "", message: "download interrupted" });
-    await core.initialize(ModelProfile.Balanced);
+    await core.initialize(ModelProfile.Balanced, true);
     expect(FakeWorker.instances).toHaveLength(6);
     expect(FakeWorker.instances[3]!.terminate).toHaveBeenCalledOnce();
   });
@@ -181,7 +181,7 @@ describe("Agent worker recovery", () => {
 
   it("terminates previous workers before switching model profiles", async () => {
     const oldWorkers = [...FakeWorker.instances];
-    await core.initialize(ModelProfile.Balanced);
+    await core.initialize(ModelProfile.Balanced, true);
     expect(oldWorkers.every(worker => worker.terminate.mock.calls.length === 1)).toBe(true);
     expect(FakeWorker.instances).toHaveLength(4);
   });
@@ -195,7 +195,7 @@ describe("Agent worker recovery", () => {
     expect(failed.terminate).toHaveBeenCalledOnce();
     expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "MODEL_LOAD_PROGRESS" && (msg as any).done === false && /smaller/.test((msg as any).text))).toBe(true);
     core.pauseListening();
-    await core.initialize(); // Resuming during the deferred recovery must keep the smaller model.
+    await core.initialize(ModelProfile.Fast, true); // Resuming during the deferred recovery must keep the smaller model.
     core.resumeListening();
     expect(FakeWorker.instances).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(GPU_RECOVERY_DELAY_MS);
@@ -208,7 +208,7 @@ describe("Agent worker recovery", () => {
     expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "PLAN_PRODUCED")).toBe(false);
     // A second loss opens the circuit instead of allocating endlessly.
     recovered.emit({ type: "error", requestId: "", code: "GPU_DEVICE_LOST", message: "DeviceLostError" });
-    await core.initialize(); // Ordinary mic restart must not reopen the circuit.
+    await core.initialize(ModelProfile.Fast, true); // Ordinary mic restart must not reopen the circuit.
     await vi.advanceTimersByTimeAsync(10_000);
     expect(FakeWorker.instances).toHaveLength(3);
     const stt = FakeWorker.instances[0]!;
@@ -217,7 +217,7 @@ describe("Agent worker recovery", () => {
   });
 
   it("keeps setup readiness pending until a replacement GPU model is ready", async () => {
-    const loading = core.loadProfile(ModelProfile.Balanced);
+    const loading = (async () => { await core.initialize(ModelProfile.Balanced, true); await core.ensurePlannerReady(); })();
     await Promise.resolve();
     const failed = FakeWorker.instances[3]!;
     FakeWorker.instances[2]!.emit({ type: "ready" });
@@ -242,6 +242,59 @@ describe("Agent worker recovery", () => {
     core.dispose();
     await vi.advanceTimersByTimeAsync(GPU_RECOVERY_DELAY_MS + 1);
     expect(FakeWorker.instances).toHaveLength(2);
+  });
+
+  it("initializes Essential speech without a GPU worker or a planner readiness dependency", async () => {
+    core.dispose(); FakeWorker.instances = [];
+    await core.initialize(ModelProfile.Essential);
+    expect(FakeWorker.instances).toHaveLength(1);
+    expect(FakeWorker.instances[0]!.url.href).toContain("stt-worker");
+    FakeWorker.instances[0]!.emit({ type: "ready" });
+    await expect(core.loadProfile(ModelProfile.Essential)).resolves.toBeUndefined();
+    core.resumeListening();
+    await core.executeCommandText("scroll down");
+    expect(FakeWorker.instances).toHaveLength(1);
+    expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "PLAN_PRODUCED")).toBe(true);
+  });
+
+  it("does not load an AI model for an unresolved Essential request", async () => {
+    core.dispose(); FakeWorker.instances = [];
+    await core.initialize(ModelProfile.Essential);
+    FakeWorker.instances[0]!.emit({ type: "ready" }); core.resumeListening();
+    await core.executeCommandText("summarize the contents of this website");
+    expect(FakeWorker.instances).toHaveLength(1);
+    const plan = sendToSW.mock.calls.map(([msg]) => msg as any).find(msg => msg.type === "PLAN_PRODUCED");
+    expect(plan).toBeUndefined();
+    expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "COMMAND_NOTICE")).toBe(true);
+  });
+
+  it("releases an idle planner and reloads it only on demand", async () => {
+    const old = FakeWorker.instances[1]!;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(old.terminate).toHaveBeenCalledOnce();
+    await core.initialize(ModelProfile.Fast);
+    expect(FakeWorker.instances).toHaveLength(2);
+    const ready = core.ensurePlannerReady();
+    expect(FakeWorker.instances).toHaveLength(3);
+    FakeWorker.instances[2]!.emit({ type: "ready" });
+    await ready;
+  });
+
+  it("does not speak or plan repeated unknown voice transcripts in Essential mode", async () => {
+    core.dispose(); FakeWorker.instances = [];
+    await core.initialize(ModelProfile.Essential);
+    const stt = FakeWorker.instances[0]!; stt.emit({ type: "ready" }); core.resumeListening();
+    sendToSW.mockClear();
+    for (let i = 0; i < 5; i++) {
+      core.onSpeechStart();
+      const request = core.onSpeechEnd(new Float32Array(16000)); await Promise.resolve();
+      stt.emit({ type: "result", text: "Thank you for watching", confidence: null, language: "en" });
+      await request;
+    }
+    expect(core.currentState).toBe(AgentState.Listening);
+    expect(sendToSW.mock.calls.map(([msg]) => (msg as any).type)).not.toContain("PLAN_PRODUCED");
+    expect(sendToSW.mock.calls.map(([msg]) => (msg as any).type)).not.toContain("COMMAND_NOTICE");
+    expect(FakeWorker.instances).toHaveLength(1);
   });
 
 });

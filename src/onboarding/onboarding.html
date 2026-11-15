@@ -189,33 +189,33 @@
     <!-- Step 2: Model Selection & Download -->
     <div class="step-panel" id="step-2" role="tabpanel" aria-labelledby="step-ind-2">
       <h2>Choose your profile</h2>
-      <p>Select a model tier. Standard is recommended for most users.</p>
+      <p>Essential is recommended for everyday commands. AI planning is optional and loads only when needed.</p>
 
       <div role="radiogroup" aria-label="Model profile selection">
         <label class="model-option selected" id="label-lite">
-          <input type="radio" name="profile" value="lite" id="radio-lite" checked />
+          <input type="radio" name="profile" value="essential" id="radio-lite" checked />
           <div class="model-info">
-            <div class="model-name">Lite</div>
+            <div class="model-name">Essential — CPU only</div>
             <div class="model-desc">Rule-based commands, WASM speech. No GPU required.</div>
-            <div class="model-size">≈ 300 MB download</div>
+            <div class="model-size">Speech model only; no planner download</div>
           </div>
         </label>
 
         <label class="model-option" id="label-standard">
-          <input type="radio" name="profile" value="standard" id="radio-standard" />
+          <input type="radio" name="profile" value="fast" id="radio-standard" />
           <div class="model-info">
-            <div class="model-name">Standard ⭐ Recommended</div>
-            <div class="model-desc">Llama 3.2 1B + Whisper base. Requires 2 GB GPU VRAM.</div>
-            <div class="model-size">≈ 1.2 GB download</div>
+            <div class="model-name">Assist</div>
+            <div class="model-desc">Whisper tiny with optional Llama 3.2 1B planning. Requires a compatible GPU for planning.</div>
+            <div class="model-size">AI model downloads on first complex request</div>
           </div>
         </label>
 
         <label class="model-option" id="label-enhanced">
-          <input type="radio" name="profile" value="enhanced" id="radio-enhanced" />
+          <input type="radio" name="profile" value="balanced" id="radio-enhanced" />
           <div class="model-info">
-            <div class="model-name">Enhanced</div>
-            <div class="model-desc">Llama 3.2 3B. Best accuracy, requires 4 GB GPU VRAM.</div>
-            <div class="model-size">≈ 3.0 GB download</div>
+            <div class="model-name">Advanced</div>
+            <div class="model-desc">Optional Llama 3.2 3B planning. Intended for capable GPUs.</div>
+            <div class="model-size">Large optional AI model; hardware qualification required</div>
           </div>
         </label>
       </div>

@@ -18,7 +18,8 @@ import { AudioCapture } from "./audio/capture.js";
 import { VAD } from "./audio/vad.js";
 import { TTS } from "./audio/tts.js";
 import { AgentCore } from "./agent/agent-core.js";
-import { AgentState, ModelProfile } from "@shared/types.js";
+import { normalizeModelProfile } from "@shared/model-profiles.js";
+import { AgentState } from "@shared/types.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 
 // ─── Module-level singletons (safe here — offscreen is not the SW) ────────────
@@ -32,10 +33,6 @@ let agentCore: AgentCore | null = null;
 let pipelineRunning = false;
 let audioOperation: Promise<void> = Promise.resolve();
 
-const profileMap: Record<string, ModelProfile> = {
-  lite: ModelProfile.Fast, standard: ModelProfile.Balanced, enhanced: ModelProfile.Powerful,
-  fast: ModelProfile.Fast, balanced: ModelProfile.Balanced, powerful: ModelProfile.Powerful,
-};
 
 function getCore(): AgentCore {
   tts ??= new TTS();
@@ -43,12 +40,12 @@ function getCore(): AgentCore {
   return agentCore;
 }
 
-async function startAudioPipeline(profileStr = "fast"): Promise<void> {
+async function startAudioPipeline(profileStr = "essential"): Promise<void> {
   if (pipelineRunning) return;
   const core = getCore();
   try {
     // initialize is idempotent: setup's loaded models are reused on ordinary starts.
-    await core.initialize(profileMap[profileStr] ?? ModelProfile.Fast);
+    await core.initialize(normalizeModelProfile(profileStr));
     vad ??= new VAD({
       onSpeechStart: () => core.onSpeechStart(),
       onSpeechDiscard: () => core.onSpeechDiscard(),
@@ -56,7 +53,16 @@ async function startAudioPipeline(profileStr = "fast"): Promise<void> {
     });
     audioCapture ??= new AudioCapture({
       bufferSize: 2048,
-      onAudioData: data => vad?.processAudioChunk(data),
+      onAudioData: data => {
+        // Browser TTS is not routed through our audio graph. Do not let its echo
+        // become another command now that feedback no longer holds the command lock.
+        if (tts?.isSpeaking) {
+          if (vad?.currentState !== "silence") core.onSpeechDiscard();
+          vad?.stop();
+          return;
+        }
+        if (pipelineRunning) { void vad?.start(); vad?.processAudioChunk(data); }
+      },
       onAudioLevel: level => {
         void sendToSW({ type: "AUDIO_LEVEL", level, isSpeech: vad?.currentState === "speech" });
       },
@@ -161,11 +167,9 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       if (!tts) {
         tts = new TTS();
       }
-      try {
-        await tts.speak(msg.text);
-      } finally {
-        await sendToSW({ type: "TTS_DONE" });
-      }
+      void tts.speak(msg.text).catch(error => {
+        void sendToSW({ type: "OFFSCREEN_ERROR", source: "tts", message: String(error) });
+      }).finally(() => { void sendToSW({ type: "TTS_DONE" }); });
       break;
     }
 
@@ -177,7 +181,7 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
 
     case "START_MODEL_DOWNLOAD": {
       const core = getCore();
-      void core.loadProfile(profileMap[msg.profile] ?? ModelProfile.Fast).catch(err => {
+      void core.loadProfile(normalizeModelProfile(msg.profile)).catch(err => {
         if (err instanceof Error && err.name === "AbortError") return;
         void sendToSW({ type: "OFFSCREEN_ERROR", source: "llm", message: `Model preparation failed: ${err instanceof Error ? err.message : String(err)}` });
       });
@@ -186,7 +190,7 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
 
     case "PROFILE_CHANGED": {
       const core = getCore();
-      void core.loadProfile(profileMap[msg.profile] ?? ModelProfile.Fast).then(() => {
+      void core.loadProfile(normalizeModelProfile(msg.profile)).then(() => {
         if (pipelineRunning) core.resumeListening();
       }).catch(err => {
         if (err instanceof Error && err.name === "AbortError") return;
@@ -205,6 +209,9 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       if (msg.state === AgentState.Executing) agentCore?.onExecutionStarted();
       break;
 
+    case "COMMAND_NOTICE":
+    case "PERFORMANCE_SAMPLE":
+    case "GET_DIAGNOSTICS":
     case "GET_MODEL_STATUS":
     case "GET_SESSION_STATE":
     case "GET_AUDIT_LOG":
@@ -225,6 +232,7 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
     case "VAULT_PASSPHRASE_RESPONSE":
     case "VAULT_FILL_RESPONSE":
     case "VAULT_FILL_REQUEST":
+    case "VAULT_LOCK":
     case "OFFSCREEN_ERROR":
     case "REQUEST_SNAPSHOT":
     case "PLAN_PRODUCED":

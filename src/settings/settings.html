@@ -192,6 +192,7 @@
       <p class="subtitle">Configure how VoxPilot listens and speaks.</p>
 
       <div class="setting-group">
+        <div class="setting-row"><div class="setting-label"><strong>Speak short confirmations</strong><span>Off by default for faster command flow. Explicit reading and clarification still use speech.</span></div><label class="toggle-switch" aria-label="Speak confirmations"><input type="checkbox" id="spoken-confirmations" /><span class="toggle-track"></span></label></div>
         <div class="setting-row">
           <div class="setting-label">
             <strong>Toggle hotkey</strong>
@@ -203,18 +204,18 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>Auto-stop mic after idle</strong>
-            <span>Close microphone after this many seconds of silence</span>
+            <span>Not implemented. Pause explicitly with the popup or Alt+V.</span>
           </div>
-          <input type="number" id="idle-timeout" min="30" max="600" value="120" aria-label="Idle timeout in seconds" /> <span style="color:var(--muted);font-size:12px;margin-left:4px;">sec</span>
+          <input type="number" id="idle-timeout" disabled min="30" max="600" value="120" aria-label="Idle timeout in seconds" /> <span style="color:var(--muted);font-size:12px;margin-left:4px;">sec</span>
         </div>
 
         <div class="setting-row">
           <div class="setting-label">
             <strong>Barge-in</strong>
-            <span>Stop speech when you start talking</span>
+            <span>During spoken feedback use Alt+V to pause; microphone commands are suppressed to prevent echo.</span>
           </div>
           <label class="toggle-switch" aria-label="Enable barge-in">
-            <input type="checkbox" id="barge-in" checked />
+            <input type="checkbox" id="barge-in" disabled />
             <span class="toggle-track"></span>
           </label>
         </div>
@@ -222,10 +223,10 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>Cloud speech recognition</strong>
-            <span style="color:var(--warn);">⚠ Audio sent to Google — off by default (FR-VOICE-05)</span>
+            <span style="color:var(--warn);">Not implemented. Recognition currently stays on your device.</span>
           </div>
           <label class="toggle-switch" aria-label="Enable cloud speech recognition">
-            <input type="checkbox" id="cloud-speech" />
+            <input type="checkbox" id="cloud-speech" disabled />
             <span class="toggle-track"></span>
           </label>
         </div>
@@ -241,21 +242,22 @@
         <div class="setting-row">
           <div class="setting-label">
             <strong>Profile</strong>
-            <span>Lite=rules only, Standard=1B LLM, Enhanced=3B LLM</span>
+            <span>Essential uses CPU speech only. Optional planners load on demand.</span>
           </div>
           <select id="model-profile" aria-label="Model profile">
-            <option value="lite">Lite (no GPU)</option>
-            <option value="standard" selected>Standard (2 GB VRAM)</option>
-            <option value="enhanced">Enhanced (4 GB VRAM)</option>
+            <option value="essential" selected>Essential (CPU only)</option>
+            <option value="fast">Assist (optional 1B planner)</option>
+            <option value="balanced">Advanced (optional 3B planner)</option>
+            <option value="powerful">Expert (optional 8B planner)</option>
           </select>
         </div>
 
         <div class="setting-row">
           <div class="setting-label">
             <strong>STT confidence threshold</strong>
-            <span>Below this, ask user to repeat (0.0–1.0)</span>
+            <span>Unavailable: this recognizer does not provide calibrated confidence.</span>
           </div>
-          <input type="number" id="stt-threshold" min="0" max="1" step="0.05" value="0.6" aria-label="STT confidence threshold" />
+          <input type="number" id="stt-threshold" disabled min="0" max="1" step="0.05" value="0.6" aria-label="STT confidence threshold" />
         </div>
       </div>
 
@@ -314,10 +316,16 @@
 
         <div class="setting-row">
           <div class="setting-label">
-            <strong>Show network audit log</strong>
-            <span>Confirm that zero external requests are made</span>
+            <strong>Export performance diagnostics</strong>
+            <span>Stage timings only; no transcript, page text, or field values</span>
           </div>
-          <button class="btn btn-secondary" id="btn-show-audit" type="button">View Log</button>
+          <button class="btn btn-secondary" id="btn-show-audit" type="button">Export JSON</button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label"><strong>Speech benchmark</strong><span>Pause listening, choose a 0.3–30 second recording, then measure ten local recognition runs. First use may download the speech model.</span>
+          <label for="benchmark-file">Local audio file</label><input id="benchmark-file" type="file" accept="audio/*" />
+          <p id="benchmark-status" role="status" aria-live="polite"></p></div>
+          <button class="btn btn-secondary" id="btn-benchmark" type="button">Run benchmark</button>
         </div>
       </div>
 
