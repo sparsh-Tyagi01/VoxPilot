@@ -33,9 +33,7 @@ import {
 // ─── Worker Environment Config ─────────────────────────────────────────────────
 
 /**
- * Force ONNX Runtime Web (WASM backend) — WebGPU not yet stable in every
- * Chrome version, and WASM q8 meets latency budgets for Whisper tiny/base.
- * We try WebGPU first, then fall back to WASM.
+ * Use WASM q8 so Whisper and WebLLM do not compete for GPU memory.
  */
 if (env.backends.onnx?.wasm) {
   env.backends.onnx.wasm.proxy = false; // No proxy worker — we ARE a worker.
@@ -61,13 +59,14 @@ type STTWorkerOutput =
   | { type: "ready" }
   | { type: "result"; text: string; confidence: number; language: string }
   | { type: "error"; message: string; stack?: string }
-  | { type: "progress"; loaded: number; total: number; modelId: string };
+  | { type: "progress"; loaded: number; total: number; modelId: string; downloading?: boolean };
 
 // ─── Worker State ──────────────────────────────────────────────────────────────
 
 let asr: AutomaticSpeechRecognitionPipeline | null = null;
 let currentModelId = "";
 let isLoading = false;
+let isTranscribing = false;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -85,14 +84,13 @@ function postError(message: string, err?: unknown): void {
 /**
  * Load the Whisper model pipeline.
  *
- * We select device priority: webgpu → wasm. The env configuration above
- * ensures the WASM fallback works inside a Worker context.
+ * The WASM backend keeps GPU resources available to the planner.
  *
  * dtype: 'q8' — 8-bit quantized weights meet the ≤300MB Lite storage budget
  * and ≤1.2 GB Standard budget while maintaining WER < 10% on common commands.
  */
 async function loadModel(modelId: string): Promise<void> {
-  if (isLoading) {
+  if (isLoading || isTranscribing) {
     postError("Model load already in progress.");
     return;
   }
@@ -107,34 +105,30 @@ async function loadModel(modelId: string): Promise<void> {
   console.log(`[STT Worker] Loading "${modelId}"…`);
 
   // Build the progress callback — maps transformers.js ProgressInfo to our protocol.
+  const files = new Map<string, number>();
+  let progress = 0;
   const progressCallback = (info: ProgressInfo): void => {
-    const infoAny = info as { status: string; loaded?: number; total?: number };
-    if (infoAny.status === "downloading" || infoAny.status === "progress") {
-      const loaded = infoAny.loaded ?? 0;
-      const total = infoAny.total ?? 0;
-      post({ type: "progress", loaded, total, modelId });
-    }
+    const report = info as { status: string; file?: string; loaded?: number; total?: number };
+    if (!report.file?.endsWith(".onnx")) return;
+    const prior = files.get(report.file) ?? 0;
+    const fraction = report.status === "done" ? 1 : report.total ? Math.min(1, (report.loaded ?? 0) / report.total) : prior;
+    files.set(report.file, Math.max(prior, fraction));
+    // Whisper has encoder and merged decoder weights. Tiny JSON/config downloads
+    // must not briefly claim 100% before the large weights even start.
+    progress = Math.max(progress, Math.min(0.99, [...files.values()].reduce((sum, value) => sum + value, 0) / Math.max(2, files.size)));
+    post({ type: "progress", loaded: progress * 100, total: 100, modelId,
+      downloading: report.status === "progress" || report.status === "downloading" });
   };
 
   try {
-    // Try WebGPU first (fastest), fall back to WASM q8, then default.
-    asr = await pipeline("automatic-speech-recognition", modelId, {
-      dtype: "q8" as "q8",
-      device: "webgpu" as "webgpu",
+    // Keep Whisper off the GPU used by WebLLM; q8 WASM has predictable memory use.
+    await asr?.dispose();
+    asr = null;
+    const createASR = pipeline<"automatic-speech-recognition">;
+    asr = await createASR("automatic-speech-recognition", modelId, {
+      dtype: "q8",
+      device: "wasm",
       progress_callback: progressCallback,
-    }).catch(async (gpuErr: unknown) => {
-      console.warn("[STT Worker] WebGPU unavailable, falling back to WASM:", gpuErr);
-      return pipeline("automatic-speech-recognition", modelId, {
-        dtype: "q8" as "q8",
-        device: "wasm" as "wasm",
-        progress_callback: progressCallback,
-      }).catch(async (wasmErr: unknown) => {
-        console.warn("[STT Worker] WASM q8 failed, trying standard WASM pipeline:", wasmErr);
-        return pipeline("automatic-speech-recognition", modelId, {
-          device: "wasm" as "wasm",
-          progress_callback: progressCallback,
-        });
-      });
     });
 
     isLoading = false;
@@ -166,6 +160,12 @@ async function transcribe(audio: Float32Array): Promise<void> {
     return;
   }
 
+  if (isTranscribing) { postError("Speech recognition is busy."); return; }
+  if (!(audio instanceof Float32Array) || audio.length === 0 || audio.length > 16_000 * 30 || !audio.every(Number.isFinite)) {
+    postError("Audio must contain 0–30 seconds of finite 16 kHz PCM samples.");
+    return;
+  }
+  isTranscribing = true;
   const durationSeconds = audio.length / 16_000;
   console.log(`[STT Worker] Transcribing ${durationSeconds.toFixed(2)}s…`);
   const t0 = performance.now();
@@ -177,6 +177,7 @@ async function transcribe(audio: Float32Array): Promise<void> {
       language: "en",
       task: "transcribe",
       return_timestamps: false,
+      max_new_tokens: 128,
       // chunk_length_s and stride_length_s are for long-form transcription;
       // voice commands are typically <10s so we skip chunking.
     });
@@ -196,6 +197,8 @@ async function transcribe(audio: Float32Array): Promise<void> {
     });
   } catch (err: unknown) {
     postError(`Transcription failed: ${err instanceof Error ? err.message : String(err)}`, err);
+  } finally {
+    isTranscribing = false;
   }
 }
 

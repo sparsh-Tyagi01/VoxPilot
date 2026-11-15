@@ -2,9 +2,8 @@
   "manifest_version": 3,
   "name": "VoxPilot",
   "short_name": "VoxPilot",
-  "description": "Autonomous on-device voice AI agent for hands-free browser control. 100% private — all processing runs on your device.",
+  "description": "Autonomous on-device voice AI agent for hands-free browser control. 100% private \u2014 all processing runs on your device.",
   "version": "0.1.0",
-
   "permissions": [
     "offscreen",
     "activeTab",
@@ -12,35 +11,29 @@
     "scripting",
     "storage",
     "unlimitedStorage",
-    "sidePanel",
     "alarms"
   ],
-
-  "host_permissions": ["https://*/*", "http://*/*"],
-
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
   "background": {
     "service_worker": "src/sw/sw.ts",
     "type": "module"
   },
-
-  "side_panel": {
-    "default_path": "src/panel/panel.html"
-  },
-
   "options_ui": {
     "page": "src/settings/settings.html",
     "open_in_tab": true
   },
-
   "action": {
     "default_title": "VoxPilot",
     "default_icon": {
       "16": "src/icons/icon-16.png",
       "48": "src/icons/icon-48.png",
       "128": "src/icons/icon-128.png"
-    }
+    },
+    "default_popup": "src/panel/panel.html"
   },
-
   "commands": {
     "toggle-listening": {
       "suggested_key": {
@@ -50,20 +43,22 @@
       "description": "Toggle voice listening on/off"
     }
   },
-
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["src/content/content.ts"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/content/content.ts"
+      ],
       "run_at": "document_idle",
       "all_frames": true
     }
   ],
-
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://raw.githubusercontent.com https://cdn.jsdelivr.net"
   },
-
   "web_accessible_resources": [
     {
       "resources": [
@@ -73,10 +68,11 @@
         "onnx/*",
         "audio-processor.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
-
   "icons": {
     "16": "src/icons/icon-16.png",
     "48": "src/icons/icon-48.png",

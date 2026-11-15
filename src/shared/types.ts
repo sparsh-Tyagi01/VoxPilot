@@ -314,6 +314,8 @@ export interface SessionState {
   lastTranscript: string;
   /** Current plan being confirmed/executed */
   currentPlan: AgentPlan | null;
+  /** Identifies the plan that may still execute after async page work. */
+  executionId?: string | null;
   /** Whether the offscreen document is alive */
   offscreenActive: boolean;
   /** Whether voice listening is toggled on */

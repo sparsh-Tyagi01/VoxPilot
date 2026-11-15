@@ -36,6 +36,7 @@ import type {
 /** All VoxPilot messages carry a `type` discriminant. */
 export interface BaseMessage {
   readonly type: string;
+  readonly target?: "sw" | "offscreen" | "ui";
 }
 
 // ─── Panel → SW Messages ──────────────────────────────────────────────────────
@@ -67,6 +68,10 @@ export interface TriggerMacroMsg extends BaseMessage {
 }
 
 /** Panel requesting current session state (for initialization). */
+export interface GetModelStatusMsg extends BaseMessage {
+  type: "GET_MODEL_STATUS";
+}
+
 export interface GetSessionStateMsg extends BaseMessage {
   type: "GET_SESSION_STATE";
 }
@@ -212,6 +217,8 @@ export interface TtsDoneMsg extends BaseMessage {
 
 /** Offscreen reports STT/LLM model download progress. */
 export interface ModelLoadProgressMsg extends BaseMessage {
+  profile?: string;
+  loadId?: string;
   type: "MODEL_LOAD_PROGRESS";
   progress?: number;
   loaded?: number;
@@ -445,6 +452,7 @@ export type VoxPilotMessage =
   | UndoLastActionMsg
   | TriggerMacroMsg
   | GetSessionStateMsg
+  | GetModelStatusMsg
   | DirectTranscriptMsg
   /* SW → Panel */
   | SessionStateUpdateMsg

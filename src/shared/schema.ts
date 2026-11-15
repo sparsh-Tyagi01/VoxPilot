@@ -14,6 +14,7 @@
  * - Additional properties disallowed at every level
  */
 
+import { BROWSER_NAVIGATION_COMMANDS } from "./constants.js";
 import type { SchemaObject } from "ajv";
 
 // ─── Individual Action Schemas ────────────────────────────────────────────────
@@ -74,7 +75,7 @@ const scrollActionSchema: SchemaObject = {
       ],
     },
     direction: { type: "string", enum: ["up", "down", "left", "right"] },
-    amount: { type: "integer", minimum: 1, maximum: 10000 },
+    amount: { type: "integer", minimum: 1, maximum: 100000 },
   },
   required: ["type", "direction"],
   additionalProperties: false,
@@ -86,9 +87,8 @@ const navigateActionSchema: SchemaObject = {
     type: { type: "string", const: "navigate" },
     url: {
       type: "string",
-      format: "uri",
       maxLength: 2048,
-      pattern: "^https?://",
+      anyOf: [{ pattern: "^https?://" }, { enum: [...BROWSER_NAVIGATION_COMMANDS] }],
     },
   },
   required: ["type", "url"],
@@ -100,8 +100,8 @@ const tabActionSchema: SchemaObject = {
   properties: {
     type: { type: "string", const: "tab" },
     operation: { type: "string", enum: ["open", "close", "switch"] },
-    url: { type: "string", format: "uri", maxLength: 2048 },
-    index: { type: "integer", minimum: 0, maximum: 999 },
+    url: { type: "string", maxLength: 2048, anyOf: [{ pattern: "^https?://" }, { const: "chrome://newtab" }] },
+    index: { type: "integer", minimum: -1, maximum: 999 },
   },
   required: ["type", "operation"],
   additionalProperties: false,
@@ -259,3 +259,12 @@ export const AGENT_PLAN_SCHEMA: SchemaObject = {
 
 /** Schema ID used to register with AJV. */
 export const AGENT_PLAN_SCHEMA_ID = AGENT_PLAN_SCHEMA["$id"] as string;
+
+/** Keep native grammar compilation small; enforce detailed bounds locally afterward. */
+function generationSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(generationSchema);
+  if (!value || typeof value !== "object") return value;
+  const omit = new Set(["$schema", "$id", "title", "description", "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "pattern", "format"]);
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !omit.has(key)).map(([key, item]) => [key === "oneOf" ? "anyOf" : key, generationSchema(item)]));
+}
+export const AGENT_PLAN_GENERATION_SCHEMA = generationSchema(AGENT_PLAN_SCHEMA);

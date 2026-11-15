@@ -22,6 +22,7 @@ export const HANDLE_PATTERN = /^e\d+$/;
 export class HandleRegistry {
   private registry = new Map<string, WeakRef<Element>>();
   private counter = 0;
+  private reverse = new WeakMap<Element, string>();
 
   /**
    * Register a DOM element and return its handle string.
@@ -31,13 +32,12 @@ export class HandleRegistry {
    * @returns Handle string like "e0", "e1", etc.
    */
   register(el: Element): string {
-    // Check if element is already registered (identity check by iterating)
-    for (const [handle, ref] of this.registry.entries()) {
-      if (ref.deref() === el) return handle;
-    }
+    const existing = this.reverse.get(el);
+    if (existing) return existing;
 
     const handle = `e${this.counter++}`;
     this.registry.set(handle, new WeakRef(el));
+    this.reverse.set(el, handle);
     return handle;
   }
 
@@ -59,7 +59,8 @@ export class HandleRegistry {
    */
   reset(): void {
     this.registry.clear();
-    this.counter = 0;
+    this.reverse = new WeakMap();
+    // Never reuse an ID for another element while this content script is alive.
   }
 
   /** Number of registered elements. */

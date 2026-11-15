@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-15T00:00:00Z",
+  "title": "Design System: VoxPilot popup",
+  "extensions": {
+    "shadows": [],
+    "motion": [
+      {
+        "name": "listening-control",
+        "value": "background 120ms ease",
+        "purpose": "Background transition on the primary listening control; disabled by reduced-motion preference."
+      },
+      {
+        "name": "model-preparation",
+        "value": "loading 1.3s ease-in-out infinite",
+        "purpose": "Indeterminate model progress translates the fill from -110% to 440%; disabled by reduced-motion preference."
+      }
+    ],
+    "breakpoints": []
+  },
+  "components": [
+    {
+      "name": "Start listening",
+      "kind": "button",
+      "refersTo": "listening-start",
+      "description": "Full-width control for enabling the persistent voice session.",
+      "html": "<button class=\"ds-start\" type=\"button\" aria-pressed=\"false\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"9\" y=\"3\" width=\"6\" height=\"11\" rx=\"3\"/><path d=\"M6 10v1a6 6 0 0 0 12 0v-1M12 17v4m-3 0h6\"/></svg><span>Start listening</span><kbd>Alt+V</kbd></button>",
+      "css": ".ds-start{width:100%;min-height:44px;padding:10px 13px;border:0;border-radius:9px;color:#fff;background:var(--accent,#2865d8);font:600 13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;gap:9px;cursor:pointer;transition:background 120ms ease}.ds-start svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.ds-start kbd{margin-left:auto;font-weight:400;font-size:12px;opacity:.8}.ds-start:hover{background:var(--accent-hover,#266ae3)}.ds-start:focus-visible{outline:2px solid #91baff;outline-offset:3px}.ds-start:disabled{cursor:wait;opacity:.65}@media(prefers-reduced-motion:reduce){.ds-start{transition:none}}"
+    },
+    {
+      "name": "Pause listening",
+      "kind": "button",
+      "refersTo": "listening-pause",
+      "description": "Active session variant of the listening control.",
+      "html": "<button class=\"ds-pause\" type=\"button\" aria-pressed=\"true\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M9 5v14M15 5v14\"/></svg><span>Pause listening</span><kbd>Alt+V</kbd></button>",
+      "css": ".ds-pause{width:100%;min-height:44px;padding:10px 13px;border:0;border-radius:9px;color:#c5f7e3;background:#233b39;font:600 13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;gap:9px;cursor:pointer;transition:background 120ms ease}.ds-pause svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.ds-pause kbd{margin-left:auto;font-weight:400;font-size:12px;opacity:.8}.ds-pause:hover{background:#2b4844}.ds-pause:focus-visible{outline:2px solid #91baff;outline-offset:3px}.ds-pause:disabled{cursor:wait;opacity:.65}@media(prefers-reduced-motion:reduce){.ds-pause{transition:none}}"
+    },
+    {
+      "name": "Contextual primary action",
+      "kind": "button",
+      "description": "Blue confirmation, unlock, or command action.",
+      "html": "<button class=\"ds-primary\" type=\"button\">Confirm action</button>",
+      "css": ".ds-primary{min-height:34px;padding:6px 10px;border:1px solid transparent;border-radius:7px;background:var(--accent,#2865d8);color:#fff;font:500 12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}.ds-primary:hover{background:var(--accent-hover,#266ae3)}.ds-primary:focus-visible{outline:2px solid #91baff;outline-offset:3px}.ds-primary:disabled{cursor:wait;opacity:.65}"
+    },
+    {
+      "name": "Secondary action",
+      "kind": "button",
+      "refersTo": "secondary-button",
+      "description": "Outlined contextual action used for Cancel.",
+      "html": "<button class=\"ds-secondary\" type=\"button\">Cancel</button>",
+      "css": ".ds-secondary{min-height:34px;padding:6px 10px;border:1px solid var(--line,#2e3c51);border-radius:7px;background:transparent;color:var(--text,#f0f4fa);font:500 12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}.ds-secondary:hover{background:var(--surface,#1a2639)}.ds-secondary:focus-visible{outline:2px solid #91baff;outline-offset:3px}.ds-secondary:disabled{cursor:wait;opacity:.65}"
+    },
+    {
+      "name": "Vault field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Labeled password field in the contextual vault section.",
+      "html": "<label class=\"ds-field-label\" for=\"ds-passphrase\">Passphrase</label><input class=\"ds-field\" id=\"ds-passphrase\" type=\"password\" autocomplete=\"current-password\" required />",
+      "css": ".ds-field-label{display:block;margin-bottom:6px;color:var(--muted,#aab8cc);font:400 12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.ds-field{box-sizing:border-box;width:100%;min-height:36px;padding:7px 9px;border:1px solid #465871;border-radius:7px;background:var(--bg,#111a29);color:var(--text,#f0f4fa);caret-color:#a8c9ff;font:400 13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}.ds-field::placeholder{color:#a3b2c7}.ds-field:focus-visible{outline:2px solid #91baff;outline-offset:3px}"
+    },
+    {
+      "name": "Popup footer",
+      "kind": "nav",
+      "description": "Settings and expandable Commands & help utilities.",
+      "html": "<footer class=\"ds-footer\"><button type=\"button\">Settings</button><button type=\"button\" aria-expanded=\"false\">Commands &amp; help</button></footer>",
+      "css": ".ds-footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line,#2e3c51);padding:5px 10px}.ds-footer button{min-height:32px;border:0;border-radius:5px;padding:5px 8px;color:var(--muted,#aab8cc);background:none;font:400 12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;cursor:pointer}.ds-footer button:hover{color:var(--text,#f0f4fa);background:var(--surface,#1a2639)}.ds-footer button:focus-visible{outline:2px solid #91baff;outline-offset:3px}"
+    }
+  ],
+  "narrative": {
+    "overview": "This document covers the compact Chrome action popup in `src/panel/panel.html` and `src/panel/panel.ts`. Its navy utility interface puts listening state, the primary control, and the latest command within a short scan. It records the shipped popup system; other extension surfaces require their own design decisions.\n\nThe popup controls a persistent voice session. Its listening note explains that closing the popup leaves the microphone running. The reviewed default popup measures 340 × 270 CSS pixels.",
+    "rules": [],
+    "dos": [
+      "Do keep listening state and its primary control visible before contextual content.",
+      "Do pair status color with explicit text and keep the persistent microphone explanation close to the control.",
+      "Do reveal confirmation, vault, error, and help content only when relevant."
+    ],
+    "donts": [
+      "Don't turn the compact popup into a dashboard or introduce a new product-wide identity through this document.",
+      "Don't imply that closing the popup pauses listening."
+    ]
+  }
+}

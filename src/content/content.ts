@@ -72,6 +72,12 @@ chrome.runtime.onMessage.addListener(
         return false;
       }
 
+      case "HIDE_CONFIRMATION": {
+        overlay.hideConfirmation();
+        sendResponse({ ok: true });
+        return false;
+      }
+
       case "SHOW_BADGES": {
         // Render set-of-marks numbered badges
         const snapshot = snapshotBuilder.build();

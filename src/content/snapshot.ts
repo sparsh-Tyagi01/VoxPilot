@@ -15,6 +15,7 @@
  * - Snapshot text is escaped when embedded in LLM prompts (see planner.ts).
  */
 
+import { SNAPSHOT_TIMEOUT_MS } from "@shared/constants.js";
 import { HandleRegistry } from "./handles.js";
 import type { ElementHandle, PageSnapshot } from "@shared/types.js";
 
@@ -74,9 +75,16 @@ function extractLabel(el: Element): string | undefined {
     if (text) return text.slice(0, 100);
   }
 
+  // Native labels avoids repeated document-wide selector queries for form fields.
+  if ("labels" in el) {
+    const labels = (el as HTMLInputElement).labels;
+    const text = labels?.[0]?.textContent?.trim();
+    if (text) return text.slice(0, 100);
+  }
+
   // 3. Associated <label> element (via id)
   const id = el.getAttribute("id");
-  if (id) {
+  if (id && !("labels" in el)) {
     const labelEl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(id)}"]`);
     const text = labelEl?.textContent?.trim();
     if (text) return text.slice(0, 100);
@@ -145,27 +153,26 @@ export class SnapshotBuilder {
    */
   build(): PageSnapshot {
     const startMs = performance.now();
+    // Leave room for headings, readable text, and serialization metadata.
+    const elementDeadline = startMs + Math.max(1, SNAPSHOT_TIMEOUT_MS - 10);
 
     // Reset handle registry for this snapshot cycle
     this.handles.reset();
 
     // Query all candidate elements
-    const candidates = Array.from(document.querySelectorAll<Element>(ACTIONABLE_SELECTOR));
-
-    // Batch getBoundingClientRect calls to avoid forced reflows
-    const rects = candidates.map((el) => el.getBoundingClientRect());
+    const candidates = document.querySelectorAll<Element>(ACTIONABLE_SELECTOR);
 
     const elements: ElementHandle[] = [];
     let truncated = false;
 
     for (let i = 0; i < candidates.length; i++) {
-      if (elements.length >= MAX_ELEMENTS) {
+      if (elements.length >= MAX_ELEMENTS || performance.now() >= elementDeadline) {
         truncated = true;
         break;
       }
 
       const el = candidates[i]!;
-      const rect = rects[i]!;
+      const rect = el.getBoundingClientRect();
 
       // Skip zero-size or hidden elements
       if (rect.width === 0 || rect.height === 0) continue;
@@ -206,20 +213,36 @@ export class SnapshotBuilder {
       });
     }
 
-    const elapsed = performance.now() - startMs;
-    if (elapsed > 50) {
-      console.warn(`[VoxPilot snapshot] Built in ${elapsed.toFixed(1)}ms (target: ≤50ms) with ${elements.length} elements`);
-    }
-
+    // Use textContent to avoid the synchronous layout calculation required by innerText.
     // Extract key headings for semantic understanding
     const headings = Array.from(document.querySelectorAll<HTMLElement>("h1, h2, h3"))
-      .map((h) => h.innerText?.trim())
+      .slice(0, 15)
+      .map((h) => h.textContent?.trim().slice(0, 150))
       .filter((t): t is string => Boolean(t && t.length > 2))
       .slice(0, 15);
 
     // Extract readable main body text
     const mainEl = document.querySelector<HTMLElement>("main, article, [role='main'], #content, .content") || document.body;
-    const textSummary = mainEl?.innerText?.trim().slice(0, 2500) || "";
+    const textParts: string[] = [];
+    let textLength = 0;
+    if (mainEl) {
+      const walker = document.createTreeWalker(mainEl, NodeFilter.SHOW_TEXT);
+      let node: Node | null;
+      let visited = 0;
+      while (performance.now() - startMs < SNAPSHOT_TIMEOUT_MS && textLength < 2500 && visited++ < 2000 && (node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest("script, style, noscript, template, [hidden], [aria-hidden='true']")) continue;
+        const text = node.textContent?.replace(/\s+/g, " ").trim().slice(0, 2500 - textLength);
+        if (text) { textParts.push(text); textLength += text.length + 1; }
+      }
+    }
+    const textSummary = textParts.join(" ").slice(0, 2500);
+
+    const elapsed = performance.now() - startMs;
+    // Tiny scheduling overruns at the deadline are normal; retain diagnostics.
+    if (elapsed > SNAPSHOT_TIMEOUT_MS + 5) {
+      console.warn(`[VoxPilot snapshot] Built in ${elapsed.toFixed(1)}ms with ${elements.length} elements (budget ${SNAPSHOT_TIMEOUT_MS}ms)`);
+    }
 
     return {
       url: window.location.href,

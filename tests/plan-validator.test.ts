@@ -54,3 +54,22 @@ describe("PlanValidator (FR-SAFE-01)", () => {
   });
 });
 
+
+
+describe("Browser command allowlist", () => {
+  const validator = new PlanValidator();
+  const plan = (action: unknown) => ({ intent: "browser", risk: 1, requiresConfirmation: false, actions: [action] });
+  it("accepts fixed browser navigation tokens and rejects executable URLs", () => {
+    for (const url of ["javascript:history.back()", "javascript:history.forward()", "javascript:location.reload()", "https://example.com"]) {
+      expect(() => validator.validate(plan({ type: "navigate", url }))).not.toThrow();
+    }
+    for (const url of ["javascript:alert(1)", "javascript:history.back();alert(1)", "data:text/html,test"]) {
+      expect(() => validator.validate(plan({ type: "navigate", url }))).toThrow();
+      expect(() => validator.validate(plan({ type: "tab", operation: "open", url }))).toThrow();
+    }
+  });
+  it("accepts the actual router's previous-tab and end-of-page actions", () => {
+    expect(() => validator.validate(plan({ type: "tab", operation: "switch", index: -1 }))).not.toThrow();
+    expect(() => validator.validate(plan({ type: "scroll", direction: "down", amount: 99999 }))).not.toThrow();
+  });
+});

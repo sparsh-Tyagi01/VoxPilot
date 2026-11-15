@@ -23,22 +23,23 @@ import {
   SW_KEEPALIVE_ALARM_PERIOD_MINUTES,
   SESSION_KEYS,
   CONTENT_SCRIPT_TIMEOUT_MS,
-  OFFSCREEN_KEEPALIVE_INTERVAL_MS,
 } from "@shared/constants.js";
-import type { VoxPilotMessage } from "@shared/messages.js";
+import type { ModelLoadProgressMsg, VoxPilotMessage } from "@shared/messages.js";
 import { AgentState } from "@shared/types.js";
-import type { SessionState, AgentPlan, PageSnapshot } from "@shared/types.js";
+import type { SessionState, AgentPlan } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
 import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
 import { VaultService } from "@vault/vault.js";
-import { IntentRouter } from "../offscreen/agent/intent-router.js";
+import { PlanValidator } from "../offscreen/agent/plan-validator.js";
+import { RiskClassifier } from "../offscreen/agent/risk-classifier.js";
+import { executeBrowserPlan } from "./plan-execution.js";
 
-// Global intent router instance for SW-level fast-path execution
-const swIntentRouter = new IntentRouter();
-
-// Command deduplication cache to prevent double-firing from dual recognition engines
-let lastExecutedCommand = "";
-let lastExecutedCommandTime = 0;
+// In-flight locks serialize events; durable state remains in storage.session.
+let sessionWrite: Promise<unknown> = Promise.resolve();
+let listeningOperation: Promise<void> = Promise.resolve();
+let offscreenCreation: Promise<void> | null = null;
+const MODEL_STATUS_KEY = "model_load_status";
+const canonicalProfile = (profile: string): string => ({ lite: "fast", standard: "balanced", enhanced: "powerful" }[profile] ?? profile);
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -72,7 +73,7 @@ async function getSessionState(): Promise<SessionState> {
  */
 async function setSessionState(state: SessionState): Promise<void> {
   await chrome.storage.session.set({ [SESSION_KEYS.SESSION_STATE]: state });
-  // Broadcast to side panel (best-effort; panel may not be open)
+  // Broadcast to popup (best-effort; panel may not be open)
   broadcastToPanel({ type: "SESSION_STATE_UPDATE", state });
 }
 
@@ -80,22 +81,26 @@ async function setSessionState(state: SessionState): Promise<void> {
  * Partial update helper — reads, merges, writes.
  */
 async function updateSessionState(
-  partial: Partial<SessionState>
+  partial: Partial<SessionState> | ((current: SessionState) => Partial<SessionState>)
 ): Promise<SessionState> {
-  const current = await getSessionState();
-  const next = { ...current, ...partial };
-  await setSessionState(next);
-  return next;
+  const write = sessionWrite.then(async () => {
+    const current = await getSessionState();
+    const next = { ...current, ...(typeof partial === "function" ? partial(current) : partial) };
+    await setSessionState(next);
+    return next;
+  });
+  sessionWrite = write.catch(() => {});
+  return write;
 }
 
 // ─── Panel Broadcast ──────────────────────────────────────────────────────────
 
 /**
- * Best-effort broadcast to the side panel.
+ * Best-effort broadcast to the popup.
  * Swallows "Could not establish connection" errors (panel not open).
  */
 function broadcastToPanel(msg: VoxPilotMessage): void {
-  chrome.runtime.sendMessage(msg).catch(() => {
+  chrome.runtime.sendMessage({ ...msg, target: "ui" }).catch(() => {
     // Panel is not open — this is expected and not an error
   });
 }
@@ -105,13 +110,9 @@ function broadcastToPanel(msg: VoxPilotMessage): void {
  * The offscreen doc receives all chrome.runtime messages (it has no other comms path).
  */
 async function relayToOffscreen(msg: VoxPilotMessage): Promise<void> {
-  // Ensure offscreen is active before sending
   await ensureOffscreenDocument();
-  // Offscreen receives via chrome.runtime.onMessage — no targetId needed
-  await chrome.runtime.sendMessage(msg).catch(() => {
-    // Offscreen may have restarted — not fatal for best-effort relay
-    console.warn("[SW] Could not relay to offscreen:", (msg as { type: string }).type);
-  });
+  const response = await chrome.runtime.sendMessage({ ...msg, target: "offscreen" });
+  if (response?.ok === false) throw new Error(response.error ?? `Offscreen ${msg.type} failed`);
 }
 
 function isInternalUrl(url?: string): boolean {
@@ -126,189 +127,43 @@ function isInternalUrl(url?: string): boolean {
 }
 
 async function getTargetTab(): Promise<chrome.tabs.Tab | null> {
-  // 1. Try active tab in last focused window (the browser window behind the side panel)
-  const tabsInLastFocused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  for (const t of tabsInLastFocused) {
-    if (t.id && !isInternalUrl(t.url)) return t;
-  }
-
-  // 2. Try active tab in current window
-  const tabsCurrent = await chrome.tabs.query({ active: true, currentWindow: true });
-  for (const t of tabsCurrent) {
-    if (t.id && !isInternalUrl(t.url)) return t;
-  }
-
-  // 3. Fallback to any active tab across all windows
-  const anyTabs = await chrome.tabs.query({ active: true });
-  for (const t of anyTabs) {
-    if (t.id && !isInternalUrl(t.url)) return t;
-  }
-
-  return tabsInLastFocused[0] ?? tabsCurrent[0] ?? anyTabs[0] ?? null;
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tab ?? null;
 }
 
-/**
- * Execute plan actions in the target tab. First attempts execution via the
- * page content script; if unavailable or unmounted, falls back to direct
- * chrome.scripting.executeScript to guarantee immediate execution.
- */
-async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void> {
-  // 1. Direct handling of Tab and Navigation operations at SW level
-  for (const action of plan.actions) {
-    if (action.type === "tab") {
-      try {
-        if (action.operation === "open") {
-          await chrome.tabs.create({ url: action.url ?? "chrome://newtab" });
-        } else if (action.operation === "close") {
-          const [cur] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (cur?.id) await chrome.tabs.remove(cur.id);
-        } else if (action.operation === "switch") {
-          const tabs = await chrome.tabs.query({ currentWindow: true });
-          const curIdx = tabs.findIndex((t) => t.active);
-          if (curIdx !== -1 && tabs.length > 1) {
-            const delta = action.index ?? 1;
-            const nextIdx = (curIdx + delta + tabs.length) % tabs.length;
-            const target = tabs[nextIdx];
-            if (target?.id) await chrome.tabs.update(target.id, { active: true });
-          }
-        }
-      } catch (err) {
-        console.error("[SW] Direct tab operation failed:", err);
-      }
-    } else if (action.type === "navigate") {
-      try {
-        console.log(`[SW] Direct navigate action: "${action.url}" on tab ${tabId}`);
-        if (action.url.includes("history.back") || action.url === "back") {
-          await chrome.tabs.goBack(tabId).catch(async (e) => {
-            console.warn("[SW] chrome.tabs.goBack failed, trying script:", e);
-            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.back() }).catch(() => {});
-          });
-        } else if (action.url.includes("history.forward") || action.url === "forward") {
-          await chrome.tabs.goForward(tabId).catch(async (e) => {
-            console.warn("[SW] chrome.tabs.goForward failed, trying script:", e);
-            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.forward() }).catch(() => {});
-          });
-        } else if (action.url.includes("location.reload") || action.url === "reload") {
-          await chrome.tabs.reload(tabId).catch(async (e) => {
-            console.warn("[SW] chrome.tabs.reload failed, trying script:", e);
-            await chrome.scripting.executeScript({ target: { tabId }, func: () => window.location.reload() }).catch(() => {});
-          });
-        } else {
-          await chrome.tabs.update(tabId, { url: action.url }).catch(console.error);
-        }
-      } catch (err) {
-        console.error("[SW] Direct navigate operation failed:", err);
-      }
-    }
-  }
-
-  // Check if there are in-page DOM actions (scroll, click, type, etc.)
-  const hasDomActions = plan.actions.some((a) =>
-    ["scroll", "click", "type", "select", "toggle", "read", "fill_from_vault"].includes(a.type)
-  );
-  if (!hasDomActions) {
-    return;
-  }
-
-  // 2. Attempt in-page execution via content script
-  let executedInContent = false;
+async function completePlan(tabId: number, plan: AgentPlan): Promise<void> {
+  await updateSessionState({ agentState: AgentState.Executing });
   try {
-    const res = await sendToContentScript(tabId, {
-      type: "EXECUTE_IN_PAGE",
-      plan,
+    const executionId = (await getSessionState()).executionId;
+    await relayToOffscreen({ type: "AGENT_STATE_CHANGED", state: AgentState.Executing });
+    await executeBrowserPlan(tabId, plan, sendToContentScript, async () => {
+      const state = await getSessionState();
+      return state.listeningEnabled && state.executionId === executionId && state.agentState === AgentState.Executing;
     });
-    if (res && (res as any).success) {
-      executedInContent = true;
+    const done = plan.actions.find(action => action.type === "done");
+    const question = plan.actions.find(action => action.type === "ask");
+    const speech = question?.question ?? done?.summary;
+    if (speech && !plan.actions.some(action => action.type === "read")) {
+      await relayToOffscreen({ type: "SPEAK", text: speech });
     }
-  } catch (err: unknown) {
-    console.warn("[SW] Content script execution failed, falling back to direct chrome.scripting:", err);
-  }
-
-  // 3. Fallback direct script injection if content script is unavailable or failed
-  if (!executedInContent) {
-    for (const action of plan.actions) {
-      if (action.type === "scroll") {
-        const direction = action.direction;
-        const amount = action.amount ?? 750;
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (dir: string, amt: number) => {
-            const screenH = window.innerHeight || 800;
-            const scrollDist = amt === 99999 ? 999999 : Math.max(amt, Math.round(screenH * 0.85));
-            const y = dir === "up" ? -scrollDist : dir === "down" ? scrollDist : 0;
-            const x = dir === "left" ? -scrollDist : dir === "right" ? scrollDist : 0;
-            window.scrollBy({ left: x, top: y, behavior: "smooth" });
-          },
-          args: [direction, amount],
-        }).catch((e: unknown) => console.error("[SW] Direct scroll script failed:", e));
-      } else if (action.type === "click") {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (targetQuery: string) => {
-            const q = targetQuery.trim().toLowerCase();
-            const cleanQ = q.replace(/^(?:the|a|an)\s+/i, "").replace(/\s+(?:button|btn|link|tab|icon|menu)$/i, "").trim();
-            const candidates = Array.from(document.querySelectorAll<HTMLElement>(
-              "button, a, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [tabindex='0'], h1, h2, h3, h4, p, span, li, b, strong"
-            ));
-            for (const el of candidates) {
-              const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
-              const aria = el.getAttribute("aria-label")?.trim().toLowerCase() || "";
-              if (
-                text === q || text === cleanQ ||
-                aria === q || aria === cleanQ ||
-                (cleanQ.length >= 3 && (text.includes(cleanQ) || aria.includes(cleanQ)))
-              ) {
-                const interactive = el.closest<HTMLElement>("button, a, [role='button'], [role='link'], [tabindex='0']") || el;
-                interactive.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                interactive.click();
-                return;
-              }
-            }
-          },
-          args: [action.handle],
-        }).catch((e: unknown) => console.error("[SW] Direct click script failed:", e));
-      } else if (action.type === "type") {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (handleQuery: string, textToType: string) => {
-            const q = handleQuery.trim().toLowerCase();
-            let inputEl = document.querySelector<HTMLInputElement>(
-              "input[type='search'], input[name*='search'], input[name='q'], input[id*='search'], input[placeholder*='search' i], textarea[name*='search'], [role='searchbox'], input[type='text'], input:not([type]), textarea"
-            );
-            if (!inputEl) {
-              inputEl = Array.from(document.querySelectorAll<HTMLInputElement>("input, textarea")).find(
-                (el) => el.placeholder?.toLowerCase().includes(q) || el.name?.toLowerCase().includes(q) || el.id?.toLowerCase().includes(q)
-              ) || null;
-            }
-            if (inputEl) {
-              inputEl.focus();
-              inputEl.value = textToType;
-              inputEl.dispatchEvent(new Event("input", { bubbles: true }));
-              inputEl.dispatchEvent(new Event("change", { bubbles: true }));
-              inputEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-              inputEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-              const form = inputEl.form || inputEl.closest("form");
-              if (form) {
-                try { form.requestSubmit(); } catch { form.submit(); }
-              }
-            } else if (q.includes("search")) {
-              window.location.href = `https://www.google.com/search?q=${encodeURIComponent(textToType)}`;
-            }
-          },
-          args: [action.handle, action.text],
-        }).catch((e: unknown) => console.error("[SW] Direct type script failed:", e));
-      } else if (action.type === "navigate") {
-        if (action.url.startsWith("javascript:history.back")) {
-          await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.back() }).catch(() => {});
-        } else if (action.url.startsWith("javascript:history.forward")) {
-          await chrome.scripting.executeScript({ target: { tabId }, func: () => window.history.forward() }).catch(() => {});
-        } else if (action.url.startsWith("javascript:location.reload")) {
-          await chrome.tabs.reload(tabId).catch(() => {});
-        } else {
-          await chrome.tabs.update(tabId, { url: action.url }).catch(console.error);
-        }
-      }
+    await appendHistory({
+      id: generateHistoryId(), timestamp: new Date().toISOString(),
+      transcript: (await getSessionState()).lastTranscript, plan, success: true,
+    }).catch(() => {});
+    const state = await getSessionState();
+    await updateSessionState({ agentState: state.listeningEnabled ? AgentState.Listening : AgentState.Idle, currentPlan: null, executionId: null });
+    broadcastToPanel({ type: "EXECUTION_DONE", success: true });
+    await relayToOffscreen({ type: "EXECUTION_DONE", success: true });
+  } catch (error) {
+    const state = await getSessionState();
+    if (String(error).includes("Command cancelled.")) {
+      broadcastToPanel({ type: "EXECUTION_DONE", success: false });
+      await relayToOffscreen({ type: "EXECUTION_DONE", success: false });
+      return;
     }
+    await updateSessionState({ agentState: state.listeningEnabled ? AgentState.Error : AgentState.Idle, currentPlan: null, executionId: null });
+    await relayToOffscreen({ type: "EXECUTION_DONE", success: false, error: String(error) });
+    throw error;
   }
 }
 
@@ -316,62 +171,26 @@ async function executePlanActions(tabId: number, plan: AgentPlan): Promise<void>
  * Dispatch an AgentPlan to the appropriate tab or overlay.
  */
 async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
-  const state = await updateSessionState({
-    currentPlan: plan,
-    agentState: plan.requiresConfirmation
-      ? AgentState.Confirming
-      : AgentState.Executing,
+  new PlanValidator().validate(plan);
+  const previous = await getSessionState();
+  const targetTabId = previous.activeTabId ?? (await getTargetTab())?.id;
+  if (targetTabId === undefined || targetTabId === null) throw new Error("Open a regular webpage before issuing a command.");
+  const risk = new RiskClassifier().classify(plan);
+  plan = { ...plan, risk, requiresConfirmation: plan.requiresConfirmation || risk >= 3 };
+  await updateSessionState({
+    currentPlan: plan, activeTabId: targetTabId, executionId: crypto.randomUUID(),
+    agentState: plan.requiresConfirmation ? AgentState.Confirming : AgentState.Executing,
   });
-
   broadcastToPanel({ type: "PLAN_READY", plan });
-
-  const targetTab = await getTargetTab();
-  const targetTabId = targetTab?.id ?? state.activeTabId;
-
-  if (targetTab?.url && isInternalUrl(targetTab.url)) {
-    broadcastToPanel({
-      type: "AGENT_STATE_CHANGED",
-      state: AgentState.Listening,
-      error: "Browser system pages (chrome://) cannot be scripted. Please test on any regular webpage.",
-    });
-    await relayToOffscreen({
-      type: "SPEAK",
-      text: "Browser internal pages cannot be controlled. Please test on a regular webpage.",
-    });
-    return false;
-  }
-
-  if (targetTabId === null) {
-    console.warn("[SW] No valid target tab found for plan execution.");
-    return false;
-  }
-
-  // If confirmation required, show overlay in content script
   if (plan.requiresConfirmation) {
-    await sendToContentScript(targetTabId, {
-      type: "SHOW_CONFIRMATION",
-      plan,
-    }).catch((err: unknown) => {
-      console.error("[SW] Failed to show confirmation overlay:", err);
+    await sendToContentScript(targetTabId, { type: "SHOW_CONFIRMATION", plan }).catch(() => {
+      // The toolbar popup remains an alternative confirmation surface.
     });
+    await chrome.action.setBadgeText({ text: "?" });
+    await chrome.action.setTitle({ title: "VoxPilot — confirmation needed. Open the popup." });
   } else {
-    // Auto-execute low-risk plans
-    await executePlanActions(targetTabId, plan);
-
-    // Speak done action summary (summarization, Q&A answers, action completions)
-    const doneAction = plan.actions.find((a) => a.type === "done") as { type: "done"; summary: string } | undefined;
-    if (doneAction?.summary) {
-      console.log(`[SW] Speaking plan summary: "${doneAction.summary}"`);
-      void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
-    }
-
-    // Return to Listening state after execution
-    await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
-    broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
-    broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true, summary: doneAction?.summary } as any);
-    await relayToOffscreen({ type: "EXECUTION_DONE" as any, success: true });
+    await completePlan(targetTabId, plan);
   }
-
   return true;
 }
 
@@ -380,7 +199,7 @@ async function dispatchPlan(plan: AgentPlan): Promise<boolean> {
 const OFFSCREEN_URL = "src/offscreen/offscreen.html";
 const OFFSCREEN_REASONS: chrome.offscreen.Reason[] = [
   (chrome.offscreen?.Reason?.USER_MEDIA ?? "USER_MEDIA") as chrome.offscreen.Reason,
-  (chrome.offscreen?.Reason?.AUDIO_PLAYBACK ?? "AUDIO_PLAYBACK") as chrome.offscreen.Reason,
+  (chrome.offscreen?.Reason?.WORKERS ?? "WORKERS") as chrome.offscreen.Reason,
 ];
 
 /**
@@ -410,6 +229,12 @@ async function hasOffscreenDocument(): Promise<boolean> {
  * Safe to call multiple times — only creates if not already open.
  */
 async function ensureOffscreenDocument(): Promise<void> {
+  if (offscreenCreation) return offscreenCreation;
+  offscreenCreation = createOffscreenDocument();
+  try { await offscreenCreation; } finally { offscreenCreation = null; }
+}
+
+async function createOffscreenDocument(): Promise<void> {
   if (await hasOffscreenDocument()) {
     await updateSessionState({ offscreenActive: true, lastKeepalive: Date.now() });
     return;
@@ -434,19 +259,6 @@ async function ensureOffscreenDocument(): Promise<void> {
   console.log("[SW] Offscreen document created.");
 }
 
-/**
- * Close the offscreen document.
- */
-async function closeOffscreenDocument(): Promise<void> {
-  try {
-    await chrome.offscreen.closeDocument();
-  } catch {
-    // May throw if already closed — ignore
-  }
-  await updateSessionState({ offscreenActive: false });
-  console.log("[SW] Offscreen document closed.");
-}
-
 // ─── Message Relay: SW → Content Script ──────────────────────────────────────
 
 /**
@@ -463,7 +275,7 @@ async function sendToContentScript(
         reject(new Error(`Content script in tab ${tabId} did not respond within ${CONTENT_SCRIPT_TIMEOUT_MS}ms`));
       }, CONTENT_SCRIPT_TIMEOUT_MS);
 
-      chrome.tabs.sendMessage(tabId, msg, (response: VoxPilotMessage | null) => {
+      chrome.tabs.sendMessage(tabId, msg, { frameId: 0 }, (response: VoxPilotMessage | null) => {
         clearTimeout(timer);
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
@@ -505,40 +317,52 @@ async function sendToContentScript(
 
 /**
  * Toggle the listening state.
- * Creates or tears down the offscreen document as needed.
+ * Keeps models resident while toggling microphone capture.
  */
 async function toggleListening(): Promise<void> {
+  const next = listeningOperation.then(toggleListeningNow);
+  listeningOperation = next.catch(() => {});
+  return next;
+}
+
+async function updateBadge(listening: boolean): Promise<void> {
+  await chrome.action.setBadgeBackgroundColor({ color: listening ? "#14815D" : "#536075" });
+  await chrome.action.setBadgeText({ text: listening ? "ON" : "" });
+  await chrome.action.setTitle({ title: listening ? "VoxPilot — microphone on (Alt+V to pause)" : "VoxPilot — microphone paused" });
+}
+
+async function toggleListeningNow(): Promise<void> {
   const state = await getSessionState();
-
   if (state.listeningEnabled) {
-    // Turn off: stop audio and close offscreen
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO" }).catch(() => {});
-    await closeOffscreenDocument();
-    await updateSessionState({
-      listeningEnabled: false,
-      agentState: AgentState.Idle,
-    });
-    console.log("[SW] Listening stopped.");
+    await relayToOffscreen({ type: "STOP_AUDIO" });
+    await updateSessionState({ listeningEnabled: false, agentState: AgentState.Idle, currentPlan: null, executionId: null });
+    await updateBadge(false);
   } else {
-    // Turn on: get active tab, create offscreen, start audio
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const tabId = tab?.id ?? null;
-
+    const tab = await getTargetTab();
+    const { selected_profile } = await chrome.storage.local.get("selected_profile");
+    const profile = typeof selected_profile === "string" ? selected_profile : "fast";
     await ensureOffscreenDocument();
-    // Brief pause to let the offscreen document initialize
-    await new Promise<void>((r) => setTimeout(r, 300));
+    // Persist intent first so readiness events do not overwrite an active mic state.
+    await updateSessionState({ activeTabId: tab?.id ?? null, listeningEnabled: true, agentState: AgentState.Idle });
+    try {
+      await relayToOffscreen({ type: "START_AUDIO", profile });
+      await updateSessionState({ listeningEnabled: true, agentState: AgentState.Listening });
+      await updateBadge(true);
+    } catch (error) {
+      await updateSessionState({ listeningEnabled: false, agentState: AgentState.Error });
+      await updateBadge(false);
+      throw error;
+    }
+  }
+}
 
-    // Read the user's selected profile from storage (set during onboarding)
-    const { selected_profile: storedProfile } = await chrome.storage.local.get("selected_profile");
-    const profileToUse = typeof storedProfile === "string" ? storedProfile : "lite";
-
-    await chrome.runtime.sendMessage({ type: "START_AUDIO", profile: profileToUse }).catch(() => {});
-    await updateSessionState({
-      listeningEnabled: true,
-      activeTabId: tabId,
-      agentState: AgentState.Listening,
-    });
-    console.log(`[SW] Listening started (active tab: ${tabId}).`);
+async function prepareModelStatus(profile: string): Promise<void> {
+  const saved = await chrome.storage.session.get(MODEL_STATUS_KEY);
+  const status = saved[MODEL_STATUS_KEY] as ModelLoadProgressMsg | undefined;
+  if (!await hasOffscreenDocument() || status?.profile !== canonicalProfile(profile) || status?.phase === "error") {
+    const next: ModelLoadProgressMsg = { type: "MODEL_LOAD_PROGRESS", profile: canonicalProfile(profile), progress: 0, phase: "loading", done: false, text: "Preparing on-device models…" };
+    await chrome.storage.session.set({ [MODEL_STATUS_KEY]: next });
+    broadcastToPanel(next);
   }
 }
 
@@ -555,10 +379,15 @@ chrome.runtime.onMessage.addListener(
     sendResponse: (response?: unknown) => void
   ): boolean => {
     const msg = rawMsg as VoxPilotMessage;
+    if (!msg || typeof msg.type !== "string" || msg.target === "offscreen" || msg.target === "ui") return false;
 
     // Run async handler and plumb errors to console
-    handleMessage(msg, sender, sendResponse).catch((err: unknown) => {
+    handleMessage(msg, sender, sendResponse).catch(async (err: unknown) => {
+      const error = err instanceof Error ? err.message : String(err);
       console.error("[SW] Message handler error:", err);
+      sendResponse({ ok: false, error });
+      await updateSessionState({ agentState: AgentState.Error });
+      broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Error, error });
     });
 
     // Return true to keep the message channel open for async sendResponse
@@ -580,31 +409,46 @@ async function handleMessage(
     }
 
     case "GET_SESSION_STATE": {
-      const state = await getSessionState();
+      let state = await getSessionState();
+      if (state.offscreenActive && !await hasOffscreenDocument()) {
+        state = await updateSessionState({ offscreenActive: false, listeningEnabled: false, agentState: AgentState.Idle });
+        await updateBadge(false);
+      }
       sendResponse(state);
       break;
     }
 
+    case "GET_MODEL_STATUS": {
+      const saved = await chrome.storage.session.get(MODEL_STATUS_KEY);
+      const status = saved[MODEL_STATUS_KEY] as ModelLoadProgressMsg | undefined;
+      sendResponse(await hasOffscreenDocument() ? status ?? { type: "MODEL_LOAD_PROGRESS", phase: "idle", done: false } : { type: "MODEL_LOAD_PROGRESS", phase: "idle", done: false, text: "Models load from your device when listening starts." });
+      break;
+    }
+
     case "CONFIRM_PLAN": {
-      // Relay plan confirmation to offscreen
-      const state = await getSessionState();
-      if (state.currentPlan && state.activeTabId !== null) {
-        await chrome.runtime.sendMessage({
-          type: "EXECUTE_PLAN",
-          plan: state.currentPlan,
-          tabId: state.activeTabId,
+      let state: SessionState;
+      try {
+        state = await updateSessionState(current => {
+          if (!current.currentPlan || current.activeTabId === null || current.agentState !== AgentState.Confirming) throw new Error("There is no plan awaiting confirmation.");
+          return { agentState: AgentState.Executing };
         });
-        await updateSessionState({ agentState: AgentState.Executing });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error) });
+        break;
       }
+      await sendToContentScript(state.activeTabId!, { type: "HIDE_CONFIRMATION" }).catch(() => {});
+      await updateBadge(state.listeningEnabled);
+      await completePlan(state.activeTabId!, state.currentPlan!);
       sendResponse({ ok: true });
       break;
     }
 
     case "CANCEL_PLAN": {
-      await updateSessionState({
-        agentState: AgentState.Listening,
-        currentPlan: null,
-      });
+      const state = await getSessionState();
+      if (state.activeTabId !== null) await sendToContentScript(state.activeTabId, { type: "HIDE_CONFIRMATION" }).catch(() => {});
+      await relayToOffscreen({ type: "EXECUTE_TEXT_COMMAND", text: "stop" });
+      await updateSessionState({ agentState: state.listeningEnabled ? AgentState.Listening : AgentState.Idle, currentPlan: null, executionId: null });
+      await updateBadge(state.listeningEnabled);
       sendResponse({ ok: true });
       break;
     }
@@ -645,63 +489,11 @@ async function handleMessage(
     // ── Panel / Direct Speech → SW ──────────────────────────────────────────
     case "DIRECT_TRANSCRIPT": {
       const text = msg.text.trim();
-      if (!text) {
-        sendResponse({ ok: true });
-        break;
-      }
-
-      console.log(`[SW] Direct transcript received: "${text}"`);
-      await updateSessionState({
-        lastTranscript: text,
-        agentState: AgentState.Routing,
-      });
-      broadcastToPanel({ type: "TRANSCRIPT_UPDATE", text, isFinal: true });
-
-      // Deduplication check: if identical command within 400ms, skip re-executing (rapid double-dispatch guard)
-      const now = Date.now();
-      if (text.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 400) {
-        console.log(`[SW] Duplicate command suppressed: "${text}"`);
-        sendResponse({ ok: true, deduplicated: true });
-        break;
-      }
-
-      // Check kill command
-      if (swIntentRouter.isKillCommand(text)) {
-        lastExecutedCommand = text;
-        lastExecutedCommandTime = now;
-        await updateSessionState({ agentState: AgentState.Listening, currentPlan: null });
-        broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
-        sendResponse({ ok: true });
-        break;
-      }
-
-      // Check undo command
-      if (swIntentRouter.isUndoCommand(text)) {
-        lastExecutedCommand = text;
-        lastExecutedCommandTime = now;
-        await relayToOffscreen({ type: "UNDO_LAST_ACTION" });
-        sendResponse({ ok: true });
-        break;
-      }
-
-      // Fast-path routing
-      const plan = swIntentRouter.route(text);
-      if (plan) {
-        lastExecutedCommand = text;
-        lastExecutedCommandTime = now;
-        console.log(`[SW] Fast-path executing direct plan: "${plan.intent}"`);
-        await dispatchPlan(plan);
-        const doneAction = plan.actions.find((a) => a.type === "done") as { type: "done"; summary: string } | undefined;
-        if (doneAction) {
-          void relayToOffscreen({ type: "SPEAK", text: doneAction.summary });
-        }
-        broadcastToPanel({ type: "EXECUTION_DONE" as any, success: true });
-        await relayToOffscreen({ type: "EXECUTION_DONE" as any, success: true } as any);
-      } else {
-        // Fallback for complex queries or unmatched commands: forward to offscreen agent LLM planner
-        console.log(`[SW] No fast-path match for "${text}" — forwarding to AgentCore for planning`);
-        await updateSessionState({ agentState: AgentState.Planning });
-        broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Planning });
+      const state = await getSessionState();
+      if (!state.listeningEnabled) throw new Error("Start listening before sending a command.");
+      if (text) {
+        const target = await getTargetTab();
+        await updateSessionState({ lastTranscript: text, activeTabId: target?.id ?? state.activeTabId });
         await relayToOffscreen({ type: "EXECUTE_TEXT_COMMAND", text });
       }
       sendResponse({ ok: true });
@@ -717,7 +509,9 @@ async function handleMessage(
     }
 
     case "TRANSCRIPT": {
+      const tab = msg.isFinal ? await getTargetTab() : null;
       await updateSessionState({
+        ...(tab?.id !== undefined ? { activeTabId: tab.id } : {}),
         lastTranscript: msg.text,
         agentState: msg.isFinal ? AgentState.Routing : AgentState.Transcribing,
       });
@@ -728,95 +522,19 @@ async function handleMessage(
     }
 
     case "PLAN_PRODUCED": {
-      const now = Date.now();
-      // If this plan's intent corresponds to the command already executed via fast-path, skip re-execution
-      if (msg.plan.intent.toLowerCase() === lastExecutedCommand.toLowerCase() && (now - lastExecutedCommandTime) < 2000) {
-        console.log(`[SW] Redundant PLAN_PRODUCED suppressed: "${msg.plan.intent}"`);
-        sendResponse({ ok: true });
-        break;
-      }
       await dispatchPlan(msg.plan);
       sendResponse({ ok: true });
       break;
     }
 
     case "REQUEST_SNAPSHOT": {
-      // Relay snapshot request to content script, or capture directly via chrome.scripting
-      try {
-        const targetTab = await getTargetTab();
-        const targetTabId = (msg.tabId && msg.tabId > 0) ? msg.tabId : targetTab?.id;
-        if (!targetTabId) {
-          throw new Error("No active tab found for snapshot");
-        }
-
-        let snapshot: PageSnapshot | null = null;
-        try {
-          const response = await sendToContentScript(targetTabId, {
-            type: "CAPTURE_SNAPSHOT",
-          });
-          if (response?.type === "SNAPSHOT_RESPONSE") {
-            snapshot = response.snapshot;
-          }
-        } catch (csErr) {
-          console.warn("[SW] Content script snapshot unavailable, capturing via scripting:", csErr);
-        }
-
-        // Direct capture fallback if content script is unavailable or not mounted
-        if (!snapshot) {
-          const [execResult] = await chrome.scripting.executeScript({
-            target: { tabId: targetTabId },
-            func: () => {
-              const elements: any[] = [];
-              const raw = Array.from(document.querySelectorAll(
-                "button, a[href], input, select, textarea, [role='button'], [role='link'], [role='tab']"
-              ));
-              let idx = 0;
-              for (const el of raw.slice(0, 100)) {
-                const tag = el.tagName.toLowerCase();
-                const label = el.getAttribute("aria-label") || (el as HTMLElement).innerText?.trim() || (el as HTMLInputElement).placeholder || (el as HTMLInputElement).value || "";
-                if (!label && tag === "a") continue;
-                elements.push({
-                  handle: `e${idx++}`,
-                  tag,
-                  label: label.slice(0, 100),
-                  role: el.getAttribute("role") || tag,
-                  inViewport: true,
-                });
-              }
-              const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
-                .map((h) => (h as HTMLElement).innerText?.trim())
-                .filter(Boolean)
-                .slice(0, 15);
-              const mainEl = document.querySelector("main, article, [role='main'], #content, .content") || document.body;
-              return {
-                url: window.location.href,
-                title: document.title,
-                elements,
-                headings,
-                textSummary: (mainEl as HTMLElement)?.innerText?.trim().slice(0, 2500) || "",
-                capturedAt: Date.now(),
-                truncated: false,
-              };
-            },
-          }).catch((err) => {
-            console.error("[SW] Direct scripting snapshot failed:", err);
-            return [null];
-          });
-
-          if (execResult?.result) {
-            snapshot = execResult.result as PageSnapshot;
-          }
-        }
-
-        if (snapshot) {
-          await relayToOffscreen({
-            type: "PAGE_SNAPSHOT",
-            snapshot,
-          });
-        }
-      } catch (err: unknown) {
-        console.error("[SW] Snapshot relay failed:", err);
-      }
+      const tab = await getTargetTab();
+      const tabId = msg.tabId > 0 ? msg.tabId : tab?.id;
+      if (tabId === undefined || isInternalUrl(tab?.url)) throw new Error("Open a regular webpage to use page commands.");
+      const response = await sendToContentScript(tabId, { type: "CAPTURE_SNAPSHOT" });
+      if (response?.type !== "SNAPSHOT_RESPONSE") throw new Error("Could not read this page. Refresh it and try again.");
+      await updateSessionState({ activeTabId: tabId });
+      await relayToOffscreen({ type: "PAGE_SNAPSHOT", snapshot: response.snapshot });
       sendResponse({ ok: true });
       break;
     }
@@ -838,7 +556,7 @@ async function handleMessage(
     }
 
     case "TTS_DONE": {
-      await updateSessionState({ agentState: AgentState.Listening });
+      // Completion of speech must not overwrite a newer transcription/planning state.
       sendResponse({ ok: true });
       break;
     }
@@ -948,14 +666,19 @@ async function handleMessage(
     }
 
     case "AGENT_STATE_CHANGED": {
-      await updateSessionState({ agentState: msg.state });
-      broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: msg.state });
+      const state = await getSessionState();
+      const nextState = !state.listeningEnabled && msg.state === AgentState.Listening ? AgentState.Idle : msg.state;
+      await updateSessionState({ agentState: nextState,
+        ...([AgentState.Listening, AgentState.Idle].includes(nextState) && [AgentState.Executing, AgentState.Confirming].includes(state.agentState) ? { currentPlan: null, executionId: null } : {}),
+      });
+      broadcastToPanel({ ...msg, state: nextState });
       sendResponse({ ok: true });
       break;
     }
 
     case "MODEL_LOAD_PROGRESS": {
-      // Forward model download progress to panel
+      await chrome.storage.session.set({ [MODEL_STATUS_KEY]: msg });
+      if (msg.done) await chrome.storage.local.set({ models_cached_profile: msg.profile });
       broadcastToPanel(msg);
       sendResponse({ ok: true });
       break;
@@ -1090,13 +813,14 @@ async function handleMessage(
       // User changed model profile in settings — persist and notify offscreen.
       await chrome.storage.local.set({ selected_profile: msg.profile });
       // Forward to offscreen so LLM/STT workers can reload on next request.
+      await prepareModelStatus(msg.profile);
       await relayToOffscreen({ type: "PROFILE_CHANGED", profile: msg.profile });
       sendResponse({ ok: true });
       break;
     }
 
     case "START_MODEL_DOWNLOAD": {
-      // Onboarding requested model download — relay to offscreen to begin.
+      await prepareModelStatus(msg.profile);
       await relayToOffscreen({ type: "START_MODEL_DOWNLOAD", profile: msg.profile });
       sendResponse({ ok: true });
       break;
@@ -1182,9 +906,6 @@ chrome.runtime.onInstalled.addListener(
   async (details: chrome.runtime.InstalledDetails) => {
     console.log(`[SW] onInstalled: reason=${details.reason}`);
 
-    // Open side panel when toolbar icon is clicked
-    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
-
     // Initialize fresh session state
     await setSessionState(defaultSessionState());
 
@@ -1209,19 +930,20 @@ chrome.alarms.onAlarm.addListener(async (alarm: chrome.alarms.Alarm) => {
     const state = await getSessionState();
 
     if (state.listeningEnabled) {
-      // Check if offscreen is still alive; recreate if not
-      const now = Date.now();
-      if (now - state.lastKeepalive > OFFSCREEN_KEEPALIVE_INTERVAL_MS) {
-        console.warn("[SW] Offscreen document may be stale — recreating.");
+      if (!await hasOffscreenDocument()) {
         await ensureOffscreenDocument();
+        const { selected_profile } = await chrome.storage.local.get("selected_profile");
+        try {
+          await relayToOffscreen({ type: "START_AUDIO", profile: typeof selected_profile === "string" ? selected_profile : "fast" });
+        } catch (error) {
+          await updateSessionState({ listeningEnabled: false, agentState: AgentState.Error });
+          await updateBadge(false);
+          broadcastToPanel({ type: "AGENT_STATE_CHANGED", state: AgentState.Error, error: String(error) });
+        }
       } else {
-        // Ping offscreen to prevent GC
-        await chrome.runtime.sendMessage({ type: "KEEPALIVE" }).catch(() => {
-          // Offscreen dead — recreate
-          ensureOffscreenDocument().catch(console.error);
-        });
+        await relayToOffscreen({ type: "KEEPALIVE" });
       }
-      await updateSessionState({ lastKeepalive: now });
+      await updateSessionState({ lastKeepalive: Date.now() });
     }
   }
 });

@@ -27,8 +27,11 @@ jobs:
       - name: TypeScript type-check
         run: npm run type-check
 
+      - name: Unit and regression tests
+        run: npm test
+
       - name: Build extension
-        run: npm run build
+        run: npm run build:prod
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -47,8 +50,8 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - name: npm audit (non-blocking)
-        run: npm audit --audit-level=high || true
+      - name: npm audit (high severity gate)
+        run: npm audit --audit-level=high
 
   lint:
     name: ESLint
@@ -61,5 +64,5 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - name: Lint
-        run: npm run lint || true
+        run: npm run lint
 

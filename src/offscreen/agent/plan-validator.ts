@@ -7,6 +7,7 @@
  * malformed plans that could cause the executor to behave unexpectedly.
  */
 
+import { BROWSER_NAVIGATION_COMMANDS } from "@shared/constants.js";
 import type { AgentPlan } from "@shared/types.js";
 
 /** Thrown when an AgentPlan fails schema validation. */
@@ -193,8 +194,8 @@ export class PlanValidator {
         if (a.handle !== undefined && a.handle !== null && (typeof a.handle !== "string" || !HANDLE_PATTERN.test(a.handle) || a.handle.length > 10)) {
           errors.push(`actions[${idx}].handle: must be null or format e[0-9]+`);
         }
-        if (a.amount !== undefined && (typeof a.amount !== "number" || !Number.isInteger(a.amount) || a.amount < 1 || a.amount > 10000)) {
-          errors.push(`actions[${idx}].amount: must be integer between 1 and 10000`);
+        if (a.amount !== undefined && (typeof a.amount !== "number" || !Number.isInteger(a.amount) || a.amount < 1 || a.amount > 100000)) {
+          errors.push(`actions[${idx}].amount: must be integer between 1 and 100000`);
         }
         break;
       }
@@ -202,7 +203,7 @@ export class PlanValidator {
       case "navigate": {
         const allowed = new Set(["type", "url"]);
         this.checkExtraKeys(a, allowed, `actions[${idx}]`, errors);
-        if (typeof a.url !== "string" || a.url.length > 2048 || !/^https?:\/\//i.test(a.url)) {
+        if (typeof a.url !== "string" || a.url.length > 2048 || (!/^https?:\/\//i.test(a.url) && !(BROWSER_NAVIGATION_COMMANDS as readonly string[]).includes(a.url))) {
           errors.push(`actions[${idx}].url: must be a valid http(s) URL up to 2048 chars`);
         }
         break;
@@ -214,11 +215,11 @@ export class PlanValidator {
         if (typeof a.operation !== "string" || !TAB_OPERATIONS.has(a.operation)) {
           errors.push(`actions[${idx}].operation: must be open, close, or switch`);
         }
-        if (a.url !== undefined && (typeof a.url !== "string" || a.url.length > 2048)) {
+        if (a.url !== undefined && (typeof a.url !== "string" || a.url.length > 2048 || (!/^https?:\/\//i.test(a.url) && a.url !== "chrome://newtab"))) {
           errors.push(`actions[${idx}].url: must be a string up to 2048 chars`);
         }
-        if (a.index !== undefined && (typeof a.index !== "number" || !Number.isInteger(a.index) || a.index < 0 || a.index > 999)) {
-          errors.push(`actions[${idx}].index: must be integer between 0 and 999`);
+        if (a.index !== undefined && (typeof a.index !== "number" || !Number.isInteger(a.index) || a.index < -1 || a.index > 999)) {
+          errors.push(`actions[${idx}].index: must be integer between -1 and 999`);
         }
         break;
       }

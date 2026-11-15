@@ -18,7 +18,7 @@ import { AudioCapture } from "./audio/capture.js";
 import { VAD } from "./audio/vad.js";
 import { TTS } from "./audio/tts.js";
 import { AgentCore } from "./agent/agent-core.js";
-import { ModelProfile } from "@shared/types.js";
+import { AgentState, ModelProfile } from "@shared/types.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
 
 // ─── Module-level singletons (safe here — offscreen is not the SW) ────────────
@@ -28,113 +28,66 @@ let vad: VAD | null = null;
 let tts: TTS | null = null;
 let agentCore: AgentCore | null = null;
 
-/** Whether the audio pipeline is currently running. */
+/** Audio is independent of model residency and the popup's lifetime. */
 let pipelineRunning = false;
+let audioOperation: Promise<void> = Promise.resolve();
 
-// ─── Initialization ───────────────────────────────────────────────────────────
+const profileMap: Record<string, ModelProfile> = {
+  lite: ModelProfile.Fast, standard: ModelProfile.Balanced, enhanced: ModelProfile.Powerful,
+  fast: ModelProfile.Fast, balanced: ModelProfile.Balanced, powerful: ModelProfile.Powerful,
+};
 
-/**
- * Initialize all subsystems.
- * Called on START_AUDIO message from the service worker.
- * @param profileStr - The model profile string from onboarding (e.g. "lite", "balanced").
- */
-async function startAudioPipeline(profileStr?: string): Promise<void> {
-  if (pipelineRunning) {
-    console.warn("[Offscreen] Audio pipeline already running — ignoring START_AUDIO.");
-    return;
-  }
+function getCore(): AgentCore {
+  tts ??= new TTS();
+  agentCore ??= new AgentCore({ tts });
+  return agentCore;
+}
 
-  // Map profile string to ModelProfile enum
-  const profileMap: Record<string, ModelProfile> = {
-    lite: ModelProfile.Fast,
-    standard: ModelProfile.Balanced,
-    enhanced: ModelProfile.Powerful,
-    fast: ModelProfile.Fast,
-    balanced: ModelProfile.Balanced,
-    powerful: ModelProfile.Powerful,
-  };
-  const profile = (profileStr && profileMap[profileStr]) || ModelProfile.Fast;
-
+async function startAudioPipeline(profileStr = "fast"): Promise<void> {
+  if (pipelineRunning) return;
+  const core = getCore();
   try {
-    console.log(`[Offscreen] Initializing audio pipeline with profile "${profile}"...`);
-
-    // Initialize TTS first (fastest, no worker required)
-    tts = new TTS();
-
-    // Initialize agent core (spawns STT + LLM workers)
-    agentCore = new AgentCore({ tts });
-
-    // Initialize VAD with callbacks to agent core
-    vad = new VAD({
-      onSpeechStart: () => {
-        agentCore?.onSpeechStart();
-      },
-      onSpeechEnd: (audioData: Float32Array) => {
-        agentCore?.onSpeechEnd(audioData);
-      },
+    // initialize is idempotent: setup's loaded models are reused on ordinary starts.
+    await core.initialize(profileMap[profileStr] ?? ModelProfile.Fast);
+    vad ??= new VAD({
+      onSpeechStart: () => core.onSpeechStart(),
+      onSpeechDiscard: () => core.onSpeechDiscard(),
+      onSpeechEnd: audio => { void core.onSpeechEnd(audio); },
     });
-
-    // Initialize audio capture and wire to VAD and SW audio level monitor
-    audioCapture = new AudioCapture({
+    audioCapture ??= new AudioCapture({
       bufferSize: 2048,
-      onAudioData: (data: Float32Array) => {
-        vad?.processAudioChunk(data);
-      },
-      onAudioLevel: (level: number) => {
-        void sendToSW({
-          type: "AUDIO_LEVEL",
-          level,
-          isSpeech: vad?.currentState === "speech" || level > 0.015,
-        });
+      onAudioData: data => vad?.processAudioChunk(data),
+      onAudioLevel: level => {
+        void sendToSW({ type: "AUDIO_LEVEL", level, isSpeech: vad?.currentState === "speech" });
       },
     });
-
     await audioCapture.start();
     await vad.start();
-    await agentCore.initialize(profile);
-
+    core.resumeListening();
     pipelineRunning = true;
-    console.log("[Offscreen] Audio pipeline started successfully.");
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-
-    console.error("[Offscreen] Failed to start audio pipeline:", err);
+  } catch (err) {
+    audioCapture?.stop();
+    vad?.stop();
+    core.pauseListening();
     pipelineRunning = false;
-
-    // Notify SW of the failure
-    await sendToSW({
-      type: "OFFSCREEN_ERROR",
-      source: "audio",
-      message: `Failed to start audio pipeline: ${message}`,
-      ...(stack !== undefined ? { stack } : {}),
-    });
+    // Let the service worker return a real failure to the popup, not a false success.
+    throw new Error(`Could not start microphone: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-/**
- * Stop all subsystems and release resources.
- * Called on STOP_AUDIO message from the service worker.
- */
 async function stopAudioPipeline(): Promise<void> {
-  if (!pipelineRunning) return;
+  getCore().pauseListening();
+  tts?.stop();
+  vad?.stop();
+  audioCapture?.stop();
+  pipelineRunning = false;
+  // Keep workers resident. Pausing the microphone must not trigger another model load.
+}
 
-  try {
-    tts?.stop();
-    vad?.stop();
-    audioCapture?.stop();
-    agentCore?.dispose();
-
-    audioCapture = null;
-    vad = null;
-    tts = null;
-    agentCore = null;
-    pipelineRunning = false;
-
-    console.log("[Offscreen] Audio pipeline stopped.");
-  } catch (err: unknown) {
-    console.error("[Offscreen] Error stopping pipeline:", err);
-  }
+function changeAudio(start: boolean, profile?: string): Promise<void> {
+  const operation = audioOperation.then(() => start ? startAudioPipeline(profile) : stopAudioPipeline());
+  audioOperation = operation.catch(() => {});
+  return operation;
 }
 
 // ─── SW Message Helper ────────────────────────────────────────────────────────
@@ -145,10 +98,14 @@ async function stopAudioPipeline(): Promise<void> {
  */
 async function sendToSW(msg: VoxPilotMessage): Promise<void> {
   try {
-    await chrome.runtime.sendMessage(msg);
+    const response = await chrome.runtime.sendMessage({ ...msg, target: "sw" });
+    if (response?.ok === false && ["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION"].includes(msg.type)) {
+      throw new Error(response.error ?? "Background operation failed");
+    }
   } catch (err: unknown) {
     // SW may have been restarted — this is expected occasionally
-    console.warn("[Offscreen] Failed to send message to SW:", err);
+    if (["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION"].includes(msg.type)) throw err;
+    console.debug("[Offscreen] Notification could not be delivered:", err);
   }
 }
 
@@ -157,6 +114,7 @@ async function sendToSW(msg: VoxPilotMessage): Promise<void> {
 chrome.runtime.onMessage.addListener(
   (rawMsg: unknown, _sender, sendResponse: (r?: unknown) => void): boolean => {
     const msg = rawMsg as VoxPilotMessage;
+    if (!msg || msg.target !== "offscreen") return false;
 
     handleMessage(msg).then(() => sendResponse({ ok: true })).catch((err: unknown) => {
       console.error("[Offscreen] Message handler error:", err);
@@ -171,11 +129,11 @@ chrome.runtime.onMessage.addListener(
 async function handleMessage(msg: VoxPilotMessage): Promise<void> {
   switch (msg.type) {
     case "START_AUDIO":
-      await startAudioPipeline(msg.profile);
+      await changeAudio(true, msg.profile);
       break;
 
     case "STOP_AUDIO":
-      await stopAudioPipeline();
+      await changeAudio(false);
       break;
 
     case "PAGE_SNAPSHOT":
@@ -218,34 +176,22 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
     }
 
     case "START_MODEL_DOWNLOAD": {
-      // Onboarding initiated explicit real model download (FR-MODEL-01, FR-MODEL-02)
-      const profileMap: Record<string, ModelProfile> = {
-        lite: ModelProfile.Fast,
-        standard: ModelProfile.Balanced,
-        enhanced: ModelProfile.Powerful,
-        fast: ModelProfile.Fast,
-        balanced: ModelProfile.Balanced,
-        powerful: ModelProfile.Powerful,
-      };
-      const profile = profileMap[msg.profile] ?? ModelProfile.Fast;
-      console.log(`[Offscreen] Starting real model download for profile: ${profile}`);
-
-      if (!agentCore) {
-        tts = new TTS();
-        agentCore = new AgentCore({ tts });
-      }
-
-      // Fire-and-forget: loadProfile takes many minutes to download models.
-      // Progress is reported via MODEL_LOAD_PROGRESS messages throughout.
-      // Do NOT await here — Chrome's message channel has a ~5s response timeout.
-      agentCore.loadProfile(profile).catch((err: unknown) => {
-        console.error("[Offscreen] Real model load failed:", err);
+      const core = getCore();
+      void core.loadProfile(profileMap[msg.profile] ?? ModelProfile.Fast).catch(err => {
+        if (err instanceof Error && err.name === "AbortError") return;
+        void sendToSW({ type: "OFFSCREEN_ERROR", source: "llm", message: `Model preparation failed: ${err instanceof Error ? err.message : String(err)}` });
       });
       break;
     }
 
     case "PROFILE_CHANGED": {
-      console.log(`[Offscreen] Profile changed to: ${msg.profile}`);
+      const core = getCore();
+      void core.loadProfile(profileMap[msg.profile] ?? ModelProfile.Fast).then(() => {
+        if (pipelineRunning) core.resumeListening();
+      }).catch(err => {
+        if (err instanceof Error && err.name === "AbortError") return;
+        void sendToSW({ type: "OFFSCREEN_ERROR", source: "llm", message: String(err) });
+      });
       break;
     }
 
@@ -255,10 +201,14 @@ async function handleMessage(msg: VoxPilotMessage): Promise<void> {
       break;
     }
 
+    case "AGENT_STATE_CHANGED":
+      if (msg.state === AgentState.Executing) agentCore?.onExecutionStarted();
+      break;
+
+    case "GET_MODEL_STATUS":
     case "GET_SESSION_STATE":
     case "GET_AUDIT_LOG":
     case "DIRECT_TRANSCRIPT":
-    case "AGENT_STATE_CHANGED":
     case "AUDIO_LEVEL":
     case "TOGGLE_LISTENING":
     case "MODEL_LOAD_PROGRESS":

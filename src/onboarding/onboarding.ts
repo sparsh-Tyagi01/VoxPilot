@@ -11,14 +11,13 @@
  * SRS references: FR-VOICE-06, FR-MODEL-01, FR-MODEL-02, FR-VAULT-01
  */
 
+import { downloadModels } from "./model-download.js";
+
 // ─── Step Management ─────────────────────────────────────────────────────────
 
 const NUM_STEPS = 4;
-let currentStep = 0;
 
 function goToStep(step: number): void {
-  currentStep = step;
-
   for (let i = 0; i < NUM_STEPS; i++) {
     const panel = document.getElementById(`step-${i}`);
     const ind   = document.getElementById(`step-ind-${i}`);
@@ -100,103 +99,63 @@ profileRadios.forEach((radio) => {
   });
 });
 
+const setupAbort = new AbortController();
+window.addEventListener("pagehide", () => setupAbort.abort(), { once: true });
+
 downloadBtn.addEventListener("click", async () => {
   const selectedProfile = Array.from(profileRadios).find((r) => r.checked)?.value ?? "lite";
-
+  const backBtn = document.getElementById("btn-step2-back") as HTMLButtonElement;
   downloadBtn.disabled = true;
+  backBtn.disabled = true;
+  profileRadios.forEach(radio => { radio.disabled = true; });
   progressBar.style.display = "block";
-  downloadStatus.textContent = "Starting model download…";
+  progressBar.removeAttribute("aria-valuenow");
+  progressFill.style.width = "0%";
+  downloadStatus.style.color = "";
+  downloadStatus.textContent = "Checking saved model files…";
 
   try {
-    // Notify SW to trigger model download with selected profile
-    await chrome.runtime.sendMessage({
-      type: "START_MODEL_DOWNLOAD",
-      profile: selectedProfile,
-    });
+    await downloadModels(selectedProfile, ({ message, percent, determinate }) => {
+      progressFill.style.width = `${percent}%`;
+      if (determinate) progressBar.setAttribute("aria-valuenow", String(percent));
+      else progressBar.removeAttribute("aria-valuenow");
+      progressBar.setAttribute("aria-busy", String(!message.done));
+      downloadStatus.textContent = message.done
+        ? "Models ready. Future starts reuse these files."
+        : message.phase === "downloading"
+          ? `Downloading model files… ${percent}%`
+          : message.text?.replace(/\s*\d+(?:\.\d+)?%/g, "") || "Preparing saved models…";
+    }, { signal: setupAbort.signal });
 
-    // Listen for real MODEL_LOAD_PROGRESS messages from the service worker.
-    // Falls back to simulated progress if models are already cached.
-    await waitForModelDownload();
-
-    await chrome.storage.local.set({
-      onboarding_complete: true,
-      selected_profile: selectedProfile,
-    });
-
+    await chrome.storage.local.set({ onboarding_complete: true, selected_profile: selectedProfile });
     goToStep(3);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Unknown error";
-    downloadStatus.textContent = `Download failed: ${msg}`;
+    const message = err instanceof Error ? err.message : "Unknown error";
+    downloadStatus.textContent = `Setup could not finish: ${message}`;
     downloadStatus.style.color = "#ef4444";
+    progressBar.setAttribute("aria-busy", "false");
+    downloadBtn.textContent = "Retry setup";
+  } finally {
     downloadBtn.disabled = false;
+    backBtn.disabled = false;
+    profileRadios.forEach(radio => { radio.disabled = false; });
   }
 });
 
 document.getElementById("btn-step2-back")?.addEventListener("click", () => goToStep(1));
 
-/**
- * Wait for model download to complete via real MODEL_LOAD_PROGRESS messages.
- * Only real model download progress from offscreen workers is accepted (no simulation fallbacks).
- * Only resolves when BOTH speech recognition and AI planner models are fully loaded and ready (done === true).
- */
-function waitForModelDownload(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // 15-minute safety timeout for real model downloads
-    const timeoutTimer = setTimeout(() => {
-      chrome.runtime.onMessage.removeListener(progressListener);
-      reject(new Error("Model download timed out after 15 minutes. Check your internet connection and retry."));
-    }, 15 * 60 * 1_000);
-
-    const progressListener = (msg: unknown): boolean => {
-      if (typeof msg !== "object" || msg === null) return false;
-      const m = msg as Record<string, unknown>;
-
-      if (m["type"] === "MODEL_LOAD_PROGRESS") {
-        let pct = 0;
-        let statusText = "";
-
-        if (typeof m["progress"] === "number") {
-          pct = Math.round(m["progress"] * 100);
-        } else if (typeof m["loaded"] === "number") {
-          pct = Math.round(m["loaded"] as number);
-        } else if (typeof (m["llm"] as any)?.loaded === "number") {
-          const llm = m["llm"] as any;
-          pct = llm.total > 0 ? Math.round((llm.loaded / llm.total) * 100) : Math.round(llm.loaded);
-        }
-
-        pct = Math.min(100, Math.max(0, pct));
-        statusText = String(m["text"] || `Downloading model files… ${pct}%`);
-
-        progressFill.style.width = `${pct}%`;
-        progressFill.setAttribute("aria-valuenow", String(pct));
-        downloadStatus.textContent = statusText;
-
-        // ONLY resolve when BOTH models report ready via done === true
-        if (m["done"] === true) {
-          clearTimeout(timeoutTimer);
-          chrome.runtime.onMessage.removeListener(progressListener);
-          downloadStatus.textContent = "✓ Models ready!";
-          downloadStatus.style.color = "#10b981";
-          progressFill.style.width = "100%";
-          resolve();
-        }
-      }
-      return false;
-    };
-
-    chrome.runtime.onMessage.addListener(progressListener);
-  });
-}
-
 // ─── Step 3: Done ─────────────────────────────────────────────────────────────
 
 document.getElementById("btn-done")?.addEventListener("click", async () => {
-  // Open side panel and close the onboarding tab
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab?.windowId) {
-    await chrome.sidePanel.open({ windowId: tab.windowId });
+  try {
+    await chrome.action.openPopup();
+    window.close();
+  } catch {
+    // Chrome may only permit opening the action popup from the toolbar itself.
+    const doneButton = document.getElementById("btn-done") as HTMLButtonElement;
+    doneButton.textContent = "Use the toolbar icon";
+    doneButton.disabled = true;
   }
-  window.close();
 });
 
 document.getElementById("btn-open-settings")?.addEventListener("click", () => {
@@ -220,9 +179,7 @@ for (let i = 1; i < NUM_STEPS; i++) {
 // Check if directed to mic permission request
 if (window.location.hash.includes("mic")) {
   goToStep(1);
-  setTimeout(() => {
-    btnRequestMic.click();
-  }, 200);
+  btnRequestMic.focus();
 } else {
   // Check if already onboarded
   (async () => {

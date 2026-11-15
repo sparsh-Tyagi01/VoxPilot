@@ -9,6 +9,12 @@
 
 ---
 
+## Popup and background listening
+
+Click the toolbar icon to open the compact popup. Start listening, then close the popup to keep using voice control; Pause or **Alt+V** turns the microphone off. Models loaded during setup stay available across mic pauses. Loading saved models is shown separately from downloading files.
+
+See [release readiness and troubleshooting](docs/RELEASE_READINESS.md) for verification commands, Chrome smoke tests, and remaining release gaps. Run `npm run check` to validate source and create `dist/`. After rebuilding, reload the extension at `chrome://extensions` and refresh target webpages. The intended capabilities below include Silero VAD and Kokoro/Piper TTS; the current implementation uses energy-based VAD and browser SpeechSynthesis.
+
 ## What is VoxPilot?
 
 VoxPilot is a Manifest V3 Chrome extension that lets you operate web pages entirely by voice — filling forms, clicking buttons, scrolling, navigating, and running multi-step workflows — without any data ever leaving your device.
@@ -47,7 +53,7 @@ VoxPilot is a Manifest V3 Chrome extension that lets you operate web pages entir
        └───────────────────────┘
 
 Extension Pages:
-  src/panel/panel.html       — Side panel (live transcript, plan, history)
+  src/panel/panel.html       — Compact toolbar popup (mic, transcript, confirmation)
   src/onboarding/            — Permission grant, model download, vault setup
   src/settings/              — Voice, model, vault, privacy dashboard
 ```
@@ -100,7 +106,7 @@ Extension Pages:
 ## Development Setup
 
 ```bash
-# Prerequisites: Node.js 20+, Chrome with WebGPU enabled
+# Prerequisites: Node.js 20.9+, Chrome with WebGPU enabled
 
 git clone https://github.com/sparsh/voxpilot
 cd voxpilot

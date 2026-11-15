@@ -14,7 +14,7 @@ import { defineConfig } from "vite";
 import { crx } from "@crxjs/vite-plugin";
 import manifest from "./manifest.json";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   /**
    * Resolve path aliases matching tsconfig.json `paths`.
    * Keeps imports short and refactor-safe across the monorepo-like src layout.
@@ -52,7 +52,7 @@ export default defineConfig({
      * Keep source maps in development for DevTools debugging.
      * Disabled in production (`build:prod`) to reduce package size.
      */
-    sourcemap: true,
+    sourcemap: mode !== "production",
 
     /**
      * Rollup options for fine-grained chunking control.
@@ -99,4 +99,4 @@ export default defineConfig({
   worker: {
     format: "es",
   },
-});
+}));

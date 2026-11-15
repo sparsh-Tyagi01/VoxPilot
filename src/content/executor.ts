@@ -76,7 +76,7 @@ export class ActionExecutor {
     this.dispatchMouseEvent(el, "mouseenter");
     this.dispatchMouseEvent(el, "mousedown");
     this.dispatchMouseEvent(el, "mouseup");
-    this.dispatchMouseEvent(el, "click");
+
 
     // Fallback for elements that need native .click()
     if (el instanceof HTMLElement) {
@@ -89,17 +89,7 @@ export class ActionExecutor {
   // ─── Type ───────────────────────────────────────────────────────────────────
 
   private async doType(action: TypeAction): Promise<void> {
-    let el: Element | null = null;
-    try {
-      el = this.resolveHandle(action.handle);
-    } catch (err) {
-      // If query is a search query and no input exists on the page, navigate directly to search
-      if (action.handle.toLowerCase().includes("search")) {
-        window.location.href = `https://www.google.com/search?q=${encodeURIComponent(action.text)}`;
-        return;
-      }
-      throw err;
-    }
+    const el = this.resolveHandle(action.handle);
 
     if (!(el instanceof HTMLElement)) {
       throw new Error(`Handle ${action.handle} does not resolve to an HTMLElement`);
@@ -236,7 +226,7 @@ export class ActionExecutor {
       const pressed = el.getAttribute("aria-pressed");
       const expanded = el.getAttribute("aria-checked");
       if (pressed !== null || expanded !== null) {
-        this.dispatchMouseEvent(el, "click");
+
         (el as HTMLElement).click?.();
       } else {
         throw new Error(`Element ${action.handle} is not a checkbox, radio, or ARIA toggle`);
@@ -288,11 +278,11 @@ export class ActionExecutor {
   // ─── Navigate ───────────────────────────────────────────────────────────────
 
   private doNavigate(action: NavigateAction): Promise<void> {
-    if (action.url.includes("history.back") || action.url === "back") {
+    if (action.url === "javascript:history.back()") {
       window.history.back();
-    } else if (action.url.includes("history.forward") || action.url === "forward") {
+    } else if (action.url === "javascript:history.forward()") {
       window.history.forward();
-    } else if (action.url.includes("location.reload") || action.url === "reload") {
+    } else if (action.url === "javascript:location.reload()") {
       window.location.reload();
     } else {
       window.location.href = action.url;
@@ -455,92 +445,8 @@ export class ActionExecutor {
    */
   private resolveHandle(handle: string): Element {
     const el = this.handles.resolve(handle);
-    if (el) return el;
-
-    // Semantic search in live DOM
-    const found = this.findElementByQuery(handle);
-    if (found) return found;
-
-    throw new Error(
-      `Element or handle "${handle}" not found on page. The page may have changed.`
-    );
-  }
-
-  /**
-   * Search for an interactive element matching a query string (for click, type, select).
-   */
-  private findElementByQuery(query: string): Element | null {
-    const q = query.trim().toLowerCase();
-    if (!q) return null;
-
-    // Clean noise words
-    const cleanQ = q.replace(/^(?:the|a|an)\s+/i, "").replace(/\s+(?:button|btn|link|tab|icon|menu)$/i, "").trim();
-
-    // Check for search input queries
-    if (q.includes("search") || q === "input" || q === "text box") {
-      const searchEl = document.querySelector<HTMLInputElement>(
-        "input[type='search'], input[name*='search'], input[name='q'], input[id*='search'], input[placeholder*='search' i], textarea[name*='search'], [role='searchbox'], input[type='text'], input:not([type])"
-      );
-      if (searchEl) return searchEl;
-    }
-
-    // Try finding clickable / interactive elements
-    const interactive = Array.from(document.querySelectorAll<HTMLElement>(
-      "button, a, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='menuitem'], [tabindex='0']"
-    ));
-
-    // 1. Exact match on innerText, aria-label, placeholder, value, name, id
-    for (const el of interactive) {
-      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase();
-      const aria = el.getAttribute("aria-label")?.trim().toLowerCase();
-      const placeholder = (el as HTMLInputElement).placeholder?.trim().toLowerCase();
-      const val = (el as HTMLInputElement).value?.trim().toLowerCase();
-      const name = el.getAttribute("name")?.trim().toLowerCase();
-      const id = el.id?.trim().toLowerCase();
-
-      if (
-        text === q || text === cleanQ ||
-        aria === q || aria === cleanQ ||
-        placeholder === q || placeholder === cleanQ ||
-        val === q || val === cleanQ ||
-        name === q || name === cleanQ ||
-        id === q || id === cleanQ
-      ) {
-        return el;
-      }
-    }
-
-    // 2. Substring match
-    for (const el of interactive) {
-      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
-      const aria = el.getAttribute("aria-label")?.trim().toLowerCase() || "";
-      const placeholder = (el as HTMLInputElement).placeholder?.trim().toLowerCase() || "";
-      const title = el.getAttribute("title")?.trim().toLowerCase() || "";
-
-      if (
-        (text && (text.includes(q) || (cleanQ.length >= 3 && text.includes(cleanQ)))) ||
-        (aria && (aria.includes(q) || (cleanQ.length >= 3 && aria.includes(cleanQ)))) ||
-        (placeholder && (placeholder.includes(q) || (cleanQ.length >= 3 && placeholder.includes(cleanQ)))) ||
-        (title && (title.includes(q) || (cleanQ.length >= 3 && title.includes(cleanQ))))
-      ) {
-        return el;
-      }
-    }
-
-    // 3. Fallback: any element with matching text
-    const allMatching = Array.from(document.querySelectorAll<HTMLElement>("h1, h2, h3, h4, p, span, li, dt, dd, b, strong"));
-    for (const el of allMatching) {
-      const text = el.innerText?.trim().toLowerCase() || el.textContent?.trim().toLowerCase() || "";
-      if (
-        text === q || text === cleanQ ||
-        (cleanQ.length >= 3 && text.includes(cleanQ) && text.length < cleanQ.length + 40)
-      ) {
-        const interactiveAncestor = el.closest<HTMLElement>("button, a, [role='button'], [role='link'], [tabindex='0']");
-        return interactiveAncestor || el;
-      }
-    }
-
-    return null;
+    if (el?.isConnected) return el;
+    throw new Error(`Element ${handle} is no longer available. Please repeat the command for a fresh page snapshot.`);
   }
 
   /** Dispatch a MouseEvent on an element. */

@@ -214,6 +214,7 @@ export class ModelStore {
     const chunks: Uint8Array[] = [];
     let downloaded = 0;
 
+    // eslint-disable-next-line no-constant-condition -- stream ends when reader reports done
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;

@@ -110,7 +110,7 @@ export class UndoStack {
           // Invert the toggle state
           inverse.push({ type: "toggle", handle: action.handle, checked: !action.checked });
           break;
-        case "scroll":
+        case "scroll": {
           // Invert scroll direction
           const scrollAction: Parameters<typeof inverse.push>[0] = {
             type: "scroll",
@@ -125,6 +125,7 @@ export class UndoStack {
           }
           inverse.push(scrollAction);
           break;
+        }
         // click, navigate, tab, read, fill_from_vault, ask, done — no reliable inverse
         default:
           break;

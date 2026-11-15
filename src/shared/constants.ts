@@ -32,8 +32,15 @@ export const VAULT_AUTO_LOCK_MS = 5 * 60 * 1_000; // 5 minutes
 /** Maximum time to wait for a content script to respond. */
 export const CONTENT_SCRIPT_TIMEOUT_MS = 10_000;
 
-/** Maximum time to wait for LLM to produce a plan. */
-export const LLM_TIMEOUT_MS = 30_000;
+/** First token includes GPU prefill and cold grammar compilation. */
+export const LLM_TIMEOUT_MS = 60_000;
+/** An active stream may continue, but a stalled stream must stop. */
+export const LLM_TOKEN_IDLE_TIMEOUT_MS = 20_000;
+export const LLM_MAX_GENERATION_MS = 120_000;
+/** Internal browser commands are fixed tokens, never evaluated as script. */
+export const BROWSER_NAVIGATION_COMMANDS = [
+  "javascript:history.back()", "javascript:history.forward()", "javascript:location.reload()",
+] as const;
 
 /** Maximum time to wait for STT to transcribe an utterance.
  * First inference on CPU (WASM) can take 25-40s due to JIT compilation.

@@ -40,6 +40,7 @@ export interface VADConfig {
   onSpeechEnd: (audio: Float32Array) => void;
   /** RMS energy threshold to enter speech state (0–1). Default: 0.012 */
   speechThreshold?: number;
+  onSpeechDiscard?: () => void;
   /** RMS energy threshold to leave speech state (hysteresis). Default: 0.006 */
   silenceThreshold?: number;
 }
@@ -83,6 +84,7 @@ export class VAD {
 
   constructor(config: VADConfig) {
     this.config = {
+      onSpeechDiscard: () => {},
       // Calibrated for standard laptop and headset microphones
       speechThreshold: 0.007,
       silenceThreshold: 0.003,
@@ -202,6 +204,7 @@ export class VAD {
    *   endpoint_hangover → speech (energy > speechThreshold — speech resumed)
    */
   private processEnergy(chunk: Float32Array): void {
+    if (chunk.length === 0) return;
     const energy = this.computeRMS(chunk);
     const isSpeech = energy > this.config.speechThreshold;
     const isSilence = energy < this.config.silenceThreshold;
@@ -243,6 +246,11 @@ export class VAD {
         // If silence continues, the setTimeout will fire finalizeUtterance()
         break;
     }
+    // Continuous background noise must not grow buffers or inference cost forever.
+    if (this.speechSamples >= AUDIO_SAMPLE_RATE * 30) {
+      if (this.hangoverTimer !== null) clearTimeout(this.hangoverTimer);
+      this.finalizeUtterance();
+    }
   }
 
   // ─── Utterance Finalization ────────────────────────────────────────────────
@@ -261,15 +269,18 @@ export class VAD {
       console.debug(`[VAD] Utterance too short (${durationMs.toFixed(0)}ms) — discarding.`);
       this.speechBuffer = [];
       this.speechSamples = 0;
+      this.config.onSpeechDiscard();
       return;
     }
 
     // Concatenate all buffered chunks into a single Float32Array
-    const utterance = new Float32Array(this.speechSamples);
+    const utterance = new Float32Array(Math.min(this.speechSamples, AUDIO_SAMPLE_RATE * 30));
     let offset = 0;
     for (const chunk of this.speechBuffer) {
-      utterance.set(chunk, offset);
-      offset += chunk.length;
+      const part = chunk.subarray(0, utterance.length - offset);
+      utterance.set(part, offset);
+      offset += part.length;
+      if (offset >= utterance.length) break;
     }
 
     this.speechBuffer = [];

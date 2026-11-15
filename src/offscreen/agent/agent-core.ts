@@ -36,6 +36,7 @@ import {
 import { TTS } from "../audio/tts.js";
 import { IntentRouter } from "./intent-router.js";
 import { Planner, type PlannerLLMInterface } from "./planner.js";
+import { GPU_RECOVERY_MODEL, GPU_RECOVERY_DELAY_MS, GPU_RECOVERY_LOAD_TIMEOUT_MS, isGPUDeviceLoss } from "../llm/gpu-errors.js";
 import type { ChatMessage } from "../llm/llm-worker.js";
 import { PlanValidator } from "./plan-validator.js";
 import { RiskClassifier } from "./risk-classifier.js";
@@ -54,15 +55,16 @@ type STTMessage =
   | { type: "ready" }
   | { type: "result"; text: string; confidence: number; language: string }
   | { type: "error"; message: string; stack?: string }
-  | { type: "progress"; loaded: number; total: number; modelId: string };
+  | { type: "progress"; loaded: number; total: number; modelId: string; downloading?: boolean };
 
 /** LLM worker message types (inbound). */
 type LLMMessage =
   | { type: "ready" }
-  | { type: "progress"; loaded: number; total: number; text: string }
+  | { type: "cancelled"; requestId: string }
+  | { type: "progress"; loaded: number; total: number; text: string; downloading?: boolean }
   | { type: "token"; requestId: string; delta: string }
   | { type: "result"; requestId: string; text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }
-  | { type: "error"; requestId: string; message: string; stack?: string };
+  | { type: "error"; requestId: string; message: string; code?: "GPU_DEVICE_LOST"; stack?: string };
 
 // ─── AgentCore ─────────────────────────────────────────────────────────────────
 
@@ -120,10 +122,29 @@ export class AgentCore {
 
   /** Set to true when "stop" / kill switch is triggered mid-operation. */
   private killRequested = false;
+  private operationId = 0;
+  private lifecycleId = 0;
+  private initializedProfile: ModelProfile | null = null;
+  private initializationFailed = false;
+  private listeningEnabled = false;
+  private speechPending = false;
+  private speechSequence = 0;
+  private speechStarted = false;
+  private speechBargeIn = false;
+  private commandBusy = false;
+  private sttModelId = "";
+  private llmModelId = "";
+  private llmRecoveryAttempts = 0;
+  private llmCircuitOpen = false;
+  private llmRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private llmAbortTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ─── Model loading state tracking ──────────────────────────────────────────
   private sttProgress = 0;
   private llmProgress = 0;
+  private sttDownloading = false;
+  private llmDownloading = false;
+  private loadId = "";
   private isSttReady = false;
   private isLlmReady = false;
 
@@ -145,71 +166,74 @@ export class AgentCore {
    * Called once when the offscreen document starts or during profile change.
    */
   async initialize(profile: ModelProfile = DEFAULT_MODEL_PROFILE): Promise<void> {
+    if (this.initializedProfile === profile && this.llmCircuitOpen && this.sttWorker) {
+      this.emitModelError("GPU planning is unavailable. Basic commands still work. Retry model setup explicitly after restarting Chrome or freeing GPU resources.");
+      return;
+    }
+    if (this.initializedProfile === profile && this.sttWorker && (this.llmWorker || this.llmRecoveryTimer) && !this.initializationFailed) {
+      this.emitModelProgress();
+      return;
+    }
+    if (this.sttWorker || this.llmWorker) this.dispose();
+    this.lifecycleId++;
+    this.initializedProfile = profile;
+    this.llmRecoveryAttempts = 0;
+    this.llmCircuitOpen = false;
+    this.initializationFailed = false;
+    this.loadId = `${profile}-${Date.now()}-${this.lifecycleId}`;
+    this.sttDownloading = false;
+    this.llmDownloading = false;
+    this.resetReadinessPromises();
+    this.isSttReady = false;
+    this.isLlmReady = false;
+    this.sttProgress = 0;
+    this.llmProgress = 0;
+    const initializationId = this.lifecycleId;
     console.log(`[AgentCore] Initializing workers with profile "${profile}"…`);
 
-    // ── STT Worker ──────────────────────────────────────────────────────────
-    this.sttWorker = new Worker(
-      new URL("../stt/stt-worker.ts", import.meta.url),
-      { type: "module" }
-    );
-    this.sttWorker.addEventListener("message", this.handleSTTMessage.bind(this));
-    this.sttWorker.addEventListener("error", (err: ErrorEvent) => {
-      console.error("[AgentCore] STT worker crashed:", err);
-      this.sttReject?.(new Error(`STT worker crashed: ${err.message}`));
-    });
+    const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
+    this.sttModelId = profileConfig.sttModelId;
+    this.spawnSTTWorker();
 
-    // ── LLM Worker ──────────────────────────────────────────────────────────
-    this.llmWorker = new Worker(
-      new URL("../llm/llm-worker.ts", import.meta.url),
-      { type: "module" }
-    );
-    this.llmWorker.addEventListener("message", this.handleLLMMessage.bind(this));
-    this.llmWorker.addEventListener("error", (err: ErrorEvent) => {
-      console.error("[AgentCore] LLM worker crashed:", err);
-      for (const cb of this.llmErrorCallbacks.values()) {
-        cb(`LLM worker crashed: ${err.message}`);
-      }
-      this.llmErrorCallbacks.clear();
-    });
+    this.llmModelId = profileConfig.modelId;
+    this.spawnLLMWorker();
 
     // ── Wire Planner to LLM worker ──────────────────────────────────────────
     const llmInterface = this.buildPlannerLLMInterface();
     this.planner.setLLMInterface(llmInterface);
 
     // ── Determine model IDs for current profile ─────────────────────────────
-    const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
-
     // Post load requests
-    this.sttWorker.postMessage({ type: "load", modelId: profileConfig.sttModelId });
-    this.llmWorker.postMessage({ type: "load", modelId: profileConfig.modelId });
+    this.sttModelId = profileConfig.sttModelId;
+    this.sttWorker!.postMessage({ type: "load", modelId: profileConfig.sttModelId });
+    this.llmWorker!.postMessage({ type: "load", modelId: profileConfig.modelId });
 
     // Emit initial progress
-    this.emitModelProgress("Initializing neural models… 0%");
+    this.emitModelProgress("Opening saved models…");
 
     // Transition to Listening as soon as STT worker is ready (Whisper loaded).
     this.sttReady
       .then(async () => {
+        if (initializationId !== this.lifecycleId) return;
         console.log("[AgentCore] STT ready — transitioning to Listening.");
-        this.transitionTo(AgentState.Listening);
-        await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+        if (this.listeningEnabled && this.state === AgentState.Idle) {
+          this.transitionTo(AgentState.Listening);
+          await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+        }
       })
       .catch((err: unknown) => {
-        console.warn("[AgentCore] STT worker initialization failed, continuing in Listening mode for Web Speech fallback:", err);
-        this.transitionTo(AgentState.Listening);
-        void sendToSW({
-          type: "OFFSCREEN_ERROR",
-          source: "agent",
-          message: `STT init warning: ${err instanceof Error ? err.message : String(err)}`,
-        });
-        void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+        if (initializationId !== this.lifecycleId) return;
+        this.handlePipelineError(new Error(`Speech model could not open: ${err instanceof Error ? err.message : String(err)}. Retry setup or check model storage.`));
       });
 
     // LLM loads in background for complex multi-step planning
     this.llmReady
       .then(() => {
+        if (initializationId !== this.lifecycleId) return;
         console.log("[AgentCore] LLM worker ready for complex planning.");
       })
       .catch((err: unknown) => {
+        if (initializationId !== this.lifecycleId) return;
         console.warn("[AgentCore] LLM worker unavailable (fast-path commands still functional):", err);
       });
 
@@ -223,13 +247,11 @@ export class AgentCore {
    * Transitions to Transcribing state. Implements barge-in (SRS FR-VOICE-03).
    */
   onSpeechStart(): void {
-    if (this.state !== AgentState.Listening && this.state !== AgentState.Idle) return;
-    this.transitionTo(AgentState.Transcribing);
-
-    // Barge-in: interrupt TTS if currently speaking (FR-VOICE-03)
-    if (this.tts.isSpeaking) {
-      this.tts.stop();
-    }
+    if (!this.listeningEnabled || this.speechPending || this.speechStarted || !this.isSttReady) return;
+    this.speechStarted = true;
+    this.speechBargeIn = this.commandBusy || ![AgentState.Listening, AgentState.Idle].includes(this.state);
+    if (!this.speechBargeIn) this.transitionTo(AgentState.Transcribing);
+    if (this.tts.isSpeaking) this.tts.stop();
   }
 
   /**
@@ -237,17 +259,31 @@ export class AgentCore {
    * Runs the full voice → plan → execute pipeline.
    */
   async onSpeechEnd(audio: Float32Array): Promise<void> {
-    if (this.state !== AgentState.Transcribing) return;
-
-    this.killRequested = false;
+    if (!this.speechStarted || this.speechPending || !this.listeningEnabled) return;
+    this.speechStarted = false;
+    this.speechPending = true;
+    const speechSequence = ++this.speechSequence;
+    const bargeIn = this.speechBargeIn;
+    const operationId = this.operationId;
 
     try {
       // Await STT worker readiness if model is still downloading
       await this.sttReady;
 
+      if (operationId !== this.operationId) return;
+
       // ── Step 1: Transcribe ───────────────────────────────────────────────
       const transcript = await this.transcribe(audio);
-      if (this.killRequested) { this.handleKill(); return; }
+      if (operationId !== this.operationId) return;
+      if (bargeIn) {
+        if (this.intentRouter.isKillCommand(transcript.text)) this.triggerKill();
+        return;
+      }
+      if (!transcript.text.trim()) {
+        this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+        await sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
+        return;
+      }
 
       console.log(`[AgentCore] Transcript: "${transcript.text}" (conf: ${transcript.confidence.toFixed(2)})`);
 
@@ -259,9 +295,14 @@ export class AgentCore {
         isFinal: true,
       });
 
-      await this.processUtterance(transcript.text);
+      // Release capture before planning so voice stop can interrupt this plan.
+      this.speechPending = false;
+      if (operationId === this.operationId) await this.processUtterance(transcript.text);
     } catch (err: unknown) {
-      this.handlePipelineError(err);
+      if (operationId === this.operationId) this.handlePipelineError(err);
+    } finally {
+      // A newer barge-in may already own the recognition gate.
+      if (speechSequence === this.speechSequence) this.speechPending = false;
     }
   }
 
@@ -269,7 +310,6 @@ export class AgentCore {
    * Execute a natural language text command directly (e.g. from Web Speech API fast-path).
    */
   async executeCommandText(text: string): Promise<void> {
-    this.killRequested = false;
     await this.processUtterance(text);
   }
 
@@ -278,6 +318,10 @@ export class AgentCore {
    * performs intent routing / LLM planning, validates plan, and sends to SW.
    */
   private async processUtterance(text: string): Promise<void> {
+    if (this.intentRouter.isKillCommand(text)) { this.triggerKill(); return; }
+    if (!text.trim() || this.commandBusy || this.sttResolve || this.state === AgentState.Confirming || this.state === AgentState.Executing) return;
+    this.commandBusy = true;
+    const operationId = ++this.operationId;
     try {
       this.transitionTo(AgentState.Routing);
 
@@ -302,7 +346,14 @@ export class AgentCore {
 
       if (fastPlan) {
         console.log("[AgentCore] Fast-path intent matched — skipping LLM.");
-        plan = fastPlan;
+        const needsSnapshot = fastPlan.actions.some(action => "handle" in action && action.handle);
+        if (needsSnapshot) {
+          this.currentSnapshot = null;
+          await sendToSW({ type: "REQUEST_SNAPSHOT", tabId: await this.getActiveTabId() });
+          await this.waitForSnapshot();
+          if (operationId !== this.operationId) return;
+          plan = this.groundFastPlan(fastPlan, this.currentSnapshot!);
+        } else plan = fastPlan;
       } else {
         // ── Step 4: Autonomous Planning ─────────────────────────────────────
         this.transitionTo(AgentState.Planning);
@@ -314,18 +365,17 @@ export class AgentCore {
         await sendToSW({ type: "REQUEST_SNAPSHOT", tabId });
         await this.waitForSnapshot();
 
-        if (this.killRequested) { this.handleKill(); return; }
+        if (operationId !== this.operationId) return;
 
         // Plan with Planner (real neural model only)
         plan = await this.planner.plan(text, this.currentSnapshot!);
       }
 
-      if (this.killRequested) { this.handleKill(); return; }
+      if (operationId !== this.operationId) return;
 
       // ── Step 5: Classify Risk & Validate ─────────────────────────────────
-      const risk = (typeof plan.risk === "number" && plan.risk >= 0 && plan.risk <= 4)
-        ? plan.risk
-        : this.riskClassifier.classify(plan);
+      this.validator.validate(plan);
+      const risk = this.riskClassifier.classify(plan, this.currentSnapshot?.url);
 
       const riskConfig = RISK_TIER_CONFIG[risk];
 
@@ -340,19 +390,19 @@ export class AgentCore {
       // Strictly validate normalized plan with PlanValidator
       this.validator.validate(plan);
 
-      // Send plan to SW — it coordinates confirmation UI and execution relay
+      // Set state before dispatch: the SW may synchronously finish execution.
+      this.transitionTo(needsConfirm ? AgentState.Confirming : AgentState.Executing);
+      await sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
       await sendToSW({ type: "PLAN_PRODUCED", plan });
 
       if (needsConfirm) {
-        this.transitionTo(AgentState.Confirming);
-        await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Confirming });
+        // Await explicit confirmation from the SW.
       } else {
-        this.transitionTo(AgentState.Executing);
-        await sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Executing });
+
 
         // Safety watchdog: auto-return to Listening if SW or execution stalls
         setTimeout(() => {
-          if (this.state === AgentState.Executing) {
+          if (operationId === this.operationId && this.state === AgentState.Executing) {
             console.warn("[AgentCore] Execution watchdog timed out — recovering to Listening state");
             this.onExecutionDone();
           }
@@ -360,11 +410,14 @@ export class AgentCore {
       }
 
     } catch (err: unknown) {
-      this.handlePipelineError(err);
+      if (operationId === this.operationId) this.handlePipelineError(err);
+    } finally {
+      if (operationId === this.operationId) this.commandBusy = false;
     }
   }
 
   private handlePipelineError(err: unknown): void {
+    const operationId = this.operationId;
     const message = err instanceof Error ? err.message : String(err);
     console.error("[AgentCore] Pipeline error:", err);
 
@@ -381,9 +434,9 @@ export class AgentCore {
 
     // Auto-recover to Listening after 3 seconds
     setTimeout(() => {
-      if (this.state === AgentState.Error) {
-        this.transitionTo(AgentState.Listening);
-        void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+      if (operationId === this.operationId && this.state === AgentState.Error) {
+        this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+        void sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
       }
     }, 3_000);
   }
@@ -420,11 +473,18 @@ export class AgentCore {
    * Called when execution of a plan completes.
    * Returns the agent to the Listening state and cleans up the active snapshot.
    */
+  onExecutionStarted(): void {
+    if (this.state === AgentState.Confirming || this.state === AgentState.Executing) {
+      this.transitionTo(AgentState.Executing);
+    }
+  }
+
   onExecutionDone(): void {
+    if (![AgentState.Executing, AgentState.Speaking, AgentState.Confirming].includes(this.state)) return;
     console.log("[AgentCore] Execution complete — returning to Listening state.");
     this.currentSnapshot = null;
-    this.transitionTo(AgentState.Listening);
-    void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+    this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
   }
 
   /**
@@ -494,11 +554,51 @@ export class AgentCore {
    * Dispose all resources. Called when offscreen document is torn down.
    */
   dispose(): void {
+    this.lifecycleId++;
+    this.initializedProfile = null;
+    this.speechStarted = false;
+    this.operationId++;
+    this.commandBusy = false;
+    this.sttReadyReject?.(new Error("Agent disposed"));
+    this.llmReadyReject?.(new Error("Agent disposed"));
+    if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
+    this.llmAbortTimer = null;
+    if (this.llmRecoveryTimer) clearTimeout(this.llmRecoveryTimer);
+    this.llmRecoveryTimer = null;
+    this.sttReject?.(new Error("Agent disposed"));
+    for (const cb of this.llmErrorCallbacks.values()) cb("Agent disposed");
+    this.llmResultCallbacks.clear();
+    this.llmErrorCallbacks.clear();
+    this.llmTokenCallbacks.clear();
     this.sttWorker?.terminate();
     this.llmWorker?.terminate();
     this.sttWorker = null;
     this.llmWorker = null;
     this.tts.stop();
+    this.transitionTo(AgentState.Idle);
+  }
+
+  /** Stop capturing commands while keeping downloaded and initialized models in memory. */
+  pauseListening(): void {
+    this.listeningEnabled = false;
+    this.triggerKill();
+    this.transitionTo(AgentState.Idle);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Idle });
+  }
+
+  resumeListening(): void {
+    this.listeningEnabled = true;
+    this.transitionTo(this.isSttReady ? AgentState.Listening : AgentState.Idle);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
+    this.emitModelProgress();
+  }
+
+  onSpeechDiscard(): void {
+    this.speechStarted = false;
+    if (this.state === AgentState.Transcribing && !this.speechPending && !this.sttResolve) {
+      this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+      void sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
+    }
   }
 
   /** Current agent state (read-only). */
@@ -519,22 +619,54 @@ export class AgentCore {
 
   private handleKill(): void {
     console.log("[AgentCore] Kill switch triggered — returning to Listening.");
+    this.operationId++;
+    this.speechStarted = false;
+    this.commandBusy = false;
     this.tts.stop();
+    const hadSttRequest = this.sttResolve !== null;
+    this.sttReject?.(new Error("Speech recognition cancelled"));
+    if (this.sttWorker && hadSttRequest) this.restartSTTWorker();
 
     // Cancel any in-flight LLM generation
     for (const requestId of this.llmResultCallbacks.keys()) {
-      this.llmWorker?.postMessage({ type: "abort", requestId });
+      this.abortLLM(requestId);
+      this.llmErrorCallbacks.get(requestId)?.("Planning cancelled");
     }
     this.llmResultCallbacks.clear();
     this.llmErrorCallbacks.clear();
     this.llmTokenCallbacks.clear();
 
     this.killRequested = false;
-    this.transitionTo(AgentState.Listening);
-    void sendToSW({ type: "AGENT_STATE_CHANGED", state: AgentState.Listening });
+    this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
+    void sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
   }
 
   // ─── Private Helpers ───────────────────────────────────────────────────────
+
+  private groundFastPlan(plan: AgentPlan, snapshot: PageSnapshot): AgentPlan {
+    const actions = plan.actions.map(action => {
+      if (!("handle" in action) || !action.handle) return action;
+      const name = action.handle.toLowerCase().trim().replace(/\s+(?:field|button|link)$/, "").replace(/^(?:number|#)\s*/, "");
+      const target = /^\d+$/.test(name) ? `e${name}` : name;
+      const candidates = snapshot.elements.filter(element => !element.disabled && (
+        action.type !== "type" || ["input", "textarea"].includes(element.tag) || element.role === "textbox"
+      ));
+      let matches = candidates.filter(element => element.handle === target || element.label?.toLowerCase() === target);
+      if (matches.length === 0) matches = candidates.filter(element =>
+        element.label?.toLowerCase().includes(target) || element.inputType === target ||
+        (target === "input" && ["input", "textarea"].includes(element.tag))
+      );
+      if (matches.length > 1) {
+        const visible = matches.filter(element => element.inViewport);
+        if (visible.length === 1) matches = visible;
+      }
+      if (matches.length !== 1) throw new Error(`Could not uniquely identify “${action.handle}”. Use the exact visible field or button label.`);
+      const match = matches[0]!;
+      if (action.type === "type" && match.inputType === "password") throw new Error("Use the vault to fill password fields.");
+      return { ...action, handle: match.handle, ...(action.type === "click" ? { label: match.label ?? "" } : {}) };
+    });
+    return { ...plan, actions };
+  }
 
   private transitionTo(next: AgentState): void {
     console.log(`[AgentCore] ${this.state} → ${next}`);
@@ -547,7 +679,11 @@ export class AgentCore {
   private buildPlannerLLMInterface(): PlannerLLMInterface {
     return {
       postGenerate: (requestId: string, messages: ChatMessage[], grammar?: string): void => {
-        this.llmWorker?.postMessage({ type: "generate", requestId, messages, grammar });
+        if (!this.llmWorker || !this.isLlmReady) {
+          this.handleLLMMessage({ data: { type: "error", requestId, message: this.llmCircuitOpen ? "GPU planning is unavailable. Basic commands still work; restart Chrome and retry model setup." : "AI planner is still loading or unavailable. Wait for Models ready, or use a simple command." } } as MessageEvent<LLMMessage>);
+          return;
+        }
+        this.llmWorker.postMessage({ type: "generate", requestId, messages, grammar });
       },
       onResult: (requestId: string, cb: (text: string) => void): void => {
         this.llmResultCallbacks.set(requestId, cb);
@@ -559,7 +695,7 @@ export class AgentCore {
         this.llmTokenCallbacks.set(requestId, cb);
       },
       abort: (requestId: string): void => {
-        this.llmWorker?.postMessage({ type: "abort", requestId });
+        this.abortLLM(requestId);
         this.llmResultCallbacks.delete(requestId);
         this.llmErrorCallbacks.delete(requestId);
         this.llmTokenCallbacks.delete(requestId);
@@ -573,12 +709,14 @@ export class AgentCore {
    */
   private async transcribe(audio: Float32Array): Promise<{ text: string; confidence: number; language: string }> {
     if (!this.sttWorker) throw new Error("STT worker not initialized");
+    if (this.sttResolve) throw new Error("Speech recognition is busy");
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.sttResolve = null;
         this.sttReject = null;
-        reject(new Error(`STT timeout after ${STT_TIMEOUT_MS}ms`));
+        this.restartSTTWorker();
+        reject(new Error(`STT timeout after ${STT_TIMEOUT_MS}ms. Speech recognition has been restarted; please retry when ready.`));
       }, STT_TIMEOUT_MS);
 
       this.sttResolve = (result) => {
@@ -595,7 +733,11 @@ export class AgentCore {
       };
 
       // Transfer the buffer (zero-copy) — the worker owns it now.
-      this.sttWorker!.postMessage({ type: "transcribe", audio }, [audio.buffer]);
+      try {
+        this.sttWorker!.postMessage({ type: "transcribe", audio }, [audio.buffer]);
+      } catch (err) {
+        this.sttReject?.(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -635,6 +777,134 @@ export class AgentCore {
     return 0; // SW resolves active tab on REQUEST_SNAPSHOT
   }
 
+  private spawnLLMWorker(): void {
+    const worker = new Worker(new URL("../llm/llm-worker.ts", import.meta.url), { type: "module" });
+    this.llmWorker = worker;
+    worker.addEventListener("message", event => {
+      if (this.llmWorker === worker) this.handleLLMMessage(event as MessageEvent<LLMMessage>);
+    });
+    worker.addEventListener("error", event => {
+      if (this.llmWorker !== worker) return;
+      if (isGPUDeviceLoss(event.message)) { this.recoverGPUPlanner(); return; }
+      const error = new Error(`LLM worker crashed: ${event.message}`);
+      if (this.llmRecoveryAttempts > 0 && !this.isLlmReady) { this.failGPURecovery(error.message); return; }
+      this.isLlmReady = false;
+      this.initializationFailed = true;
+      this.emitModelError(error.message);
+      this.llmReadyReject(error);
+      for (const cb of this.llmErrorCallbacks.values()) cb(error.message);
+      this.llmErrorCallbacks.clear();
+      this.llmResultCallbacks.clear();
+      this.llmTokenCallbacks.clear();
+    });
+  }
+
+  private recoverGPUPlanner(): void {
+    this.llmWorker?.terminate();
+    this.llmWorker = null;
+    this.isLlmReady = false;
+    this.llmProgress = 0;
+    this.llmDownloading = false;
+    if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
+    this.llmAbortTimer = null;
+    if (this.llmRecoveryTimer) clearTimeout(this.llmRecoveryTimer);
+    this.llmRecoveryTimer = null;
+
+    const callbacks = [...this.llmErrorCallbacks.values()];
+    this.llmErrorCallbacks.clear();
+    this.llmResultCallbacks.clear();
+    this.llmTokenCallbacks.clear();
+    const canRecover = this.llmRecoveryAttempts === 0;
+    const message = canRecover
+      ? "GPU device lost. Loading a smaller AI planner; wait for Models ready, then repeat your command. Basic commands still work."
+      : "GPU device was lost again. Complex planning is disabled to avoid repeated GPU crashes. Basic commands still work. Restart Chrome or free GPU resources, then retry model setup.";
+
+    if (canRecover) {
+      this.llmRecoveryAttempts++;
+      this.llmModelId = GPU_RECOVERY_MODEL;
+      // Bridge the old readiness promise: setup may already be awaiting it.
+      const previousResolve = this.llmReadyResolve;
+      const previousReject = this.llmReadyReject;
+      this.llmReady = new Promise<void>((resolve, reject) => {
+        this.llmReadyResolve = () => { resolve(); previousResolve(); };
+        this.llmReadyReject = error => { reject(error); previousReject(error); };
+      });
+      void this.llmReady.catch(() => {});
+      this.emitModelProgress("GPU reset — opening a smaller AI planner…");
+      this.llmRecoveryTimer = setTimeout(() => {
+        this.llmRecoveryTimer = null;
+        this.spawnLLMWorker();
+        this.llmWorker!.postMessage({ type: "load", modelId: this.llmModelId });
+        this.llmRecoveryTimer = setTimeout(() => {
+          this.llmRecoveryTimer = null;
+          this.failGPURecovery("The smaller AI planner could not load within five minutes. Basic commands still work; retry model setup when ready.");
+        }, GPU_RECOVERY_LOAD_TIMEOUT_MS);
+      }, GPU_RECOVERY_DELAY_MS);
+    } else {
+      this.failGPURecovery(message);
+    }
+    // Never replay a failed command using a stale page snapshot.
+    for (const callback of callbacks) callback(message);
+  }
+
+  private failGPURecovery(message: string): void {
+    if (this.llmRecoveryTimer) clearTimeout(this.llmRecoveryTimer);
+    this.llmRecoveryTimer = null;
+    this.llmWorker?.terminate();
+    this.llmWorker = null;
+    this.isLlmReady = false;
+    this.llmCircuitOpen = true;
+    this.emitModelError(message);
+    this.llmReadyReject(new Error(message));
+  }
+
+  private abortLLM(requestId: string): void {
+    this.llmWorker?.postMessage({ type: "abort", requestId });
+    if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
+    // A wedged GPU may never yield a token or acknowledge interruptGenerate.
+    this.llmAbortTimer = setTimeout(() => {
+      this.llmAbortTimer = null;
+      this.llmWorker?.terminate();
+      this.isLlmReady = false;
+      this.llmProgress = 0;
+      this.llmReady = new Promise<void>((resolve, reject) => {
+        this.llmReadyResolve = resolve;
+        this.llmReadyReject = reject;
+      });
+      void this.llmReady.catch(() => {});
+      this.spawnLLMWorker();
+      this.llmWorker!.postMessage({ type: "load", modelId: this.llmModelId });
+    }, 2_000);
+  }
+
+  private spawnSTTWorker(): void {
+    const worker = new Worker(new URL("../stt/stt-worker.ts", import.meta.url), { type: "module" });
+    this.sttWorker = worker;
+    worker.addEventListener("message", event => {
+      if (this.sttWorker === worker) this.handleSTTMessage(event as MessageEvent<STTMessage>);
+    });
+    worker.addEventListener("error", event => {
+      if (this.sttWorker !== worker) return;
+      const error = new Error(`STT worker crashed: ${event.message}`);
+      this.sttReadyReject(error);
+      this.sttReject?.(error);
+      this.restartSTTWorker();
+    });
+  }
+
+  private restartSTTWorker(): void {
+    this.sttWorker?.terminate();
+    this.isSttReady = false;
+    this.sttProgress = 0;
+    this.sttReady = new Promise<void>((resolve, reject) => {
+      this.sttReadyResolve = resolve;
+      this.sttReadyReject = reject;
+    });
+    void this.sttReady.catch(() => {});
+    this.spawnSTTWorker();
+    this.sttWorker!.postMessage({ type: "load", modelId: this.sttModelId });
+  }
+
   /**
    * Reset the STT/LLM readiness promises.
    * Called in constructor and when workers are restarted.
@@ -644,10 +914,12 @@ export class AgentCore {
       this.sttReadyResolve = resolve;
       this.sttReadyReject = reject;
     });
+    void this.sttReady.catch(() => {});
     this.llmReady = new Promise<void>((resolve, reject) => {
       this.llmReadyResolve = resolve;
       this.llmReadyReject = reject;
     });
+    void this.llmReady.catch(() => {});
   }
 
   /**
@@ -657,27 +929,30 @@ export class AgentCore {
    */
   private emitModelProgress(detailText?: string): void {
     const isAllReady = this.isSttReady && this.isLlmReady;
+    if (isAllReady) this.initializationFailed = false;
     const weightedProgress = isAllReady ? 1.0 : (this.sttProgress * 0.15 + this.llmProgress * 0.85);
     const pct = isAllReady ? 100 : Math.min(99, Math.round(weightedProgress * 100));
 
     let text = detailText;
     if (isAllReady) {
-      text = "✓ Models ready!";
+      text = this.llmModelId === GPU_RECOVERY_MODEL ? "Models ready — compact planner active" : "✓ Models ready!";
     } else if (!text) {
       if (!this.isSttReady) {
-        text = `Downloading speech recognition model… ${Math.round(this.sttProgress * 100)}%`;
+        text = this.sttProgress > 0 ? `Preparing speech model… ${Math.round(this.sttProgress * 100)}%` : "Opening saved speech model…";
       } else {
-        text = `Downloading AI planner model… ${Math.round(this.llmProgress * 100)}%`;
+        text = this.llmProgress > 0 ? `Preparing AI planner… ${Math.round(this.llmProgress * 100)}%` : "Opening saved AI planner…";
       }
     }
 
     void sendToSW({
       type: "MODEL_LOAD_PROGRESS",
+      profile: this.initializedProfile ?? undefined,
+      loadId: this.loadId,
       progress: isAllReady ? 1.0 : weightedProgress,
       loaded: pct,
       total: 100,
       done: isAllReady,
-      phase: isAllReady ? "ready" : (this.isSttReady ? "llm" : "stt"),
+      phase: isAllReady ? "ready" : (this.sttDownloading || this.llmDownloading ? "downloading" : "loading"),
       text,
       stt: {
         loaded: Math.round(this.sttProgress * 100),
@@ -693,29 +968,31 @@ export class AgentCore {
     } as any);
   }
 
+  private emitModelError(message: string): void {
+    this.initializationFailed = true;
+    void sendToSW({ type: "MODEL_LOAD_PROGRESS", profile: this.initializedProfile ?? undefined,
+      loadId: this.loadId, progress: 0, loaded: 0, total: 100, done: false, phase: "error", text: message } as any);
+  }
+
   /**
    * Explicitly load models for a given profile (e.g. from Onboarding).
    */
   async loadProfile(profile: ModelProfile): Promise<void> {
-    const profileConfig = MODEL_PROFILE_CONFIG[profile] ?? MODEL_PROFILE_CONFIG[DEFAULT_MODEL_PROFILE];
-    console.log(`[AgentCore] Loading profile "${profile}" (${profileConfig.label})…`);
-
-    this.isSttReady = false;
-    this.isLlmReady = false;
-    this.sttProgress = 0;
-    this.llmProgress = 0;
-
-    if (!this.sttWorker || !this.llmWorker) {
-      await this.initialize(profile);
-      await Promise.all([this.sttReady, this.llmReady]);
-      return;
+    // Explicit setup/retry is allowed to reopen the circuit; mic pause/resume is not.
+    if (this.llmCircuitOpen) {
+      this.llmCircuitOpen = false;
+      this.initializationFailed = true;
     }
-
-    this.resetReadinessPromises();
-    this.sttWorker.postMessage({ type: "load", modelId: profileConfig.sttModelId });
-    this.llmWorker.postMessage({ type: "load", modelId: profileConfig.modelId });
-
-    await Promise.all([this.sttReady, this.llmReady]);
+    // Recreate workers so profile changes cannot race with native inference/loading.
+    await this.initialize(profile);
+    if (this.initializedProfile !== profile) throw new DOMException("Model selection changed", "AbortError");
+    const loadId = this.loadId;
+    try {
+      await Promise.all([this.sttReady, this.llmReady]);
+    } catch (err) {
+      if (this.initializedProfile !== profile || loadId !== this.loadId) throw new DOMException("Model selection changed", "AbortError");
+      throw err;
+    }
   }
 
   // ─── Worker Message Handlers ───────────────────────────────────────────────
@@ -729,6 +1006,7 @@ export class AgentCore {
         console.log("[AgentCore] STT worker ready.");
         this.sttProgress = 1.0;
         this.isSttReady = true;
+        this.sttDownloading = false;
         this.sttReadyResolve();
         this.emitModelProgress("Speech recognition ready.");
         break;
@@ -738,15 +1016,17 @@ export class AgentCore {
         break;
 
       case "error":
+        if (!this.isSttReady) this.emitModelError(msg.message);
         this.sttReadyReject?.(new Error(msg.message));
         this.sttReject?.(new Error(msg.message));
         break;
 
       case "progress":
+        this.sttDownloading = msg.downloading ?? false;
         if (msg.total > 0) {
-          this.sttProgress = Math.min(1.0, msg.loaded / msg.total);
+          this.sttProgress = Math.max(this.sttProgress, Math.min(0.99, msg.loaded / msg.total));
         }
-        this.emitModelProgress(`Downloading speech recognition model… ${Math.round(this.sttProgress * 100)}%`);
+        this.emitModelProgress();
         break;
 
       default: {
@@ -762,18 +1042,27 @@ export class AgentCore {
 
     switch (msg.type) {
       case "ready":
+        if (this.llmRecoveryTimer) clearTimeout(this.llmRecoveryTimer);
+        this.llmRecoveryTimer = null;
         console.log("[AgentCore] LLM worker ready.");
         this.llmProgress = 1.0;
         this.isLlmReady = true;
+        this.llmDownloading = false;
         this.llmReadyResolve();
         this.emitModelProgress("AI planner ready.");
         break;
 
+      case "cancelled":
+        if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
+        this.llmAbortTimer = null;
+        break;
+
       case "progress":
+        this.llmDownloading = msg.downloading ?? false;
         if (msg.total > 0) {
-          this.llmProgress = Math.min(1.0, msg.loaded / msg.total);
+          this.llmProgress = Math.max(this.llmProgress, Math.min(0.99, msg.loaded / msg.total));
         }
-        this.emitModelProgress(msg.text || `Downloading AI planner model… ${Math.round(this.llmProgress * 100)}%`);
+        this.emitModelProgress(this.llmDownloading ? "Downloading AI model…" : "Preparing AI planner…");
         break;
 
       case "token": {
@@ -782,7 +1071,7 @@ export class AgentCore {
         tokenCb?.(msg.delta);
 
         // Also forward to panel for live display.
-        void sendToSW({ type: "LLM_TOKEN", delta: msg.delta } as any);
+        if (this.llmResultCallbacks.has(msg.requestId)) void sendToSW({ type: "LLM_TOKEN", delta: msg.delta } as any);
         break;
       }
 
@@ -801,7 +1090,16 @@ export class AgentCore {
       }
 
       case "error": {
+        if (msg.code === "GPU_DEVICE_LOST" || isGPUDeviceLoss(msg.message)) {
+          this.recoverGPUPlanner();
+          break;
+        }
+        if (!msg.requestId && this.llmRecoveryAttempts > 0 && !this.isLlmReady) {
+          this.failGPURecovery(`The smaller AI planner could not open: ${msg.message}. Basic commands still work; retry model setup.`);
+          break;
+        }
         if (!msg.requestId) {
+          this.emitModelError(msg.message);
           this.llmReadyReject?.(new Error(msg.message));
         }
         const errorCb = this.llmErrorCallbacks.get(msg.requestId);

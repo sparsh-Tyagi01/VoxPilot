@@ -211,6 +211,8 @@ export class OverlayManager {
     return this.confirmation.show(plan);
   }
 
+  hideConfirmation(): void { this.confirmation.dismiss(); }
+
   // ─── Teardown ────────────────────────────────────────────────────────────
 
   /** Remove the overlay from the page completely. */
