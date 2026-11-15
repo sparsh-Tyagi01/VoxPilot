@@ -6,7 +6,7 @@ export interface ExecutionReceipt {
   executionId: string;
   status: "running" | "completed" | "failed" | "interrupted";
   updatedAt: number;
-  steps: { index: number; kind: AgentAction["type"]; status: StepStatus }[];
+  steps: { index: number; kind: AgentAction["type"] | "submit"; status: StepStatus }[];
 }
 /** One bounded receipt in session storage. Contains no action arguments or page data. */
 export class ExecutionJournal {
@@ -29,7 +29,7 @@ export class ExecutionJournal {
   async begin(executionId: string): Promise<void> {
     await this.write({ executionId, status: "running", updatedAt: Date.now(), steps: [] });
   }
-  async step(executionId: string, index: number, kind: AgentAction["type"], status: StepStatus): Promise<void> {
+  async step(executionId: string, index: number, kind: AgentAction["type"] | "submit", status: StepStatus): Promise<void> {
     const receipt = await this.read();
     if (!receipt || receipt.executionId !== executionId || receipt.status !== "running") throw new Error("Execution receipt is no longer active.");
     if (!Number.isInteger(index) || index < 0 || index >= 20) throw new Error("Invalid execution step.");

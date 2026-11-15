@@ -456,8 +456,21 @@ export interface GetDiagnosticsMsg extends BaseMessage { type: "GET_DIAGNOSTICS"
 
 export interface CommandNoticeMsg extends BaseMessage { type: "COMMAND_NOTICE"; text: string; }
 export interface VaultLockMsg extends BaseMessage { type: "VAULT_LOCK"; }
+export type SiteTaskMessage =
+  | { type: "START_SITE_TASK"; goal: string }
+  | { type: "CANCEL_SITE_TASK" }
+  | { type: "SITE_TASK_REPLY"; taskId: string; answer: string }
+  | { type: "SITE_TASK_APPROVE"; taskId: string; approvalId: string; approved: boolean }
+  | { type: "SITE_TASK_STATE"; state: import("./site-task.js").SiteTaskState }
+  | { type: "SITE_DECIDE"; request: import("./site-task.js").SiteDecisionRequest }
+  | { type: "SITE_OBSERVE"; since?: string }
+  | { type: "SITE_OBSERVATION"; observation: import("./site-task.js").SiteObservation }
+  | { type: "SITE_EXECUTE"; action: import("./site-task.js").SiteAction; documentId: string; fingerprint: string }
+  | { type: "SITE_VALIDATE"; handle: string; documentId: string; fingerprint: string }
+  | { type: "SITE_VALIDATION"; valid: boolean }
+  | { type: "SITE_STEP_RESULT"; result: import("./site-task.js").SiteStepResult };
 
-export type VoxPilotMessage = VaultLockMsg | CommandNoticeMsg | PerformanceSampleMsg | GetDiagnosticsMsg
+export type VoxPilotMessage = (SiteTaskMessage & { target?: "sw" | "offscreen" | "ui" }) | VaultLockMsg | CommandNoticeMsg | PerformanceSampleMsg | GetDiagnosticsMsg
   /* Panel → SW */
   | ToggleListeningMsg
   | ConfirmPlanMsg

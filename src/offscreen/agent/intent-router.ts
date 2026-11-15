@@ -225,24 +225,7 @@ export class IntentRouter {
         },
       },
 
-      // ── Search Query ───────────────────────────────────────────────────────
-      {
-        name: "search-query",
-        pattern: /^(?:can\s+you\s+|please\s+)?(?:search\s+for|search)\s+(.+)$/i,
-        planFactory: (match) => {
-          const query = match[1]?.trim();
-          if (!query) return null;
-          return {
-            intent: `Search for "${query}"`,
-            risk: RiskTier.R1,
-            requiresConfirmation: false,
-            actions: [
-              { type: "type", handle: "search", text: query },
-              { type: "done", summary: `Searched for "${query}".` },
-            ],
-          };
-        },
-      },
+      // Search is handled by the site task loop, including explicit submission and verification.
 
       // ── Type Text ──────────────────────────────────────────────────────────
       {

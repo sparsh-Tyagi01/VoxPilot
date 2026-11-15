@@ -105,12 +105,12 @@ function changeAudio(start: boolean, profile?: string): Promise<void> {
 async function sendToSW(msg: VoxPilotMessage): Promise<void> {
   try {
     const response = await chrome.runtime.sendMessage({ ...msg, target: "sw" });
-    if (response?.ok === false && ["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION"].includes(msg.type)) {
+    if (response?.ok === false && ["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION", "START_SITE_TASK", "SITE_TASK_REPLY"].includes(msg.type)) {
       throw new Error(response.error ?? "Background operation failed");
     }
   } catch (err: unknown) {
     // SW may have been restarted — this is expected occasionally
-    if (["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION"].includes(msg.type)) throw err;
+    if (["PLAN_PRODUCED", "REQUEST_SNAPSHOT", "RELAY_ACTION", "START_SITE_TASK", "SITE_TASK_REPLY"].includes(msg.type)) throw err;
     console.debug("[Offscreen] Notification could not be delivered:", err);
   }
 }
@@ -121,6 +121,11 @@ chrome.runtime.onMessage.addListener(
   (rawMsg: unknown, _sender, sendResponse: (r?: unknown) => void): boolean => {
     const msg = rawMsg as VoxPilotMessage;
     if (!msg || msg.target !== "offscreen") return false;
+    if (_sender.id !== chrome.runtime.id) return false;
+    if (msg.type === "SITE_DECIDE") {
+      void getCore().decideSiteTask(msg.request).then(decision => sendResponse({ ok: true, decision })).catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : "Planning failed." }));
+      return true;
+    }
 
     handleMessage(msg).then(() => sendResponse({ ok: true })).catch((err: unknown) => {
       console.error("[Offscreen] Message handler error:", err);
@@ -134,6 +139,9 @@ chrome.runtime.onMessage.addListener(
 
 async function handleMessage(msg: VoxPilotMessage): Promise<void> {
   switch (msg.type) {
+    case "SITE_TASK_STATE":
+      getCore().onSiteTaskState(msg.state);
+      break;
     case "START_AUDIO":
       await changeAudio(true, msg.profile);
       break;

@@ -25,7 +25,7 @@ describe("Agent worker recovery", () => {
     sendToSW.mockImplementation(async () => undefined);
     FakeWorker.instances = [];
     vi.stubGlobal("Worker", FakeWorker);
-    core = new AgentCore({ tts: { stop: vi.fn(), isSpeaking: false } as unknown as TTS });
+    core = new AgentCore({ tts: { stop: vi.fn(), isSpeaking: false } as unknown as TTS, siteAware: false });
     await core.initialize(ModelProfile.Fast, true);
     FakeWorker.instances.forEach(worker => worker.emit({ type: "ready" }));
     await Promise.resolve();
@@ -120,6 +120,25 @@ describe("Agent worker recovery", () => {
     const call = sendToSW.mock.calls.find(([msg]) => (msg as { type?: string }).type === "PLAN_PRODUCED");
     expect((call?.[0] as { plan: { actions: { handle?: string }[] } }).plan.actions[0]!.handle).toBe("e1");
     expect(core.currentState).toBe(AgentState.Listening);
+  });
+  it("delegates arbitrary goals and search to site tasks in the shipped default mode", async () => {
+    core.dispose(); FakeWorker.instances = [];
+    core = new AgentCore({ tts: { stop: vi.fn(), isSpeaking: false } as unknown as TTS });
+    await core.initialize(ModelProfile.Fast);
+    FakeWorker.instances[0]!.emit({ type: "ready" }); core.resumeListening();
+    sendToSW.mockClear();
+    await core.executeCommandText("Could you find a waterproof backpack under £80?");
+    await core.executeCommandText("search for backpacks");
+    expect(sendToSW).toHaveBeenCalledWith({ type: "START_SITE_TASK", goal: "Could you find a waterproof backpack under £80?" });
+    expect(sendToSW).toHaveBeenCalledWith({ type: "START_SITE_TASK", goal: "search for backpacks" });
+    expect(sendToSW.mock.calls.some(([message]) => (message as { type: string }).type === "PLAN_PRODUCED")).toBe(false);
+  });
+  it("uses recognized speech to answer only the active clarification, never to approve a mutation", async () => {
+    core.onSiteTaskState({ version: 1, id: "site-task", tabId: 12, origin: "https://example.com", goal: "Add this shirt", status: "awaiting_answer", steps: 0, message: "Which size?" });
+    core.onSpeechStart(); const speech = core.onSpeechEnd(new Float32Array(16000)); await Promise.resolve();
+    FakeWorker.instances[0]!.emit({ type: "result", text: "Medium", confidence: null, language: "en" });
+    await speech;
+    expect(sendToSW).toHaveBeenCalledWith({ type: "SITE_TASK_REPLY", taskId: "site-task", answer: "Medium" });
   });
 
   it("keeps model progress monotonic across files and reports the active profile", async () => {

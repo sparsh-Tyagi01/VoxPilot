@@ -2,6 +2,8 @@
 import { AgentState } from "@shared/types.js";
 import type { AgentAction, AgentPlan, SessionState } from "@shared/types.js";
 import type { ModelLoadProgressMsg, VoxPilotMessage } from "@shared/messages.js";
+import { SITE_TERMINAL } from "@shared/site-task.js";
+import type { SiteTaskState } from "@shared/site-task.js";
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -40,6 +42,34 @@ let pendingSummary: string | null = null;
 let vaultRequestId: string | null = null;
 let lastDownloadProgress = 0;
 let lastModelPhase = "";
+let siteTask: SiteTaskState | null = null;
+const taskSection = element("site-task");
+const taskAnswerForm = element<HTMLFormElement>("task-answer-form");
+const taskAnswer = element<HTMLInputElement>("task-answer");
+function renderSiteTask(task: SiteTaskState | null): void {
+  const newQuestion = task?.status === "awaiting_answer" && (siteTask?.id !== task.id || siteTask.status !== "awaiting_answer");
+  const newApproval = task?.status === "awaiting_approval" && siteTask?.approval?.id !== task.approval?.id;
+  siteTask = task;
+  taskSection.hidden = !task;
+  taskAnswerForm.hidden = task?.status !== "awaiting_answer";
+  if (!task) return;
+  element("task-site").textContent = task.origin;
+  element("task-message").textContent = task.message;
+  element("task-stop").hidden = SITE_TERMINAL.has(task.status);
+  if (newQuestion) taskAnswer.focus();
+  if (task.status === "awaiting_approval" && task.approval) {
+    planSection.hidden = false; confirmation.hidden = false;
+    planHeading.textContent = "Confirm before continuing";
+    planIntent.textContent = task.approval.description;
+    planActions.replaceChildren();
+    for (const text of [task.approval.context, `Destination: ${task.approval.destination}`].filter(Boolean)) {
+      const item = document.createElement("li"); item.textContent = text; planActions.appendChild(item);
+    }
+    planActions.hidden = false;
+    confirmButton.disabled = false; cancelButton.disabled = false;
+    if (newApproval) cancelButton.focus();
+  }
+}
 
 async function send(message: { type: string; [key: string]: unknown }): Promise<unknown> {
   const response: unknown = await chrome.runtime.sendMessage(message);
@@ -133,6 +163,7 @@ function renderSession(state: SessionState): void {
   renderTranscript(state.lastTranscript);
   if (state.currentPlan && [AgentState.Confirming, AgentState.Executing, AgentState.Planning].includes(state.agentState)) renderPlan(state.currentPlan);
   else hidePlan();
+  renderSiteTask(state.siteTask ?? null);
 }
 function renderModel(message: ModelLoadProgressMsg): void {
   const phase = message.phase ?? "loading";
@@ -243,12 +274,26 @@ element<HTMLFormElement>("command-form").addEventListener("submit", async event 
 confirmButton.addEventListener("click", async () => {
   confirmButton.disabled = true;
   cancelButton.disabled = true;
-  try { await send({ type: "CONFIRM_PLAN" }); confirmation.hidden = true; }
+  try {
+    if (siteTask?.status === "awaiting_approval" && siteTask.approval) await send({ type: "SITE_TASK_APPROVE", taskId: siteTask.id, approvalId: siteTask.approval.id, approved: true });
+    else await send({ type: "CONFIRM_PLAN" });
+    confirmation.hidden = true;
+  }
   catch (error) { showError(error); confirmButton.disabled = false; cancelButton.disabled = false; }
 });
 cancelButton.addEventListener("click", async () => {
-  try { await send({ type: "CANCEL_PLAN" }); pendingSummary = null; hidePlan(); }
+  try { await send({ type: siteTask && !SITE_TERMINAL.has(siteTask.status) ? "CANCEL_SITE_TASK" : "CANCEL_PLAN" }); pendingSummary = null; hidePlan(); }
   catch (error) { showError(error); }
+});
+element("task-stop").addEventListener("click", () => { void send({ type: "CANCEL_SITE_TASK" }).catch(showError); });
+taskAnswerForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!siteTask || siteTask.status !== "awaiting_answer" || !taskAnswer.value.trim()) return;
+  const button = taskAnswerForm.querySelector("button")!;
+  button.disabled = true;
+  try { await send({ type: "SITE_TASK_REPLY", taskId: siteTask.id, answer: taskAnswer.value.trim() }); taskAnswer.value = ""; }
+  catch (error) { showError(error); }
+  finally { button.disabled = false; }
 });
 vaultForm.addEventListener("submit", async event => {
   event.preventDefault();

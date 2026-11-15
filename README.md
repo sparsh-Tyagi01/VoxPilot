@@ -19,6 +19,10 @@ Click the toolbar icon to open the compact popup. Start listening, then close th
 
 See [release readiness and troubleshooting](docs/RELEASE_READINESS.md) for verification commands, Chrome smoke tests, and remaining release gaps. Run `npm run check` to validate source and create `dist/`. After rebuilding, reload the extension at `chrome://extensions` and refresh target webpages. Silero VAD runs locally in a CPU/WASM worker; speech output uses local browser SpeechSynthesis voices. Kokoro/Piper TTS remains planned. Silence and unrecognized voice input do not speak the direct-command tutorial.
 
+The proposed [site-aware agent architecture](docs/SITE_AWARE_AGENT_ARCHITECTURE.md) describes open-ended requests, capability discovery, per-site guardrails, verified actions, implementation phases, and the tradeoffs behind those decisions.
+
+The initial [site-aware task runner](docs/SITE_AGENT_IMPLEMENTATION.md) is available with Assist and larger AI profiles. It observes the current page, asks for missing information, checks each action and inspects the result. Essential remains the lightweight basic-control mode. Run `npm run test:browser` for the controlled Chrome task and popup smoke tests.
+
 ## What is VoxPilot?
 
 VoxPilot is a Manifest V3 Chrome extension that lets you operate web pages entirely by voice — filling forms, clicking buttons, scrolling, navigating, and running multi-step workflows — without any data ever leaving your device.

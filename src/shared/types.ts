@@ -310,6 +310,7 @@ export interface VaultField {
  * The service worker is stateless — all runtime state lives here.
  */
 export interface SessionState {
+  siteTask?: import("./site-task.js").SiteTaskState | null;
   agentState: AgentState;
   /** ID of the currently active tab being automated */
   activeTabId: number | null;

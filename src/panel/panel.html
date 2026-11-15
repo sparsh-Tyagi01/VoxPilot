@@ -90,6 +90,11 @@
     .command-form input { min-width: 0; }
     .command-form button { flex: 0 0 36px; min-height: 36px; display: grid; place-items: center; padding: 0; }
     .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+    .task { margin: 12px 0; padding: 12px 0 0; border-top: 1px solid var(--line); }
+    .task p { margin: 0 0 8px; overflow-wrap: anywhere; }
+    .task-site { font-size: 12px; color: var(--muted); }
+    .task label { display: block; margin-bottom: 6px; }
+    .task input { width: 100%; margin-bottom: 8px; }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
   </style>
 </head>
@@ -110,6 +115,16 @@
       <p class="transcript empty" id="transcript" aria-live="polite">Say “scroll down” or “click Sign in”.</p>
       <p class="result" id="result" aria-live="polite" hidden></p>
     </div>
+    <section class="task" id="site-task" aria-label="Site task" hidden>
+      <p class="task-site" id="task-site"></p>
+      <p id="task-message" role="status" aria-live="polite"></p>
+      <form id="task-answer-form" hidden>
+        <label for="task-answer">Your answer</label>
+        <input id="task-answer" maxlength="500" autocomplete="off" required />
+        <button class="button primary" type="submit">Continue task</button>
+      </form>
+      <button class="text-button" id="task-stop" type="button">Stop task</button>
+    </section>
     <div class="model-status" id="model-status" hidden>
       <div class="model-caption"><span class="model-label" id="model-label">Preparing voice control…</span><span class="model-percent" id="model-percent" hidden></span></div>
       <div class="progress-track" id="model-progress" role="progressbar" aria-label="Model preparation" aria-valuemin="0" aria-valuemax="100"><div class="progress-fill" id="model-fill"></div></div>

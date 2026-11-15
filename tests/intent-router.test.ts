@@ -112,12 +112,8 @@ describe("IntentRouter", () => {
       expect(plan2?.actions[0]?.type).toBe("click");
     });
 
-    it("routes search queries", () => {
-      const plan = router.route("search for Albert Einstein");
-      expect(plan).not.toBeNull();
-      expect(plan?.intent.toLowerCase()).toContain("albert einstein");
-      expect(plan?.actions[0]?.type).toBe("type");
-      expect((plan?.actions[0] as any)?.text.toLowerCase()).toBe("albert einstein");
+    it("delegates search workflows instead of returning a typing-only success plan", () => {
+      expect(router.route("search for Albert Einstein")).toBeNull();
     });
 
     it("routes tab management commands", () => {

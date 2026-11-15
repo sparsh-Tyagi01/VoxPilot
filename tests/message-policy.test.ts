@@ -6,6 +6,7 @@ describe("runtime authority", () => {
     expect(authorizedSender("PLAN_PRODUCED", page, "vox")).toBe(false);
     expect(authorizedSender("PROFILE_CHANGED", page, "vox")).toBe(false);
     expect(authorizedSender("VAULT_PASSPHRASE_RESPONSE", page, "vox")).toBe(false);
+    for (const operation of ["START_SITE_TASK", "SITE_TASK_APPROVE", "SITE_TASK_REPLY", "CANCEL_SITE_TASK"]) expect(authorizedSender(operation, page, "vox")).toBe(false);
     expect(authorizedSender("IN_PAGE_CONFIRM", page, "vox")).toBe(true);
   });
   it("separates popup, offscreen and other extensions", () => {

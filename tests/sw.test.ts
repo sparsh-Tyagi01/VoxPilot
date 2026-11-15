@@ -58,7 +58,7 @@ const confirmedPlan: AgentPlan = {
   intent: "Submit form", risk: RiskTier.R3, requiresConfirmation: true,
   actions: [{ type: "click", handle: "e1", label: "Submit" }, { type: "done", summary: "Submitted." }],
 };
-const request = (message: unknown): Promise<Record<string, unknown>> => new Promise(resolve => { handleMessage(message, { id: "voxpilot", url: `chrome-extension://voxpilot/${["AGENT_STATE_CHANGED", "AUDIO_LEVEL", "MODEL_LOAD_PROGRESS", "TRANSCRIPT", "PLAN_PRODUCED", "REQUEST_SNAPSHOT", "OFFSCREEN_ERROR", "TTS_DONE", "LLM_TOKEN", "PERFORMANCE_SAMPLE", "RELAY_ACTION"].includes((message as { type: string }).type) ? "src/offscreen/offscreen.html" : "src/panel/panel.html"}` }, value => resolve(value as Record<string, unknown>)); });
+const request = (message: unknown): Promise<Record<string, unknown>> => new Promise(resolve => { handleMessage(message, { id: "voxpilot", url: `chrome-extension://voxpilot/${["START_SITE_TASK", "AGENT_STATE_CHANGED", "AUDIO_LEVEL", "MODEL_LOAD_PROGRESS", "TRANSCRIPT", "PLAN_PRODUCED", "REQUEST_SNAPSHOT", "OFFSCREEN_ERROR", "TTS_DONE", "LLM_TOKEN", "PERFORMANCE_SAMPLE", "RELAY_ACTION"].includes((message as { type: string }).type) ? "src/offscreen/offscreen.html" : "src/panel/panel.html"}` }, value => resolve(value as Record<string, unknown>)); });
 const executeCalls = () => api.tabs.sendMessage.mock.calls.filter(([, message]) => message.type === "EXECUTE_IN_PAGE");
 
 beforeEach(async () => {
@@ -74,6 +74,29 @@ beforeEach(async () => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("service worker orchestration", () => {
+  it("restores a site task as unknown after restart without retaining approval or replaying it", async () => {
+    session[SESSION_KEYS.SESSION_STATE] = { ...state(), siteTask: { version: 1, id: "site-1", tabId: 12, origin: "https://example.com", goal: "Add item", status: "awaiting_approval", steps: 0, message: "Waiting", approval: { id: "old", description: "Add item", context: "", destination: "", expiresAt: Date.now() + 60_000 } } };
+    const restored = await request({ type: "GET_SESSION_STATE" });
+    expect(restored).toMatchObject({ siteTask: { status: "unknown" } });
+    expect((restored["siteTask"] as Record<string, unknown>)["approval"]).toBeUndefined();
+    expect(executeCalls()).toHaveLength(0);
+    expect(await request({ type: "SITE_TASK_APPROVE", taskId: "site-1", approvalId: "old", approved: true })).toMatchObject({ ok: false });
+  });
+  it("routes a general task to the real offscreen decision boundary and publishes a scoped limitation", async () => {
+    api.tabs.sendMessage.mockImplementation((_tab, message, _options, callback) => {
+      callback(message.type === "SITE_OBSERVE" ? { type: "SITE_OBSERVATION", observation: {
+        documentId: "doc", observationId: "observation", stateKey: "state", url: "https://example.com", title: "Page", textSummary: "An article about books", elements: [], forms: [], coverage: { candidates: 0, inspected: 0, limited: false, frames: "top_only" }, capturedAt: 1, truncated: false,
+      } } : message.type === "SITE_VALIDATE" ? { type: "SITE_VALIDATION", valid: true } : { ok: true });
+    });
+    api.runtime.sendMessage.mockImplementation(async raw => {
+      const message = raw as { type: string };
+      return message.type === "SITE_DECIDE" ? { ok: true, decision: { kind: "unavailable", reason: "not_found_in_scope", message: "No cart control was found here." } } : { ok: true };
+    });
+    expect(await request({ type: "START_SITE_TASK", goal: "Add this to cart" })).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(session[SESSION_KEYS.SESSION_STATE]).toMatchObject({ siteTask: { status: "limited", message: "On the inspected page: No cart control was found here." } }));
+    expect(api.runtime.sendMessage.mock.calls.some(([message]) => (message as { type: string }).type === "SITE_DECIDE")).toBe(true);
+    expect(executeCalls()).toHaveLength(0);
+  });
   it("interrupts old execution after worker restart without replaying page actions", async () => {
     session[SESSION_KEYS.SESSION_STATE] = { ...state(), agentState: AgentState.Executing, currentPlan: confirmedPlan, executionId: "interrupted" };
     session[EXECUTION_RECEIPT_KEY] = { executionId: "interrupted", status: "running", updatedAt: Date.now(), steps: [{ index: 0, kind: "click", status: "dispatched" }] };

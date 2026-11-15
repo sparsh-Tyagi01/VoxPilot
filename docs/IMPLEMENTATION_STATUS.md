@@ -2,6 +2,8 @@
 
 Updated 15 November 2026. This tracks work against [the roadmap](ARCHITECTURE_AND_OPTIMIZATION_ROADMAP.md); the entire roadmap is not yet complete.
 
+The [site-aware agent architecture](SITE_AWARE_AGENT_ARCHITECTURE.md) now has an initial runtime implementation: selected-site task sessions, one-step model decisions, form context, independent policy, clarification, approval and UI-evidence checks. See [site-agent implementation and limits](SITE_AGENT_IMPLEMENTATION.md) for use, verification and remaining work. The entire architecture is not yet qualified for general production use.
+
 ## Implemented
 
 - **CPU-first Essential mode:** setup prepares speech recognition without waiting for WebGPU or a planner. Listening adds a bundled CPU speech detector. Unrecognized voice input returns quietly to listening; typed commands show a short text notice. The repeated spoken direct-command tutorial has been removed.

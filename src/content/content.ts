@@ -19,6 +19,8 @@ import { SnapshotBuilder } from "./snapshot.js";
 import { ActionExecutor } from "./executor.js";
 import { OverlayManager } from "./overlay/overlay.js";
 import type { VoxPilotMessage } from "@shared/messages.js";
+import { describeSiteTarget, waitForSiteObservation } from "./site-observation.js";
+import { executeSiteAction } from "./site-executor.js";
 
 // ─── Module-level singletons ─────────────────────────────────────────────────
 
@@ -35,8 +37,21 @@ const executor = new ActionExecutor(snapshotBuilder.handles);
 chrome.runtime.onMessage.addListener(
   (rawMsg: unknown, _sender: chrome.runtime.MessageSender, sendResponse: (r: unknown) => void): boolean => {
     const msg = rawMsg as VoxPilotMessage;
+    if (_sender.id !== chrome.runtime.id) return false;
 
     switch (msg.type) {
+      case "SITE_VALIDATE": {
+        const target = snapshotBuilder.handles.resolve(msg.handle);
+        const sameDocument = snapshotBuilder.documentId === msg.documentId;
+        sendResponse({ type: "SITE_VALIDATION", valid: msg.handle === "" && msg.fingerprint === "" ? sameDocument : Boolean(target?.isConnected && sameDocument && describeSiteTarget(target, snapshotBuilder.handles).fingerprint === msg.fingerprint) });
+        return false;
+      }
+      case "SITE_OBSERVE":
+        void waitForSiteObservation(snapshotBuilder, msg.since).then(observation => sendResponse({ type: "SITE_OBSERVATION", observation })).catch(() => sendResponse({ ok: false, error: "This page could not be inspected." }));
+        return true;
+      case "SITE_EXECUTE":
+        void executeSiteAction(snapshotBuilder, msg.action, msg.documentId, msg.fingerprint).then(result => sendResponse({ type: "SITE_STEP_RESULT", result })).catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : "Page interaction failed." }));
+        return true;
 
       case "CAPTURE_SNAPSHOT": {
         // Build DOM snapshot synchronously (must complete in ≤50ms per NFR-PERF-08)

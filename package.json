@@ -9,6 +9,7 @@
     "build:prod": "vite build --mode production",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
+    "test:browser": "node scripts/site-browser-smoke.mjs",
     "lint": "eslint src",
     "check": "npm run type-check && npm run lint && npm test && npm run build:prod && node scripts/verify-build.mjs"
   },

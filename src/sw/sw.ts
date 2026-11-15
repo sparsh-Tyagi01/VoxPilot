@@ -38,6 +38,9 @@ import { RiskClassifier } from "../offscreen/agent/risk-classifier.js";
 import { executeBrowserPlan } from "./plan-execution.js";
 import { ExecutionJournal } from "./execution-journal.js";
 import { groundMacroActions } from "./macro-grounding.js";
+import { SiteTaskRunner } from "./site-task-runner.js";
+import { SITE_TERMINAL } from "@shared/site-task.js";
+import { parseSiteDecision } from "@shared/site-schema.js";
 
 // In-flight locks serialize events; durable state remains in storage.session.
 const metrics = new PerformanceMetrics();
@@ -51,6 +54,65 @@ let listeningOperation: Promise<void> = Promise.resolve();
 let offscreenCreation: Promise<void> | null = null;
 const MODEL_STATUS_KEY = "model_load_status";
 const canonicalProfile = normalizeModelProfile;
+const siteTasks = new SiteTaskRunner({
+  observe: async (tabId, after) => {
+    const result = await sendToContentScript(tabId, { type: "SITE_OBSERVE", ...(after ? { since: after.stateKey } : {}) });
+    if (result?.type !== "SITE_OBSERVATION" || !result.observation.documentId) throw new Error("I could not inspect this page. Refresh it or use a supported webpage.");
+    return result.observation;
+  },
+  decide: async request => {
+    const response = await chrome.runtime.sendMessage({ type: "SITE_DECIDE", request, target: "offscreen" });
+    if (!response?.ok || !response.decision) throw new Error(response?.error ?? "The optional planner is unavailable. Basic controls remain available.");
+    return parseSiteDecision(JSON.stringify(response.decision));
+  },
+  execute: async (tabId, action, observation, fingerprint) => {
+    const target = action.type === "click" ? observation.elements.find(el => el.handle === action.handle) : undefined;
+    const destination = action.type === "navigate" ? action.url : target?.href;
+    if (destination) {
+      const link = target ?? observation.elements.find(el => el.href === destination);
+      if (!link) throw new Error("The navigation target is no longer observed.");
+      const validation = await sendToContentScript(tabId, { type: "SITE_VALIDATE", documentId: observation.documentId, handle: link.handle, fingerprint: link.fingerprint });
+      if (validation?.type !== "SITE_VALIDATION" || !validation.valid) throw new Error("The navigation target changed before execution.");
+      const updated = await chrome.tabs.update(tabId, { url: destination });
+      if (updated.status === "loading") await new Promise<void>((resolve, reject) => {
+        const listener = (id: number, change: chrome.tabs.TabChangeInfo) => { if (id === tabId && change.status === "complete") { cleanup(); resolve(); } };
+        const cleanup = () => { clearTimeout(timer); chrome.tabs.onUpdated.removeListener(listener); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Navigation did not finish in time.")); }, 8000);
+        chrome.tabs.onUpdated.addListener(listener);
+        void chrome.tabs.get(tabId).then(tab => { if (tab.status === "complete") { cleanup(); resolve(); } }).catch(error => { cleanup(); reject(error); });
+      });
+      return { dispatched: true, controlVerified: false, navigationExpected: true };
+    }
+    const response = await sendToContentScript(tabId, { type: "SITE_EXECUTE", action, documentId: observation.documentId, fingerprint });
+    if (response?.type !== "SITE_STEP_RESULT" || typeof response.result?.dispatched !== "boolean" || typeof response.result.controlVerified !== "boolean" || typeof response.result.navigationExpected !== "boolean") throw new Error("The page did not acknowledge the action.");
+    return response.result;
+  },
+  current: async (tabId, origin, documentId) => {
+    const state = await getSessionState();
+    const selected = await getTargetTab();
+    if (!state.listeningEnabled || selected?.id !== tabId) return false;
+    if (!selected.url || new URL(selected.url).origin !== origin) return false;
+    if (documentId) {
+      const validation = await sendToContentScript(tabId, { type: "SITE_VALIDATE", documentId, handle: "", fingerprint: "" });
+      return validation?.type === "SITE_VALIDATION" && validation.valid;
+    }
+    return true;
+  },
+  publish: async task => {
+    const terminal = SITE_TERMINAL.has(task.status);
+    const previous = await getSessionState();
+    await updateSessionState({ siteTask: task, agentState: terminal || task.status === "awaiting_answer" ? (previous.listeningEnabled ? AgentState.Listening : AgentState.Idle)
+      : task.status === "awaiting_approval" ? AgentState.Confirming : task.status === "executing" ? AgentState.Executing : AgentState.Planning });
+    await relayToOffscreen({ type: "SITE_TASK_STATE", state: task });
+    if (terminal) await journal.finish(task.id, task.status === "completed" || task.status === "answered");
+    await updateBadge(previous.listeningEnabled);
+    if (task.status === "awaiting_approval") await chrome.action.setBadgeText({ text: "?" });
+  },
+  receipt: async (taskId, index, action, status) => {
+    if (index === 0 && status === "dispatched") await journal.begin(taskId);
+    await journal.step(taskId, index, action.type, status);
+  },
+});
 
 // ─── Default Session State ────────────────────────────────────────────────────
 
@@ -147,6 +209,13 @@ function recoverInterruptedExecution(): Promise<void> {
   recovery ??= (async () => {
     const interruptedId = await journal.recover();
     const state = await getSessionState();
+    if (state.siteTask && !SITE_TERMINAL.has(state.siteTask.status)) {
+      const task = { ...state.siteTask, status: "unknown" as const, message: "The previous task was interrupted. Check the page before starting again." };
+      delete task.approval; delete task.question;
+      await updateSessionState({ siteTask: task, currentPlan: null, executionId: null, agentState: state.listeningEnabled ? AgentState.Listening : AgentState.Idle });
+      if (await hasOffscreenDocument()) await relayToOffscreen({ type: "SITE_TASK_STATE", state: task });
+      return;
+    }
     if (state.agentState !== AgentState.Executing || !state.currentPlan) return;
     if (interruptedId && state.executionId !== interruptedId) return;
     await updateSessionState({ currentPlan: null, executionId: null, currentDocumentId: null, agentState: state.listeningEnabled ? AgentState.Listening : AgentState.Idle });
@@ -204,6 +273,7 @@ async function completePlan(tabId: number, plan: AgentPlan): Promise<void> {
  * Dispatch an AgentPlan to the appropriate tab or overlay.
  */
 async function dispatchPlan(plan: AgentPlan, documentId?: string): Promise<boolean> {
+  if (siteTasks.active) throw new Error("Finish or stop the current site task first.");
   new PlanValidator().validate(plan);
   const previous = await getSessionState();
   const targetTabId = previous.activeTabId ?? (await getTargetTab())?.id;
@@ -368,6 +438,7 @@ async function updateBadge(listening: boolean): Promise<void> {
 async function toggleListeningNow(): Promise<void> {
   const state = await getSessionState();
   if (state.listeningEnabled) {
+    siteTasks.cancel();
     await relayToOffscreen({ type: "STOP_AUDIO" });
     await updateSessionState({ listeningEnabled: false, agentState: AgentState.Idle, currentPlan: null, executionId: null });
     await updateBadge(false);
@@ -441,6 +512,20 @@ async function handleMessage(
 ): Promise<void> {
   await recoverInterruptedExecution();
   switch (msg.type) {
+    case "START_SITE_TASK": {
+      const current = await getSessionState();
+      if (!current.listeningEnabled || current.currentPlan) throw new Error("Start listening and finish the current command first.");
+      const tab = await getTargetTab();
+      if (tab?.id === undefined || !tab.url || !/^https?:\/\//.test(tab.url)) throw new Error("Open a regular webpage before starting a site task.");
+      await siteTasks.start(msg.goal, tab.id, new URL(tab.url).origin);
+      sendResponse({ ok: true }); break;
+    }
+    case "CANCEL_SITE_TASK":
+      siteTasks.cancel(); sendResponse({ ok: true }); break;
+    case "SITE_TASK_REPLY":
+      sendResponse({ ok: siteTasks.reply(msg.taskId, msg.answer), error: "There is no matching question awaiting an answer." }); break;
+    case "SITE_TASK_APPROVE":
+      sendResponse({ ok: typeof msg.approved === "boolean" && siteTasks.approve(msg.taskId, msg.approvalId, msg.approved), error: "This approval expired or no longer matches the pending action." }); break;
     // ── Panel → SW ─────────────────────────────────────────────────────────
     case "TOGGLE_LISTENING": {
       await toggleListening();
@@ -498,6 +583,7 @@ async function handleMessage(
     }
 
     case "CANCEL_PLAN": {
+      siteTasks.cancel();
       const state = await getSessionState();
       if (state.activeTabId !== null) await sendToContentScript(state.activeTabId, { type: "HIDE_CONFIRMATION" }).catch(() => {});
       await relayToOffscreen({ type: "EXECUTE_TEXT_COMMAND", text: "stop" });
@@ -549,7 +635,7 @@ async function handleMessage(
       if (!state.listeningEnabled) throw new Error("Start listening before sending a command.");
       if (text) {
         const target = await getTargetTab();
-        await updateSessionState({ lastTranscript: text, activeTabId: target?.id ?? state.activeTabId });
+        await updateSessionState({ lastTranscript: text, activeTabId: target?.id ?? state.activeTabId, ...(!siteTasks.active ? { siteTask: null } : {}) });
         await relayToOffscreen({ type: "EXECUTE_TEXT_COMMAND", text });
       }
       sendResponse({ ok: true });
@@ -569,7 +655,7 @@ async function handleMessage(
       await updateSessionState({
         ...(tab?.id !== undefined ? { activeTabId: tab.id } : {}),
         lastTranscript: msg.text,
-        agentState: msg.isFinal ? AgentState.Routing : AgentState.Transcribing,
+        ...(!siteTasks.active ? { agentState: msg.isFinal ? AgentState.Routing : AgentState.Transcribing, siteTask: null } : {}),
       });
       // Forward to panel for live display
       broadcastToPanel({ type: "TRANSCRIPT_UPDATE", text: msg.text, isFinal: msg.isFinal });
@@ -734,6 +820,7 @@ async function handleMessage(
     }
 
     case "AGENT_STATE_CHANGED": {
+      if (siteTasks.active) { sendResponse({ ok: true }); break; }
       const state = await getSessionState();
       const nextState = !state.listeningEnabled && msg.state === AgentState.Listening ? AgentState.Idle : msg.state;
       await updateSessionState({ agentState: nextState,
@@ -893,6 +980,7 @@ async function handleMessage(
     // ─── Settings / Model Management ─────────────────────────────────────────
 
     case "PROFILE_CHANGED": {
+      siteTasks.cancel();
       // User changed model profile in settings — persist and notify offscreen.
       await chrome.storage.local.set({ selected_profile: msg.profile });
       // Forward to offscreen so LLM/STT workers can reload on next request.

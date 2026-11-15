@@ -42,12 +42,17 @@ import { PlanValidator } from "./plan-validator.js";
 import { RiskClassifier } from "./risk-classifier.js";
 import { UndoStack } from "./undo-stack.js";
 import { sendToSW } from "../offscreen.js";
+import { decideSiteStep } from "./site-planner.js";
+import { SITE_TERMINAL } from "@shared/site-task.js";
+import type { SiteDecisionRequest, SiteTaskState, SiteDecision } from "@shared/site-task.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 /** Configuration for AgentCore. */
 export interface AgentCoreConfig {
   tts: TTS;
+  /** Migration switch for integration qualification; the shipped runtime defaults on. */
+  siteAware?: boolean;
 }
 
 /** STT worker message types (inbound). */
@@ -73,6 +78,8 @@ type LLMMessage =
  * It owns the STT and LLM workers and manages the agent state machine.
  */
 export class AgentCore {
+  private siteTask: SiteTaskState | null = null;
+  private readonly siteAware: boolean;
   private state: AgentState = AgentState.Idle;
   private readonly tts: TTS;
   private readonly intentRouter: IntentRouter;
@@ -151,6 +158,7 @@ export class AgentCore {
   private isLlmReady = false;
 
   constructor(config: AgentCoreConfig) {
+    this.siteAware = config.siteAware !== false;
     this.tts = config.tts;
     this.intentRouter = new IntentRouter();
     this.planner = new Planner();
@@ -278,7 +286,7 @@ export class AgentCore {
       // ── Step 1: Transcribe ───────────────────────────────────────────────
       const transcript = await this.measure("recognition", () => this.transcribe(audio));
       if (operationId !== this.operationId) return;
-      if (bargeIn) {
+      if (bargeIn && this.siteTask?.status !== "awaiting_answer") {
         if (this.intentRouter.isKillCommand(transcript.text)) this.triggerKill();
         return;
       }
@@ -321,6 +329,11 @@ export class AgentCore {
    */
   private async processUtterance(text: string, source: "voice" | "text" = "voice"): Promise<void> {
     if (this.intentRouter.isKillCommand(text)) { this.triggerKill(); return; }
+    if (this.siteTask && !SITE_TERMINAL.has(this.siteTask.status)) {
+      if (this.siteTask.status === "awaiting_answer" && text.trim()) await sendToSW({ type: "SITE_TASK_REPLY", taskId: this.siteTask.id, answer: text.trim() });
+      else if (source === "text") await sendToSW({ type: "COMMAND_NOTICE", text: "Finish or stop the current task before starting another." });
+      return;
+    }
     if (!text.trim() || this.commandBusy || this.sttResolve || this.state === AgentState.Confirming || this.state === AgentState.Executing) return;
     this.commandBusy = true;
     this.currentSnapshot = null;
@@ -343,7 +356,9 @@ export class AgentCore {
       }
 
       // ── Step 3: Intent Routing ────────────────────────────────────────────
-      const fastPlan = this.intentRouter.route(text);
+      const routed = this.intentRouter.route(text);
+      // A search is a workflow, not a typing shortcut with an optimistic summary.
+      const fastPlan = routed?.actions.some(action => action.type === "type" && action.handle === "search") ? null : routed;
 
       let plan: AgentPlan;
       let snapshot: PageSnapshot | null = null;
@@ -363,6 +378,10 @@ export class AgentCore {
         this.transitionTo(this.listeningEnabled ? AgentState.Listening : AgentState.Idle);
         await sendToSW({ type: "AGENT_STATE_CHANGED", state: this.state });
         if (source === "text") await sendToSW({ type: "COMMAND_NOTICE", text: "Command not recognized. Use a direct command or choose Assist in Settings." });
+        return;
+      } else if (this.siteAware) {
+        this.transitionTo(AgentState.Planning);
+        await sendToSW({ type: "START_SITE_TASK", goal: text });
         return;
       } else {
         // ── Step 4: Autonomous Planning ─────────────────────────────────────
@@ -492,6 +511,7 @@ export class AgentCore {
   }
 
   onExecutionDone(): void {
+    if (this.siteTask && !SITE_TERMINAL.has(this.siteTask.status)) return;
     if (![AgentState.Executing, AgentState.Speaking, AgentState.Confirming].includes(this.state)) return;
     console.log("[AgentCore] Execution complete — returning to Listening state.");
     this.currentSnapshot = null;
@@ -632,6 +652,7 @@ export class AgentCore {
   }
 
   private handleKill(): void {
+    if (this.siteTask && !SITE_TERMINAL.has(this.siteTask.status)) void sendToSW({ type: "CANCEL_SITE_TASK" });
     console.log("[AgentCore] Kill switch triggered — returning to Listening.");
     this.operationId++;
     this.speechStarted = false;
@@ -656,6 +677,21 @@ export class AgentCore {
   }
 
   // ─── Private Helpers ───────────────────────────────────────────────────────
+  onSiteTaskState(state: SiteTaskState): void {
+    this.siteTask = state;
+    if (["cancelled", "unknown", "limited"].includes(state.status)) {
+      for (const [requestId, fail] of this.llmErrorCallbacks) { this.abortLLM(requestId); fail("Site task cancelled"); }
+      this.llmResultCallbacks.clear(); this.llmErrorCallbacks.clear(); this.llmTokenCallbacks.clear();
+    }
+    this.transitionTo(SITE_TERMINAL.has(state.status) || state.status === "awaiting_answer" ? (this.listeningEnabled ? AgentState.Listening : AgentState.Idle)
+      : state.status === "awaiting_approval" ? AgentState.Confirming : state.status === "executing" ? AgentState.Executing : AgentState.Planning);
+  }
+
+  async decideSiteTask(request: SiteDecisionRequest): Promise<SiteDecision> {
+    if (this.initializedProfile === ModelProfile.Essential) throw new Error("Choose Assist or another AI profile in Settings for general site tasks.");
+    await this.ensurePlannerReady();
+    return this.measure("planning", () => decideSiteStep(this.buildPlannerLLMInterface(), request));
+  }
 
   private groundFastPlan(plan: AgentPlan, snapshot: PageSnapshot): AgentPlan {
     const actions = plan.actions.map(action => {
