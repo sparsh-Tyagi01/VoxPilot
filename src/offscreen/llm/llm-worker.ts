@@ -1,5 +1,5 @@
 /** WebLLM worker. One engine operation at a time; aborts bypass the queue. */
-import { isGPUDeviceLoss } from "./gpu-errors.js";
+import { gpuFailureCode, type GPUFailureCode } from "./gpu-errors.js";
 import * as webllm from "@mlc-ai/web-llm";
 import { AGENT_PLAN_GENERATION_SCHEMA } from "@shared/schema.js";
 
@@ -23,37 +23,64 @@ type LLMWorkerInput =
 /** Messages sent to the main offscreen thread. */
 type LLMWorkerOutput =
   | { type: "ready" }
-  | { type: "cancelled"; requestId: string }
+  | { type: "cancelled"; requestId: string; retired?: boolean }
   | { type: "progress"; loaded: number; total: number; text: string; downloading?: boolean }
   | { type: "token"; requestId: string; delta: string }
   | { type: "result"; requestId: string; text: string; usage: TokenUsage }
-  | { type: "error"; requestId: string; message: string; code?: "GPU_DEVICE_LOST"; stack?: string };
+  | { type: "error"; requestId: string; message: string; code?: GPUFailureCode; stack?: string };
 
 
 let engine: webllm.MLCEngine | null = null;
 let currentModelId = "";
 let busy = false;
 let activeRequest: string | null = null;
+let cancelledRequest: string | null = null;
 let aborted = false;
-let deviceLost = false;
+let invalidated: GPUFailureCode | null = null;
 
 function post(msg: LLMWorkerOutput): void { self.postMessage(msg); }
 function postError(requestId: string, err: unknown): void {
   post({ type: "error", requestId, message: err instanceof Error ? err.message : String(err) });
 }
 
+function retireEngine(error: unknown, requestId = activeRequest ?? cancelledRequest ?? ""): void {
+  const code = gpuFailureCode(error);
+  if (!code || invalidated) return;
+  invalidated = code;
+  // Do not unmap/destroy again or wait for GPU sync on an invalid native engine.
+  // Only the owner terminates this worker; no failed command is replayed here.
+  engine = null;
+  if (aborted && code === "GPU_BUFFER_INVALIDATED" && requestId) {
+    post({ type: "cancelled", requestId, retired: true });
+  } else {
+    post({ type: "error", requestId, code, message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+// Native GPU readback promises can reject outside the generation promise. Retire
+// once and silence only this recognized failure; unrelated rejections stay visible.
+self.addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
+  if (!gpuFailureCode(event.reason)) return;
+  event.preventDefault();
+  retireEngine(event.reason);
+});
+
 async function unload(): Promise<void> {
   const previous = engine;
   engine = null;
   if (previous) {
     try { await previous.unload(); }
-    catch (err) { console.warn("[LLM Worker] Engine cleanup failed:", err); }
+    catch (err) {
+      if (gpuFailureCode(err)) retireEngine(err);
+      else console.warn("[LLM Worker] Engine cleanup failed:", err);
+    }
   }
 }
 
 async function loadEngine(modelId: string): Promise<void> {
   if (engine && currentModelId === modelId) return;
   await unload();
+  if (invalidated) return;
   currentModelId = modelId;
   // Bound KV-cache memory. Prefill batch size is compiled into the model library.
   const appConfig = {
@@ -63,7 +90,7 @@ async function loadEngine(modelId: string): Promise<void> {
       overrides: { ...record.overrides, context_window_size: 4096 },
     })),
   };
-  engine = await webllm.CreateMLCEngine(modelId, {
+  const loaded = await webllm.CreateMLCEngine(modelId, {
     appConfig,
     logLevel: "WARN",
     initProgressCallback: report => post({
@@ -71,6 +98,7 @@ async function loadEngine(modelId: string): Promise<void> {
       downloading: /download|fetch/i.test(report.text) && !/cache/i.test(report.text),
     }),
   }, { context_window_size: 4096 });
+  if (!invalidated) engine = loaded;
 }
 
 async function generate(msg: Extract<LLMWorkerInput, { type: "generate" }>): Promise<void> {
@@ -78,7 +106,7 @@ async function generate(msg: Extract<LLMWorkerInput, { type: "generate" }>): Pro
     if (!currentModelId) throw new Error("AI planner is not loaded. Load a model first.");
     await loadEngine(currentModelId);
   }
-  if (aborted) return;
+  if (aborted || invalidated) return;
   // This WebLLM version passes schema straight to the native string binding.
   // Omitting it causes GrammarMatcherInitError and poisons subsequent requests.
   const schema = msg.grammar ?? JSON.stringify(AGENT_PLAN_GENERATION_SCHEMA);
@@ -96,7 +124,7 @@ async function generate(msg: Extract<LLMWorkerInput, { type: "generate" }>): Pro
   let usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   let finishReason: string | null = null;
   for await (const chunk of stream) {
-    if (aborted) break;
+    if (aborted || invalidated) break;
     const delta = chunk.choices[0]?.delta?.content ?? "";
     finishReason = chunk.choices[0]?.finish_reason ?? finishReason;
     if (delta) {
@@ -105,7 +133,7 @@ async function generate(msg: Extract<LLMWorkerInput, { type: "generate" }>): Pro
     }
     if (chunk.usage) usage = chunk.usage;
   }
-  if (aborted) return;
+  if (aborted || invalidated) return;
   if (finishReason === "length") throw new Error("Plan exceeded output limit. Try a shorter command.");
   if (!fullText.trim()) throw new Error("AI planner returned an empty plan. Please try again.");
   post({ type: "result", requestId: msg.requestId, text: fullText, usage });
@@ -116,13 +144,19 @@ self.addEventListener("message", (event: MessageEvent<LLMWorkerInput>) => {
   if (msg.type === "abort") {
     if (activeRequest === msg.requestId) {
       aborted = true;
+      cancelledRequest = msg.requestId;
       // Checking a flag between tokens alone does not stop WebGPU inference.
-      void engine?.interruptGenerate().catch(err => console.warn("[LLM Worker] Interrupt failed:", err));
+      const failed = (err: unknown) => {
+        if (gpuFailureCode(err)) retireEngine(err);
+        else console.warn("[LLM Worker] Interrupt failed:", err);
+      };
+      try { void Promise.resolve(engine?.interruptGenerate()).catch(failed); }
+      catch (err) { failed(err); }
     }
     return;
   }
-  if (deviceLost) {
-    post({ type: "error", requestId: msg.type === "generate" ? msg.requestId : "", code: "GPU_DEVICE_LOST", message: "The GPU device was lost; this worker must be replaced." });
+  if (invalidated) {
+    post({ type: "error", requestId: msg.type === "generate" ? msg.requestId : "", code: invalidated, message: "The GPU engine is unavailable; this worker must be replaced." });
     return;
   }
   if (busy) {
@@ -131,30 +165,27 @@ self.addEventListener("message", (event: MessageEvent<LLMWorkerInput>) => {
   }
   busy = true;
   aborted = false;
+  cancelledRequest = null;
   activeRequest = msg.type === "generate" ? msg.requestId : null;
   void (async () => {
     try {
       if (msg.type === "load") {
         await loadEngine(msg.modelId);
-        post({ type: "ready" });
+        if (!invalidated) post({ type: "ready" });
       } else {
         await generate(msg);
       }
     } catch (err) {
-      if (isGPUDeviceLoss(err)) {
-        // WebLLM already unloads on device.lost. A second unload can race or hang
-        // on GPU sync. Notify the owner immediately so it can terminate this realm.
-        deviceLost = true;
-        engine = null;
-        post({ type: "error", requestId: msg.type === "generate" ? msg.requestId : "", code: "GPU_DEVICE_LOST", message: err instanceof Error ? err.message : String(err) });
-      } else {
+      if (gpuFailureCode(err)) {
+        retireEngine(err, msg.type === "generate" ? msg.requestId : "");
+      } else if (!invalidated) {
         await unload();
-        if (!aborted) postError(msg.type === "generate" ? msg.requestId : "", err);
+        if (!aborted && !invalidated) postError(msg.type === "generate" ? msg.requestId : "", err);
       }
     } finally {
       activeRequest = null;
       busy = false;
-      if (aborted && msg.type === "generate") post({ type: "cancelled", requestId: msg.requestId });
+      if (aborted && !invalidated && msg.type === "generate") post({ type: "cancelled", requestId: msg.requestId });
     }
   })();
 });

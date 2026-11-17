@@ -125,7 +125,7 @@
       <span class="logo" aria-hidden="true">🎙️</span>
       <div>
         <div class="product-name">VoxPilot</div>
-        <div class="tagline">Hands-free browser control · 100% on-device</div>
+        <div class="tagline">Hands-free browser control · local speech</div>
       </div>
     </div>
 
@@ -140,19 +140,18 @@
     <!-- Step 0: Privacy -->
     <div class="step-panel active" id="step-0" role="tabpanel" aria-labelledby="step-ind-0">
       <h2>Privacy-first by design</h2>
-      <p>VoxPilot runs entirely on your device. Here's what that means:</p>
+      <p>VoxPilot starts in local mode. Hosted planning is optional and can only be enabled in Settings.</p>
 
       <ul class="privacy-list">
         <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Your voice is never sent to any server</li>
-        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Page content stays on your device</li>
-        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> No accounts, no analytics, no telemetry</li>
-        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Personal data encrypted with AES-256</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Page content stays local unless you enable Hosted assist</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> No analytics or telemetry; hosted services may require an account</li>
+        <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Vault data encrypted with AES-256</li>
         <li class="privacy-item"><span class="check" aria-hidden="true">✓</span> Delete all data any time from settings</li>
       </ul>
 
       <p style="font-size:12px; color: var(--muted);">
-        One-time model download required (up to 1.2 GB for the Standard profile).
-        All subsequent processing is fully local.
+        Local speech models download during setup. Local profiles keep inference on your device. Hosted assist sends general commands and selected page context to your chosen service only after you enable it in Settings.
       </p>
 
       <div class="btn-row">
@@ -189,7 +188,7 @@
     <!-- Step 2: Model Selection & Download -->
     <div class="step-panel" id="step-2" role="tabpanel" aria-labelledby="step-ind-2">
       <h2>Choose your profile</h2>
-      <p>Essential is recommended for everyday commands. AI planning is optional and loads only when needed.</p>
+      <p>Essential provides basic controls. Assist CPU adds experimental local planning without a GPU. Larger GPU planners are optional.</p>
 
       <div role="radiogroup" aria-label="Model profile selection">
         <label class="model-option selected" id="label-lite">
@@ -201,10 +200,19 @@
           </div>
         </label>
 
+        <label class="model-option" id="label-cpu">
+          <input type="radio" name="profile" value="cpu" id="radio-cpu" />
+          <div class="model-info">
+            <div class="model-name">Assist CPU — experimental</div>
+            <div class="model-desc">No GPU required. General site planning is not qualified and may reject requests. Basic commands remain available.</div>
+            <div class="model-size">About 520 MB of planner files, downloaded during setup and cached</div>
+          </div>
+        </label>
+
         <label class="model-option" id="label-standard">
           <input type="radio" name="profile" value="fast" id="radio-standard" />
           <div class="model-info">
-            <div class="model-name">Assist</div>
+            <div class="model-name">Assist GPU</div>
             <div class="model-desc">Whisper tiny with optional Llama 3.2 1B planning. Requires a compatible GPU for planning.</div>
             <div class="model-size">AI model downloads on first complex request</div>
           </div>

@@ -70,6 +70,20 @@ try {
   const privatePage = observeSite(builder);
   assert(!JSON.stringify(privatePage).includes("secret-value-never-export"), "Password leaked into observation");
   cases.push("sensitive field values excluded from observations");
+  const fields = document.createElement("form");
+  fields.innerHTML = '<label>Private message <textarea>private-editor-default-never-export</textarea></label><div contenteditable="true" role="textbox">private-editable-never-export</div>';
+  document.querySelector("main")!.appendChild(fields);
+  const protectedObservation = observeSite(builder);
+  assert(!JSON.stringify(protectedObservation).match(/private-editor-default-never-export|private-editable-never-export/), "Editable contents leaked through labels, prose, context or fingerprints");
+  assert(protectedObservation.elements.some(el => el.label === "Private message"), "Safe field label was lost while excluding contents");
+  cases.push("editable contents excluded from label, context, prose and form fingerprint");
+  const hidden = document.createElement("div");
+  hidden.innerHTML = '<p style="display:none">private-css-hidden-never-export</p><div style="opacity:0"><span>private-invisible-parent-never-export</span><button>Invisible action</button></div><p style="display:contents">Public display contents label</p>';
+  document.querySelector("main")!.appendChild(hidden);
+  const visibleOnly = observeSite(builder);
+  assert(!JSON.stringify(visibleOnly).match(/private-css-hidden-never-export|private-invisible-parent-never-export|Invisible action/), "Hidden content became model context or outcome evidence");
+  assert(visibleOnly.textSummary?.includes("Public display contents label"), "Visible display:contents prose was omitted");
+  cases.push("CSS-hidden content and invisible actions excluded from context and outcome evidence");
   let stale = false;
   try { await executeSiteAction(builder, { type: "click", handle: privatePage.elements[0]!.handle }, "another-document", ""); } catch { stale = true; }
   assert(stale, "Document binding failed");

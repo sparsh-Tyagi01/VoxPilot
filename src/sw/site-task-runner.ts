@@ -1,6 +1,7 @@
 import type { SiteAction, SiteDecision, SiteDecisionRequest, SiteObservation, SiteStepResult, SiteTaskState } from "@shared/site-task.js";
 import { SITE_TERMINAL } from "@shared/site-task.js";
 import { checkSitePolicy, siteChanged, visibleSiteText } from "./site-policy.js";
+import { SECRET_INPUT_PATTERN } from "@shared/site-secrets.js";
 
 interface Dependencies {
   observe(tabId: number, after?: SiteObservation): Promise<SiteObservation>;
@@ -9,6 +10,7 @@ interface Dependencies {
   current(tabId: number, origin: string, documentId?: string): Promise<boolean>;
   publish(state: SiteTaskState): Promise<void>;
   receipt(taskId: string, index: number, action: SiteAction, state: "dispatched" | "acknowledged" | "uncertain"): Promise<void>;
+  cancelDecision?(): void;
 }
 export class SiteTaskRunner {
   private state: SiteTaskState | null = null;
@@ -17,6 +19,7 @@ export class SiteTaskRunner {
   private approval: ((approved: boolean) => void) | null = null;
   constructor(private readonly deps: Dependencies) {}
   get active(): boolean { return Boolean(this.state && !SITE_TERMINAL.has(this.state.status)); }
+  isPlanning(taskId: string): boolean { return this.state?.id === taskId && this.state.status === "planning"; }
   async start(goal: string, tabId: number, origin: string): Promise<void> {
     if (this.active) throw new Error("Finish or stop the current task before starting another.");
     if (typeof goal !== "string" || !goal.trim() || goal.length > 500) throw new Error("Describe the task in 500 characters or fewer.");
@@ -25,7 +28,7 @@ export class SiteTaskRunner {
     await this.deps.publish({ ...this.state });
     void this.run(this.state, this.controller.signal).catch(() => { if (this.state) this.state.status = "limited"; });
   }
-  cancel(): void { this.controller?.abort(); this.response?.(""); this.approval?.(false); }
+  cancel(): void { this.controller?.abort(); this.deps.cancelDecision?.(); this.response?.(""); this.approval?.(false); }
   reply(taskId: string, answer: string): boolean {
     if (this.state?.id !== taskId || this.state.status !== "awaiting_answer" || typeof answer !== "string" || !answer.trim() || answer.length > 500 || !this.response) return false;
     const respond = this.response; this.response = null; respond(answer.trim()); return true;
@@ -71,7 +74,7 @@ export class SiteTaskRunner {
         const decision = await bounded(this.deps.decide({ taskId: task.id, goal: task.goal, observation, history: history.slice(-8), answers: answers.slice(-4), remainingMs }), remainingMs);
         calls++; await check();
         if (decision.kind === "ask") {
-          if (/password|cvv|card number|one.time.code|verification code/i.test(decision.question)) throw new Error("Complete authentication and payment details directly on the site; do not dictate secrets to the agent.");
+          if (SECRET_INPUT_PATTERN.test(decision.question)) throw new Error("Complete authentication, API credentials and payment details directly on the site; do not dictate secrets to the agent.");
           if (answers.length >= 4) throw new Error("More information is still needed. Please start a more specific request.");
           task.question = decision.question;
           const waitStarted = Date.now();

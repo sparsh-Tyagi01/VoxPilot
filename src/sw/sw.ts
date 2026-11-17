@@ -28,7 +28,7 @@ import type { ModelLoadProgressMsg, VoxPilotMessage } from "@shared/messages.js"
 import { normalizeModelProfile } from "@shared/model-profiles.js";
 import { authorizedSender } from "./message-policy.js";
 import { PerformanceMetrics } from "../diagnostics/metrics.js";
-import { AgentState } from "@shared/types.js";
+import { AgentState, ModelProfile } from "@shared/types.js";
 import type { SessionState, AgentPlan } from "@shared/types.js";
 import { loadMacros, saveMacros, generateMacroId, deriveTriggerWords } from "@shared/macros.js";
 import { appendHistory, clearHistory, loadHistory, generateHistoryId } from "@shared/history.js";
@@ -41,6 +41,8 @@ import { groundMacroActions } from "./macro-grounding.js";
 import { SiteTaskRunner } from "./site-task-runner.js";
 import { SITE_TERMINAL } from "@shared/site-task.js";
 import { parseSiteDecision } from "@shared/site-schema.js";
+import { HostedPlanner } from "./hosted-planner.js";
+import { readHostedRuntimeSettings, hostedSettingsStatus, saveHostedSettings } from "./hosted-settings.js";
 
 // In-flight locks serialize events; durable state remains in storage.session.
 const metrics = new PerformanceMetrics();
@@ -54,13 +56,22 @@ let listeningOperation: Promise<void> = Promise.resolve();
 let offscreenCreation: Promise<void> | null = null;
 const MODEL_STATUS_KEY = "model_load_status";
 const canonicalProfile = normalizeModelProfile;
+const hostedPlanner = new HostedPlanner(readHostedRuntimeSettings);
 const siteTasks = new SiteTaskRunner({
+  cancelDecision: () => hostedPlanner.cancel(),
   observe: async (tabId, after) => {
     const result = await sendToContentScript(tabId, { type: "SITE_OBSERVE", ...(after ? { since: after.stateKey } : {}) });
     if (result?.type !== "SITE_OBSERVATION" || !result.observation.documentId) throw new Error("I could not inspect this page. Refresh it or use a supported webpage.");
     return result.observation;
   },
   decide: async request => {
+    const { selected_profile } = await chrome.storage.local.get("selected_profile");
+    if (!siteTasks.isPlanning(request.taskId)) throw new DOMException("Site task cancelled", "AbortError");
+    if (selected_profile === ModelProfile.Hosted) {
+      const started = performance.now(); let success = false;
+      try { const decision = await hostedPlanner.decide(request, () => siteTasks.isPlanning(request.taskId)); success = true; return decision; }
+      finally { metrics.add({ stage: "planning", durationMs: performance.now() - started, success }); }
+    }
     const response = await chrome.runtime.sendMessage({ type: "SITE_DECIDE", request, target: "offscreen" });
     if (!response?.ok || !response.decision) throw new Error(response?.error ?? "The optional planner is unavailable. Basic controls remain available.");
     return parseSiteDecision(JSON.stringify(response.decision));
@@ -100,6 +111,7 @@ const siteTasks = new SiteTaskRunner({
   },
   publish: async task => {
     const terminal = SITE_TERMINAL.has(task.status);
+    if (terminal) hostedPlanner.cancel();
     const previous = await getSessionState();
     await updateSessionState({ siteTask: task, agentState: terminal || task.status === "awaiting_answer" ? (previous.listeningEnabled ? AgentState.Listening : AgentState.Idle)
       : task.status === "awaiting_approval" ? AgentState.Confirming : task.status === "executing" ? AgentState.Executing : AgentState.Planning });
@@ -512,6 +524,19 @@ async function handleMessage(
 ): Promise<void> {
   await recoverInterruptedExecution();
   switch (msg.type) {
+    case "GET_HOSTED_SETTINGS":
+      sendResponse(await hostedSettingsStatus()); break;
+    case "GET_PLANNER_STATUS": {
+      const { selected_profile } = await chrome.storage.local.get("selected_profile");
+      const config = await hostedSettingsStatus();
+      sendResponse({ profile: canonicalProfile(String(selected_profile ?? "essential")), hostedEnabled: config.enabled, origin: config.endpoint ? new URL(config.endpoint).origin : "" });
+      break;
+    }
+    case "SAVE_HOSTED_SETTINGS": {
+      siteTasks.cancel(); hostedPlanner.cancel();
+      await saveHostedSettings(msg.config, msg.apiKey, msg.forgetKey);
+      sendResponse({ ok: true }); break;
+    }
     case "START_SITE_TASK": {
       const current = await getSessionState();
       if (!current.listeningEnabled || current.currentPlan) throw new Error("Start listening and finish the current command first.");

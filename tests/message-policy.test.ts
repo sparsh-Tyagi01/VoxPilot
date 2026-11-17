@@ -16,4 +16,11 @@ describe("runtime authority", () => {
     expect(authorizedSender("PLAN_PRODUCED", { ...popup, url: "chrome-extension://vox/src/offscreen/offscreen.html" }, "vox")).toBe(true);
     expect(authorizedSender("GET_SESSION_STATE", { ...popup, id: "other" }, "vox")).toBe(false);
   });
+  it("confines hosted credentials and settings to the Settings document", () => {
+    for (const type of ["SAVE_HOSTED_SETTINGS", "GET_HOSTED_SETTINGS"]) {
+      for (const url of ["https://site.test", "chrome-extension://vox/src/panel/panel.html", "chrome-extension://vox/src/offscreen/offscreen.html"]) expect(authorizedSender(type, { id: "vox", url }, "vox")).toBe(false);
+      expect(authorizedSender(type, { id: "vox", url: "chrome-extension://vox/src/settings/settings.html#model" }, "vox")).toBe(true);
+      expect(authorizedSender(type, { id: "vox", url: "chrome-extension://vox/src/settings/settings.html", frameId: 4 }, "vox")).toBe(false);
+    }
+  });
 });

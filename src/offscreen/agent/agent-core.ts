@@ -36,7 +36,8 @@ import {
 import { TTS } from "../audio/tts.js";
 import { IntentRouter } from "./intent-router.js";
 import { Planner, type PlannerLLMInterface } from "./planner.js";
-import { GPU_RECOVERY_MODEL, GPU_RECOVERY_DELAY_MS, GPU_RECOVERY_LOAD_TIMEOUT_MS, isGPUDeviceLoss } from "../llm/gpu-errors.js";
+import { GPU_RECOVERY_MODEL, GPU_RECOVERY_DELAY_MS, GPU_RECOVERY_LOAD_TIMEOUT_MS, gpuFailureCode, type GPUFailureCode } from "../llm/gpu-errors.js";
+import { CPU_PLANNER_SETUP_TIMEOUT_MS } from "@shared/cpu-planner.js";
 import type { ChatMessage } from "../llm/llm-worker.js";
 import { PlanValidator } from "./plan-validator.js";
 import { RiskClassifier } from "./risk-classifier.js";
@@ -65,11 +66,11 @@ type STTMessage =
 /** LLM worker message types (inbound). */
 type LLMMessage =
   | { type: "ready" }
-  | { type: "cancelled"; requestId: string }
+  | { type: "cancelled"; requestId: string; retired?: boolean }
   | { type: "progress"; loaded: number; total: number; text: string; downloading?: boolean }
   | { type: "token"; requestId: string; delta: string }
   | { type: "result"; requestId: string; text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }
-  | { type: "error"; requestId: string; message: string; code?: "GPU_DEVICE_LOST"; stack?: string };
+  | { type: "error"; requestId: string; message: string; code?: GPUFailureCode; stack?: string };
 
 // ─── AgentCore ─────────────────────────────────────────────────────────────────
 
@@ -78,7 +79,9 @@ type LLMMessage =
  * It owns the STT and LLM workers and manages the agent state machine.
  */
 export class AgentCore {
+  private get plannerBackend() { return MODEL_PROFILE_CONFIG[this.initializedProfile ?? DEFAULT_MODEL_PROFILE].backend; }
   private siteTask: SiteTaskState | null = null;
+  private siteDecisionEpoch = 0;
   private readonly siteAware: boolean;
   private state: AgentState = AgentState.Idle;
   private readonly tts: TTS;
@@ -181,13 +184,14 @@ export class AgentCore {
       return;
     }
     if (this.initializedProfile === profile && this.sttWorker && (!this.initializationFailed || Boolean(this.llmRecoveryTimer))) {
+      if (preloadPlanner && ["wasm", "webgpu"].includes(this.plannerBackend)) this.llmRequested = true;
       this.emitModelProgress();
       return;
     }
     if (this.sttWorker || this.llmWorker) this.dispose();
     this.lifecycleId++;
     this.initializedProfile = profile;
-    this.llmRequested = preloadPlanner && profile !== ModelProfile.Essential;
+    this.llmRequested = preloadPlanner && ["wasm", "webgpu"].includes(this.plannerBackend);
     this.llmRecoveryAttempts = 0;
     this.llmCircuitOpen = false;
     this.initializationFailed = false;
@@ -207,7 +211,7 @@ export class AgentCore {
     this.spawnSTTWorker();
 
     this.llmModelId = profileConfig.modelId;
-    if (preloadPlanner && profile !== ModelProfile.Essential) this.spawnLLMWorker();
+    if (this.llmRequested) this.spawnLLMWorker();
 
     // ── Wire Planner to LLM worker ──────────────────────────────────────────
     const llmInterface = this.buildPlannerLLMInterface();
@@ -680,6 +684,7 @@ export class AgentCore {
   onSiteTaskState(state: SiteTaskState): void {
     this.siteTask = state;
     if (["cancelled", "unknown", "limited"].includes(state.status)) {
+      this.siteDecisionEpoch++;
       for (const [requestId, fail] of this.llmErrorCallbacks) { this.abortLLM(requestId); fail("Site task cancelled"); }
       this.llmResultCallbacks.clear(); this.llmErrorCallbacks.clear(); this.llmTokenCallbacks.clear();
     }
@@ -688,8 +693,14 @@ export class AgentCore {
   }
 
   async decideSiteTask(request: SiteDecisionRequest): Promise<SiteDecision> {
+    if (this.plannerBackend === "hosted") throw new Error("Hosted decisions are managed by the background coordinator.");
     if (this.initializedProfile === ModelProfile.Essential) throw new Error("Choose Assist or another AI profile in Settings for general site tasks.");
+    const epoch = this.siteDecisionEpoch, lifecycle = this.lifecycleId, operation = this.operationId;
     await this.ensurePlannerReady();
+    if (epoch !== this.siteDecisionEpoch || lifecycle !== this.lifecycleId || operation !== this.operationId
+      || (this.siteTask && (this.siteTask.id !== request.taskId || SITE_TERMINAL.has(this.siteTask.status)))) {
+      throw new DOMException("Site task cancelled", "AbortError");
+    }
     return this.measure("planning", () => decideSiteStep(this.buildPlannerLLMInterface(), request));
   }
 
@@ -735,6 +746,7 @@ export class AgentCore {
    */
   private buildPlannerLLMInterface(): PlannerLLMInterface {
     return {
+      backend: this.plannerBackend === "wasm" ? "wasm" : "webgpu",
       postGenerate: (requestId: string, messages: ChatMessage[], grammar?: string): void => {
         if (!this.llmWorker || !this.isLlmReady) {
           this.handleLLMMessage({ data: { type: "error", requestId, message: this.llmCircuitOpen ? "GPU planning is unavailable. Basic commands still work; restart Chrome and retry model setup." : "AI planner is still loading or unavailable. Wait for Models ready, or use a simple command." } } as MessageEvent<LLMMessage>);
@@ -835,7 +847,8 @@ export class AgentCore {
   }
 
   /** Optional planning is initialized only when a complex request actually needs it. */
-  async ensurePlannerReady(): Promise<void> {
+  async ensurePlannerReady(timeoutMs = GPU_RECOVERY_LOAD_TIMEOUT_MS): Promise<void> {
+    if (this.plannerBackend === "hosted") throw new Error("Hosted planning is managed in Settings → Model; no local planner is loaded.");
     if (this.initializedProfile === ModelProfile.Essential) throw new Error("AI planning is disabled in Essential mode.");
     if (this.llmCircuitOpen) throw new Error("GPU planning is unavailable. Basic commands still work.");
     if (this.isLlmReady) return;
@@ -848,20 +861,23 @@ export class AgentCore {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([this.llmReady, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Optional planner initialization timed out. Basic commands still work.")), GPU_RECOVERY_LOAD_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error("Planner initialization timed out. Basic commands still work; retry setup to reuse cached files.")), timeoutMs);
       })]);
     } finally { if (timer) clearTimeout(timer); }
   }
 
   private spawnLLMWorker(): void {
-    const worker = new Worker(new URL("../llm/llm-worker.ts", import.meta.url), { type: "module" });
+    const worker = this.plannerBackend === "wasm"
+      ? new Worker(new URL("../llm/cpu-worker.ts", import.meta.url), { type: "module" })
+      : new Worker(new URL("../llm/llm-worker.ts", import.meta.url), { type: "module" });
     this.llmWorker = worker;
     worker.addEventListener("message", event => {
       if (this.llmWorker === worker) this.handleLLMMessage(event as MessageEvent<LLMMessage>);
     });
     worker.addEventListener("error", event => {
       if (this.llmWorker !== worker) return;
-      if (isGPUDeviceLoss(event.message)) { this.recoverGPUPlanner(); return; }
+      const gpuFailure = gpuFailureCode(event.message);
+      if (this.plannerBackend === "webgpu" && gpuFailure) { this.recoverGPUPlanner(gpuFailure); return; }
       const error = new Error(`LLM worker crashed: ${event.message}`);
       if (this.llmRecoveryAttempts > 0 && !this.isLlmReady) { this.failGPURecovery(error.message); return; }
       this.isLlmReady = false;
@@ -888,11 +904,11 @@ export class AgentCore {
       this.llmProgress = 0;
       this.llmReady = new Promise<void>((resolve, reject) => { this.llmReadyResolve = resolve; this.llmReadyReject = reject; });
       void this.llmReady.catch(() => {});
-      this.emitModelProgress("Voice ready — idle planner released from GPU memory");
+      this.emitModelProgress("Voice ready — idle planner released from memory");
     }, 120_000);
   }
 
-  private recoverGPUPlanner(): void {
+  private recoverGPUPlanner(code: GPUFailureCode = "GPU_DEVICE_LOST"): void {
     this.llmWorker?.terminate();
     this.llmWorker = null;
     this.isLlmReady = false;
@@ -908,9 +924,10 @@ export class AgentCore {
     this.llmResultCallbacks.clear();
     this.llmTokenCallbacks.clear();
     const canRecover = this.llmRecoveryAttempts === 0;
+    const reason = code === "GPU_DEVICE_LOST" ? "GPU device lost" : "GPU buffer read was interrupted";
     const message = canRecover
-      ? "GPU device lost. Loading a smaller AI planner; wait for Models ready, then repeat your command. Basic commands still work."
-      : "GPU device was lost again. Complex planning is disabled to avoid repeated GPU crashes. Basic commands still work. Restart Chrome or free GPU resources, then retry model setup.";
+      ? `${reason}. Loading a smaller AI planner; wait for Models ready, then repeat your command. Basic commands still work.`
+      : `${reason} again. Complex planning is disabled to avoid repeated GPU failures. Basic commands still work. Restart Chrome or free GPU resources, then retry model setup.`;
 
     if (canRecover) {
       this.llmRecoveryAttempts++;
@@ -952,6 +969,18 @@ export class AgentCore {
   }
 
   private abortLLM(requestId: string): void {
+    if (this.plannerBackend === "wasm") {
+      // Hard cancellation is reliable even when a WASM kernel cannot yield.
+      // Reopen cached weights only on the next request; do not auto-reload on Stop.
+      this.llmWorker?.terminate(); this.llmWorker = null;
+      this.isLlmReady = false; this.llmRequested = false; this.llmProgress = 0; this.llmDownloading = false;
+      if (this.llmIdleTimer) clearTimeout(this.llmIdleTimer);
+      this.llmIdleTimer = null;
+      this.llmReady = new Promise<void>((resolve, reject) => { this.llmReadyResolve = resolve; this.llmReadyReject = reject; });
+      void this.llmReady.catch(() => {});
+      this.emitModelProgress("CPU planning cancelled. Basic voice controls remain ready.");
+      return;
+    }
     this.llmWorker?.postMessage({ type: "abort", requestId });
     if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
     // A wedged GPU may never yield a token or acknowledge interruptGenerate.
@@ -1029,7 +1058,7 @@ export class AgentCore {
 
     let text = detailText;
     if (isAllReady) {
-      text = !plannerRequested ? "Voice ready — optional planner not loaded" : this.llmModelId === GPU_RECOVERY_MODEL ? "Models ready — compact planner active" : "✓ Models ready!";
+      text = this.plannerBackend === "hosted" ? "Voice ready — hosted planning selected" : !plannerRequested ? "Voice ready — optional planner not loaded" : this.llmModelId === GPU_RECOVERY_MODEL ? "Models ready — compact planner active" : "✓ Models ready!";
     } else if (!text) {
       if (!this.isSttReady) {
         text = this.sttProgress > 0 ? `Preparing speech model… ${Math.round(this.sttProgress * 100)}%` : "Opening saved speech model…";
@@ -1078,11 +1107,12 @@ export class AgentCore {
       this.initializationFailed = true;
     }
     // Recreate workers so profile changes cannot race with native inference/loading.
-    await this.initialize(profile);
+    await this.initialize(profile, profile === ModelProfile.Cpu);
     if (this.initializedProfile !== profile) throw new DOMException("Model selection changed", "AbortError");
     const loadId = this.loadId;
     try {
       await this.sttReady;
+      if (profile === ModelProfile.Cpu) await this.ensurePlannerReady(CPU_PLANNER_SETUP_TIMEOUT_MS);
     } catch (err) {
       if (this.initializedProfile !== profile || loadId !== this.loadId) throw new DOMException("Model selection changed", "AbortError");
       throw err;
@@ -1150,6 +1180,18 @@ export class AgentCore {
       case "cancelled":
         if (this.llmAbortTimer) clearTimeout(this.llmAbortTimer);
         this.llmAbortTimer = null;
+        if (msg.retired) {
+          this.llmWorker?.terminate(); this.llmWorker = null;
+          this.isLlmReady = false; this.llmRequested = false; this.llmProgress = 0; this.llmDownloading = false;
+          if (this.llmIdleTimer) clearTimeout(this.llmIdleTimer);
+          this.llmIdleTimer = null;
+          this.llmReady = new Promise<void>((resolve, reject) => { this.llmReadyResolve = resolve; this.llmReadyReject = reject; });
+          void this.llmReady.catch(() => {});
+          this.emitModelProgress("Planning stopped. Basic voice controls remain ready.");
+          const callbacks = [...this.llmErrorCallbacks.values()];
+          this.llmErrorCallbacks.clear(); this.llmResultCallbacks.clear(); this.llmTokenCallbacks.clear();
+          for (const callback of callbacks) callback("The planner was reset after cancellation. Repeat your command when ready; basic controls remain available.");
+        }
         break;
 
       case "progress":
@@ -1186,8 +1228,9 @@ export class AgentCore {
       }
 
       case "error": {
-        if (msg.code === "GPU_DEVICE_LOST" || isGPUDeviceLoss(msg.message)) {
-          this.recoverGPUPlanner();
+        const gpuFailure = msg.code ?? gpuFailureCode(msg.message);
+        if (this.plannerBackend === "webgpu" && gpuFailure) {
+          this.recoverGPUPlanner(gpuFailure);
           break;
         }
         if (!msg.requestId && this.llmRecoveryAttempts > 0 && !this.isLlmReady) {

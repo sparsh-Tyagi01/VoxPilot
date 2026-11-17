@@ -1,16 +1,18 @@
 # Site-aware agent implementation
 
-Updated 15 November 2026. This records the first working implementation of the [site-aware architecture](SITE_AWARE_AGENT_ARCHITECTURE.md), its verification and its limits.
+Updated 17 November 2026. This records the first working implementation of the [site-aware architecture](SITE_AWARE_AGENT_ARCHITECTURE.md), its verification and its limits.
 
 ## Use
 
 1. Run `npm run check`, reload `dist/` at `chrome://extensions`, and refresh target webpages.
-2. In Settings → Models choose **Assist** or another optional AI profile. Essential keeps basic CPU voice controls; it does not initialize a general reasoning model.
-3. Start listening on a regular HTTP(S) page and describe a goal. Search requests now go through the task loop rather than a typing-only shortcut. General tasks use the same local WebLLM worker and bounded recovery policy as the existing planner.
+2. In Settings → Model choose **Hosted assist** for explicitly enabled external planning without a device GPU, **Assist CPU** for experimental local planning, or a GPU profile. Essential keeps basic CPU voice controls; it does not initialize a general reasoning model. See [CPU implementation and benchmarking](CPU_PLANNER.md).
+3. Start listening on a regular HTTP(S) page and describe a goal. Search requests go through the task loop rather than a typing-only shortcut. General tasks use the selected hosted client, local CPU worker or WebLLM worker. The experimental CPU model has not passed task qualification.
 4. Answer clarification by voice or in the popup. Review operation details in the popup for actions requiring approval. A spoken “yes” does not approve a sensitive operation.
 5. Close the popup to continue background listening. Stop task, voice “stop”, Pause, or Alt+V cancels future dispatches. Page changes already applied can remain.
 
 This does not guarantee that a selected model will correctly interpret every request. A model that cannot initialize or produce a valid decision yields a limitation instead of an invented action.
+
+Hosted assist setup, credentials, sharing boundaries and qualification limits are documented in [the hosted architecture](HOSTED_PLANNER.md).
 
 ## Implemented path
 
@@ -50,7 +52,7 @@ User waiting is excluded from the active-work budget. Initial limits are 12 acti
 
 ## Verification performed
 
-`npm run check` passed with 167 tests, TypeScript, ESLint, a production build and packaged asset checks. Regression coverage includes search submission, completion evidence, invented tools/targets, private form fields, cart approval identity, cancellation, stale replies, unknown outcomes, selected-site changes, worker restart and the offscreen planning boundary. Existing explicit `any` integration warnings remain.
+`npm run check` passed with 247 tests, TypeScript, ESLint, a production build and packaged asset checks. Regression coverage includes search submission, completion evidence, invented tools/targets, private form fields, cart approval identity, cancellation, stale replies, unknown outcomes, selected-site changes, worker restart and the offscreen planning boundary. Existing explicit `any` integration warnings remain. The separate real-model CPU qualification failed all three synthetic task checks; unit tests do not establish model accuracy.
 
 `npm run test:browser` runs an isolated headless Chrome against local controlled fixtures. Node 22+ with global WebSocket is required for this optional runner; set `CHROME_PATH` if Chrome is not found automatically. It uses a temporary profile and removes its temporary build/profile after completion.
 

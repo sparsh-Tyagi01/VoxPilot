@@ -70,6 +70,7 @@ function sanitizePageContent(raw: string): string {
  * AgentCore injects these when constructing the Planner.
  */
 export interface PlannerLLMInterface {
+  backend?: "wasm" | "webgpu";
   /**
    * Post a generate request to the LLM worker.
    * @param requestId - Unique ID for correlating tokens/result callbacks.

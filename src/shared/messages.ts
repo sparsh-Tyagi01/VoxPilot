@@ -470,7 +470,12 @@ export type SiteTaskMessage =
   | { type: "SITE_VALIDATION"; valid: boolean }
   | { type: "SITE_STEP_RESULT"; result: import("./site-task.js").SiteStepResult };
 
-export type VoxPilotMessage = (SiteTaskMessage & { target?: "sw" | "offscreen" | "ui" }) | VaultLockMsg | CommandNoticeMsg | PerformanceSampleMsg | GetDiagnosticsMsg
+export type HostedSettingsMessage =
+  | { type: "GET_HOSTED_SETTINGS" }
+  | { type: "SAVE_HOSTED_SETTINGS"; config: import("./hosted-planner.js").HostedPlannerSettings; apiKey?: string; forgetKey?: boolean }
+  | { type: "GET_PLANNER_STATUS" };
+
+export type VoxPilotMessage = ((HostedSettingsMessage | SiteTaskMessage) & { target?: "sw" | "offscreen" | "ui" }) | VaultLockMsg | CommandNoticeMsg | PerformanceSampleMsg | GetDiagnosticsMsg
   /* Panel → SW */
   | ToggleListeningMsg
   | ConfirmPlanMsg

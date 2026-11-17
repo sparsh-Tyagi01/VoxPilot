@@ -60,6 +60,13 @@ describe("site policy and decision contracts", () => {
   });
 });
 describe("bounded observe-plan-act-verify loop", () => {
+  it.each(["API key", "access token", "seed phrase", "password"])("never asks the user to dictate a %s", async secret => {
+    const h = harness([{ kind: "ask", question: "Please tell me your " + secret }]);
+    await h.runner.start("Set up the page", 1, origin);
+    await vi.waitFor(() => expect(h.last().status).toBe("limited"));
+    expect(h.states.some(state => state.status === "awaiting_answer")).toBe(false);
+    expect(h.deps.execute).not.toHaveBeenCalled();
+  });
   it("fills, explicitly submits and verifies search results through fresh observations", async () => {
     const h = harness([
       { kind: "act", action: { type: "type", handle: "e1", text: "backpacks" }, expected: { kind: "control_state" } },

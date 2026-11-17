@@ -8,6 +8,7 @@
  */
 
 import { ModelProfile, RiskTier } from "./types.js";
+import { CPU_PLANNER_MODEL } from "./cpu-planner.js";
 
 // ─── Timing & Latency Budgets (milliseconds) ──────────────────────────────────
 
@@ -145,28 +146,34 @@ export const MODEL_PROFILE_CONFIG: Record<
   ModelProfile,
   {
     label: string;
-    /** WebLLM MLC model ID for LLM inference. */
+    backend: "none" | "wasm" | "webgpu" | "hosted";
+    /** Planner model ID for the selected inference backend. */
     modelId: string;
     /** HuggingFace repo for the STT (Whisper) ONNX model. */
     sttModelId: string;
     description: string;
   }
 > = {
-  [ModelProfile.Essential]: { label: "Essential (CPU)", modelId: "", sttModelId: "onnx-community/whisper-tiny", description: "Everyday commands without a GPU or planner download" },
+  [ModelProfile.Essential]: { label: "Essential (basic controls)", backend: "none", modelId: "", sttModelId: "onnx-community/whisper-tiny", description: "Basic commands without a planner download" },
+  [ModelProfile.Cpu]: { label: "Assist CPU", backend: "wasm", modelId: CPU_PLANNER_MODEL, sttModelId: "onnx-community/whisper-tiny", description: "Local CPU/WASM planning; no GPU required. Model accuracy is experimental." },
+  [ModelProfile.Hosted]: { label: "Hosted assist", backend: "hosted", modelId: "", sttModelId: "onnx-community/whisper-tiny", description: "Optional external planning with explicitly shared page context. No device GPU or local planner download." },
   [ModelProfile.Fast]: {
     label: "Fast (1B)",
+    backend: "webgpu",
     modelId: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
     sttModelId: "onnx-community/whisper-tiny",
     description: "Optional 1B planning; requires a qualified WebGPU device",
   },
   [ModelProfile.Balanced]: {
     label: "Balanced (3B)",
+    backend: "webgpu",
     modelId: "Llama-3.2-3B-Instruct-q4f16_1-MLC",
     sttModelId: "onnx-community/whisper-base",
     description: "Good balance of speed and accuracy",
   },
   [ModelProfile.Powerful]: {
     label: "Powerful (8B)",
+    backend: "webgpu",
     modelId: "Llama-3.1-8B-Instruct-q4f16_1-MLC",
     sttModelId: "onnx-community/whisper-base",
     description: "Best accuracy, requires a capable GPU",

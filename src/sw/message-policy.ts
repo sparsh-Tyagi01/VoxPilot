@@ -5,6 +5,7 @@ export function authorizedSender(type: string, sender: chrome.runtime.MessageSen
   if (sender.id !== extensionId || !sender.url) return false;
   const extensionURL = `chrome-extension://${extensionId}/`;
   const offscreen = sender.url === `${extensionURL}src/offscreen/offscreen.html`;
+  if (["SAVE_HOSTED_SETTINGS", "GET_HOSTED_SETTINGS"].includes(type)) return (sender.frameId ?? 0) === 0 && sender.url.split(/[?#]/, 1)[0] === `${extensionURL}src/settings/settings.html`;
   if (["CANCEL_SITE_TASK", "SITE_TASK_REPLY"].includes(type)) return offscreen || sender.url.startsWith(extensionURL);
   if (OFFSCREEN_MESSAGES.has(type)) return offscreen;
   if (sender.url.startsWith(extensionURL)) return !offscreen;

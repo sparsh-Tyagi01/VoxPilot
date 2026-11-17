@@ -16,12 +16,14 @@ let session: Record<string, unknown>;
 let local: Record<string, unknown>;
 let api: ReturnType<typeof createChrome>;
 let pageFailure: string | null;
+let hostedFetch: ReturnType<typeof vi.fn>;
 
 function createChrome() {
   const area = (data: Record<string, unknown>) => ({
     get: vi.fn(async (key: string) => structuredClone({ [key]: data[key] })),
     set: vi.fn(async (values: Record<string, unknown>) => { Object.assign(data, structuredClone(values)); }),
     remove: vi.fn(async (key: string) => { delete data[key]; }),
+    setAccessLevel: vi.fn(async () => {}),
   });
   const event = () => ({ addListener: vi.fn() });
   return {
@@ -69,11 +71,38 @@ beforeEach(async () => {
   pageFailure = null;
   api = createChrome();
   vi.stubGlobal("chrome", api);
+  hostedFetch = vi.fn(async () => new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ kind: "unavailable", reason: "not_found_in_scope", message: "No matching control was found on this page." }) } }] })));
+  vi.stubGlobal("fetch", hostedFetch);
   await import("../src/sw/sw.js");
 });
 afterEach(() => vi.unstubAllGlobals());
 
 describe("service worker orchestration", () => {
+  it("routes an explicitly selected hosted task through SW networking instead of an offscreen GPU planner", async () => {
+    local["selected_profile"] = "hosted";
+    local["hosted_planner"] = { version: 1, enabled: true, endpoint: "https://planner.test/v1/chat/completions", model: "configured-model" };
+    api.tabs.sendMessage.mockImplementation((_tab, message, _options, callback) => {
+      callback(message.type === "SITE_OBSERVE" ? { type: "SITE_OBSERVATION", observation: {
+        documentId: "doc", observationId: "obs", stateKey: "state", url: "https://example.com", title: "Article", elements: [], forms: [], capturedAt: 1, truncated: false, coverage: { candidates: 0, inspected: 0, limited: false, frames: "top_only" },
+      } } : message.type === "SITE_VALIDATE" ? { type: "SITE_VALIDATION", valid: true } : { ok: true });
+    });
+    await request({ type: "START_SITE_TASK", goal: "Find an item" });
+    await vi.waitFor(() => expect((session[SESSION_KEYS.SESSION_STATE] as SessionState).siteTask?.status).toBe("limited"));
+    expect(hostedFetch).toHaveBeenCalledOnce();
+    expect(api.runtime.sendMessage.mock.calls.some(([message]) => (message as { type: string }).type === "SITE_DECIDE")).toBe(false);
+    expect(api.tabs.sendMessage.mock.calls.some(([, message]) => message.type === "SITE_EXECUTE")).toBe(false);
+  });
+  it("permits only Settings to save hosted configuration and never returns credentials", async () => {
+    const settings = (message: unknown) => new Promise<Record<string, unknown>>(resolve => handleMessage(message, { id: "voxpilot", url: "chrome-extension://voxpilot/src/settings/settings.html#model", frameId: 0 }, value => resolve(value as Record<string, unknown>)));
+    const config = { version: 1, enabled: true, endpoint: "https://planner.test/v1/chat/completions", model: "configured-model" };
+    expect(await request({ type: "SAVE_HOSTED_SETTINGS", config, apiKey: "private-key" })).toMatchObject({ ok: false });
+    expect(await settings({ type: "SAVE_HOSTED_SETTINGS", config, apiKey: "private-key" })).toMatchObject({ ok: true });
+    const restored = await settings({ type: "GET_HOSTED_SETTINGS" });
+    expect(restored).toMatchObject({ ...config, hasApiKey: true });
+    expect(JSON.stringify(restored)).not.toContain("private-key");
+    expect(JSON.stringify(local)).not.toContain("private-key");
+    expect(hostedFetch).not.toHaveBeenCalled();
+  });
   it("restores a site task as unknown after restart without retaining approval or replaying it", async () => {
     session[SESSION_KEYS.SESSION_STATE] = { ...state(), siteTask: { version: 1, id: "site-1", tabId: 12, origin: "https://example.com", goal: "Add item", status: "awaiting_approval", steps: 0, message: "Waiting", approval: { id: "old", description: "Add item", context: "", destination: "", expiresAt: Date.now() + 60_000 } } };
     const restored = await request({ type: "GET_SESSION_STATE" });

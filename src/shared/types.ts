@@ -66,6 +66,10 @@ export enum RiskTier {
  */
 export enum ModelProfile {
   Essential = "essential",
+  /** Quantized local planner running on CPU/WASM; GPU is never required. */
+  Cpu = "cpu",
+  /** Explicitly enabled external planning; speech and execution remain local. */
+  Hosted = "hosted",
   /** Llama 3.2 1B — fastest, lowest memory (~700 MB) */
   Fast = "fast",
   /** Llama 3.2 3B — balanced */

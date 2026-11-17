@@ -1,6 +1,12 @@
 # Release readiness
 
+For hosted planning and its explicit configuration/privacy boundary, see [Hosted assist](HOSTED_PLANNER.md). A live service and model qualification are still required.
+
 For the subsequent CPU-first implementation, current feature limits, and remaining roadmap work, see [implementation status](IMPLEMENTATION_STATUS.md).
+
+GPU buffer-unmapping failures now retire the invalid worker without a second unload; expected cancellation and unexpected GPU recovery have separate paths. See [GPU readback recovery and verification](GPU_BUFFER_RECOVERY.md).
+
+Assist CPU now provides an explicit GPU-independent WASM planner backend. Its current small model failed task qualification and remains experimental; see [measured results and architecture](CPU_PLANNER.md). CPU setup prepares both speech and planning. Cached provider-file reads are labeled as preparation rather than downloading.
 
 The automated checks cover request handling, worker recovery, model reuse, progress races, plan execution, and packaging. The compact popup was rendered in isolated Chrome at its shipped 340px width in paused, listening, confirmation, and error states with mocked runtime messages. A passing build does not verify real WebGPU inference or qualify this extension for a production release.
 

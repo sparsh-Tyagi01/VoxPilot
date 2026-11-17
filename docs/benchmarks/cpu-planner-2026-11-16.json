@@ -1,0 +1,100 @@
+{
+  "recordedDate": "2026-11-16",
+  "hardware": {
+    "cpu": "Intel Core i7-1068NG7 @ 2.30GHz",
+    "physicalCores": 4,
+    "ramGiB": 16
+  },
+  "scope": "Synthetic next-decision tests only. No DOM mutations or microphone recognition. Localhost weights exclude internet download time.",
+  "reports": {
+    "observedControlToolPackets": {
+      "route": "/",
+      "ok": false,
+      "gpuFree": true,
+      "cachedInitializationMs": 5801.399999976158,
+      "cachedDownloadEvents": 0,
+      "correctSamples": 0,
+      "totalSamples": 3,
+      "model": "onnx-community/Qwen2.5-0.5B-Instruct",
+      "revision": "22942cb7d7ba4cc81bb4673549ca4d4614469b5e",
+      "backend": "wasm",
+      "numThreads": 1,
+      "gpuRequests": 0,
+      "initializationMs": 8565.199999988079,
+      "cacheCondition": "fresh Chrome profile; weights staged on localhost; warm samples reuse one worker",
+      "samples": [
+        {
+          "name": "search-first",
+          "durationMs": 20203.399999976158,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner returned unexpected tool arguments.",
+          "fixtureOutput": " \"submit\", \"target\": \"e1\", \"e1\": \"Submit a product recommendation.\"}"
+        },
+        {
+          "name": "search-warm",
+          "durationMs": 16284.199999988079,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner returned unexpected tool arguments.",
+          "fixtureOutput": " \"submit\", \"target\": \"e1\", \"e1\": \"Submit a product recommendation.\"}"
+        },
+        {
+          "name": "unavailable",
+          "durationMs": 12791.100000023842,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner did not supply valid outcome evidence.",
+          "fixtureOutput": " \"answer\", \"message\": \"What is the main topic of the given URL?\"}"
+        }
+      ],
+      "weightNetworkRequests": 1
+    },
+    "nativeFunctionCalls": {
+      "route": "/",
+      "ok": false,
+      "gpuFree": true,
+      "cachedInitializationMs": 3685.300000011921,
+      "cachedDownloadEvents": 0,
+      "correctSamples": 0,
+      "totalSamples": 3,
+      "model": "onnx-community/Qwen2.5-0.5B-Instruct",
+      "revision": "22942cb7d7ba4cc81bb4673549ca4d4614469b5e",
+      "backend": "wasm",
+      "numThreads": 1,
+      "gpuRequests": 0,
+      "initializationMs": 8497,
+      "cacheCondition": "fresh Chrome profile; weights staged on localhost; warm samples reuse one worker",
+      "samples": [
+        {
+          "name": "search-first",
+          "durationMs": 39761,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner returned invalid function arguments.",
+          "fixtureOutput": " \"unavailable\", \"arguments\": []}\n\n"
+        },
+        {
+          "name": "search-warm",
+          "durationMs": 35936.5,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner returned invalid function arguments.",
+          "fixtureOutput": " \"unavailable\", \"arguments\": []}\n\n"
+        },
+        {
+          "name": "unavailable",
+          "durationMs": 36214.69999998808,
+          "validSchema": false,
+          "correct": false,
+          "error": "Error: The CPU planner did not produce a complete JSON decision. That decision was rejected.",
+          "fixtureOutput": " \"unavailable\", \"arguments\": {\"type\": \"object\", \"properties\": {\"message\": {\"type\": \"string\", \"required\": true}, \"evidence\": {\"type\": \"boolean\", \"required\": true}, \"additionalProperties\": false}}\n<tool_call>"
+        }
+      ],
+      "weightNetworkRequests": 1,
+      "cachePassed": true
+    }
+  },
+  "conclusion": "GPU independence and provider cache reuse verified. Task accuracy qualification failed; not ready for general production site planning.",
+  "decision": "Retain the shorter observed-control tool-packet protocol as an experimental baseline. Native function calls also failed 0/3 checks and took longer; neither qualifies this model for general site planning."
+}

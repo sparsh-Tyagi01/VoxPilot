@@ -18,6 +18,7 @@
 import { SNAPSHOT_TIMEOUT_MS } from "@shared/constants.js";
 import { HandleRegistry } from "./handles.js";
 import type { ElementHandle, PageSnapshot } from "@shared/types.js";
+import { publicText, isPublicTextElement } from "./public-text.js";
 
 /** Maximum number of elements in a single snapshot (prevents prompt overflow). */
 const MAX_ELEMENTS = 150;
@@ -71,14 +72,14 @@ export function extractLabel(el: Element): string | undefined {
   const labelledById = el.getAttribute("aria-labelledby");
   if (labelledById) {
     const labelEl = document.getElementById(labelledById);
-    const text = labelEl?.textContent?.trim();
+    const text = labelEl ? publicText(labelEl, 100) : "";
     if (text) return text.slice(0, 100);
   }
 
   // Native labels avoids repeated document-wide selector queries for form fields.
   if ("labels" in el) {
     const labels = (el as HTMLInputElement).labels;
-    const text = labels?.[0]?.textContent?.trim();
+    const text = labels?.[0] ? publicText(labels[0], 100) : "";
     if (text) return text.slice(0, 100);
   }
 
@@ -86,7 +87,7 @@ export function extractLabel(el: Element): string | undefined {
   const id = el.getAttribute("id");
   if (id && !("labels" in el)) {
     const labelEl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(id)}"]`);
-    const text = labelEl?.textContent?.trim();
+    const text = labelEl ? publicText(labelEl, 100) : "";
     if (text) return text.slice(0, 100);
   }
 
@@ -95,7 +96,7 @@ export function extractLabel(el: Element): string | undefined {
   if (placeholder) return placeholder.slice(0, 100);
 
   // 5. Text content (buttons, links — truncated)
-  const textContent = el.textContent?.trim().replace(/\s+/g, " ");
+  const textContent = publicText(el, 100);
   if (textContent && textContent.length > 0) return textContent.slice(0, 100);
 
   // 6. title attribute
@@ -126,6 +127,8 @@ function isInViewport(rect: DOMRect): boolean {
  * Faster than getComputedStyle on every element — only called on visible-rect elements.
  */
 function isEffectivelyHidden(el: Element): boolean {
+  if (el.closest("[hidden], [aria-hidden='true'], [inert]")) return true;
+  if (typeof el.checkVisibility === "function" && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return true;
   // Cheap checks first
   if ((el as HTMLElement).hidden) return true;
   const style = (el as HTMLElement).style;
@@ -228,7 +231,7 @@ export class SnapshotBuilder {
     // Extract key headings for semantic understanding
     const headings = Array.from(includeText ? document.querySelectorAll<HTMLElement>("h1, h2, h3") : [])
       .slice(0, 15)
-      .map((h) => h.textContent?.trim().slice(0, 150))
+      .map((h) => publicText(h, 150))
       .filter((t): t is string => Boolean(t && t.length > 2))
       .slice(0, 15);
 
@@ -242,7 +245,7 @@ export class SnapshotBuilder {
       let visited = 0;
       while (performance.now() - startMs < SNAPSHOT_TIMEOUT_MS && textLength < 2500 && visited++ < 2000 && (node = walker.nextNode())) {
         const parent = node.parentElement;
-        if (!parent || parent.closest("script, style, noscript, template, [hidden], [aria-hidden='true']")) continue;
+        if (!parent || !isPublicTextElement(parent)) continue;
         const text = node.textContent?.replace(/\s+/g, " ").trim().slice(0, 2500 - textLength);
         if (text) { textParts.push(text); textLength += text.length + 1; }
       }

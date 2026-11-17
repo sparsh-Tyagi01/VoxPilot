@@ -156,6 +156,64 @@ describe("Agent worker recovery", () => {
     expect(progress.at(-1)?.phase).toBe("downloading");
     expect(progress.at(-1)?.progress).toBeCloseTo(0.46);
   });
+  it("loads the CPU worker without WebLLM and retains it across microphone pauses", async () => {
+    await core.initialize(ModelProfile.Cpu, true);
+    const cpu = FakeWorker.instances.at(-1)!;
+    expect(cpu.url.pathname).toMatch(/cpu-worker\.ts$/);
+    FakeWorker.instances.at(-2)!.emit({ type: "ready" }); cpu.emit({ type: "ready" });
+    core.resumeListening(); core.pauseListening();
+    const count = FakeWorker.instances.length;
+    await core.initialize(ModelProfile.Cpu);
+    expect(FakeWorker.instances).toHaveLength(count);
+    expect(cpu.terminate).not.toHaveBeenCalled();
+  });
+  it("CPU setup cannot announce completion after only the speech worker is ready", async () => {
+    const setup = core.loadProfile(ModelProfile.Cpu);
+    await Promise.resolve();
+    const speech = FakeWorker.instances.at(-2)!; const cpu = FakeWorker.instances.at(-1)!;
+    speech.emit({ type: "ready" }); await Promise.resolve();
+    expect(sendToSW.mock.calls.map(([value]) => value as { type: string; done?: boolean }).filter(value => value.type === "MODEL_LOAD_PROGRESS").at(-1)?.done).toBe(false);
+    cpu.emit({ type: "ready" }); await setup;
+  });
+  it("permits the initial CPU setup download to exceed the on-demand planner timeout", async () => {
+    let complete = false;
+    const setup = core.loadProfile(ModelProfile.Cpu).then(() => { complete = true; });
+    await Promise.resolve();
+    const speech = FakeWorker.instances.at(-2)!; const cpu = FakeWorker.instances.at(-1)!;
+    speech.emit({ type: "ready" }); await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(GPU_RECOVERY_LOAD_TIMEOUT_MS + 1);
+    expect(complete).toBe(false);
+    cpu.emit({ type: "ready" }); await setup;
+    expect(complete).toBe(true);
+  });
+  it("hard-stops CPU inference without the GPU auto-reload timer or accepting late output", async () => {
+    await core.initialize(ModelProfile.Cpu, true);
+    FakeWorker.instances.at(-2)!.emit({ type: "ready" });
+    const cpu = FakeWorker.instances.at(-1)!; cpu.emit({ type: "ready" }); core.resumeListening();
+    const pending = core.executeCommandText("summarize the details on this page");
+    await vi.advanceTimersByTimeAsync(3000);
+    const generation = cpu.postMessage.mock.calls.find(([message]) => message.type === "generate")![0];
+    const count = FakeWorker.instances.length;
+    core.triggerKill(); await pending;
+    cpu.emit({ type: "result", requestId: generation.requestId, text: '{}', usage: { completion_tokens: 1 } });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(cpu.terminate).toHaveBeenCalledOnce();
+    expect(FakeWorker.instances).toHaveLength(count);
+    expect(core.currentState).toBe(AgentState.Listening);
+  });
+  it("does not begin site inference after cancellation during a cold CPU model load", async () => {
+    await core.initialize(ModelProfile.Cpu);
+    FakeWorker.instances.at(-1)!.emit({ type: "ready" });
+    const state = { version: 1 as const, id: "cold-task", tabId: 12, origin: "https://example.com", goal: "Find a product", status: "planning" as const, steps: 0, message: "Planning" };
+    core.onSiteTaskState(state);
+    const pending = core.decideSiteTask({ taskId: state.id, goal: state.goal, answers: [], history: [], remainingMs: 120_000,
+      observation: { documentId: "doc", observationId: "obs", stateKey: "state", url: state.origin, title: "Store", capturedAt: 1, truncated: false, elements: [], forms: [], coverage: { candidates: 0, inspected: 0, limited: false, frames: "top_only" } } });
+    const rejected = expect(pending).rejects.toThrow("cancelled");
+    const cpu = FakeWorker.instances.at(-1)!;
+    core.onSiteTaskState({ ...state, status: "cancelled" });
+    cpu.emit({ type: "ready" }); await rejected;
+    expect(cpu.postMessage.mock.calls.some(([message]) => message.type === "generate")).toBe(false);
+  });
 
   it("retries a failed load instead of reusing rejected readiness promises", async () => {
     await core.initialize(ModelProfile.Balanced, true);
@@ -204,12 +262,15 @@ describe("Agent worker recovery", () => {
     expect(oldWorkers.every(worker => worker.terminate.mock.calls.length === 1)).toBe(true);
     expect(FakeWorker.instances).toHaveLength(4);
   });
-  it("replaces a lost GPU worker with one smaller model and does not replay the command", async () => {
+  it.each([
+    ["GPU_DEVICE_LOST", "[Device] is lost."],
+    ["GPU_BUFFER_INVALIDATED", "Failed to execute 'mapAsync' on 'GPUBuffer': Buffer was unmapped before mapping was resolved."],
+  ] as const)("replaces a worker after %s once, without replaying the command", async (code, message) => {
     const failed = FakeWorker.instances[1]!;
     const request = core.executeCommandText("summarize this page");
     await vi.advanceTimersByTimeAsync(3_000);
     const generate = failed.postMessage.mock.calls.find(([msg]) => msg.type === "generate")![0];
-    failed.emit({ type: "error", requestId: generate.requestId, code: "GPU_DEVICE_LOST", message: "[Device] is lost." });
+    failed.emit({ type: "error", requestId: generate.requestId, code, message });
     await request;
     expect(failed.terminate).toHaveBeenCalledOnce();
     expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "MODEL_LOAD_PROGRESS" && (msg as any).done === false && /smaller/.test((msg as any).text))).toBe(true);
@@ -233,6 +294,50 @@ describe("Agent worker recovery", () => {
     const stt = FakeWorker.instances[0]!;
     expect(stt.terminate).not.toHaveBeenCalled();
     expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "MODEL_LOAD_PROGRESS" && (msg as any).phase === "error")).toBe(true);
+  });
+  it("routes a worker-level unmapped-buffer failure through bounded GPU recovery", async () => {
+    const failed = FakeWorker.instances[1]!;
+    failed.listeners.get("error")?.({ message: "Failed to execute 'mapAsync' on 'GPUBuffer': Buffer was unmapped before mapping was resolved." });
+    expect(failed.terminate).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(GPU_RECOVERY_DELAY_MS);
+    expect(FakeWorker.instances[2]!.postMessage).toHaveBeenCalledWith({ type: "load", modelId: GPU_RECOVERY_MODEL });
+    expect(FakeWorker.instances[0]!.terminate).not.toHaveBeenCalled();
+  });
+  it("retires a cancelled GPU worker without immediate reload or consuming failure recovery", async () => {
+    const failed = FakeWorker.instances[1]!;
+    const pending = core.executeCommandText("summarize this page");
+    await vi.advanceTimersByTimeAsync(3_000);
+    const request = failed.postMessage.mock.calls.find(([message]) => message.type === "generate")![0];
+    core.triggerKill(); await pending;
+    failed.emit({ type: "cancelled", requestId: request.requestId, retired: true });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(failed.terminate).toHaveBeenCalledOnce();
+    expect(FakeWorker.instances).toHaveLength(2);
+    const ready = core.ensurePlannerReady();
+    const next = FakeWorker.instances[2]!;
+    expect(next.postMessage).toHaveBeenCalledWith(failed.postMessage.mock.calls[0]![0]);
+    next.emit({ type: "ready" }); await ready;
+    next.emit({ type: "error", requestId: "", code: "GPU_BUFFER_INVALIDATED", message: "Buffer read interrupted" });
+    await vi.advanceTimersByTimeAsync(GPU_RECOVERY_DELAY_MS);
+    expect(FakeWorker.instances).toHaveLength(4);
+    expect(FakeWorker.instances[3]!.postMessage).toHaveBeenCalledWith({ type: "load", modelId: GPU_RECOVERY_MODEL });
+  });
+  it("fails an overlapping new request if a late cancellation retires its worker", async () => {
+    const worker = FakeWorker.instances[1]!;
+    const first = core.executeCommandText("summarize this page");
+    await vi.advanceTimersByTimeAsync(3_000);
+    const request = worker.postMessage.mock.calls.find(([message]) => message.type === "generate")![0];
+    core.triggerKill(); await first;
+    worker.emit({ type: "cancelled", requestId: request.requestId });
+    const second = core.executeCommandText("summarize the details on this page");
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(worker.postMessage.mock.calls.filter(([message]) => message.type === "generate")).toHaveLength(2);
+    worker.emit({ type: "cancelled", requestId: request.requestId, retired: true });
+    await second;
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    expect(sendToSW.mock.calls.some(([message]) => (message as { type: string }).type === "PLAN_PRODUCED")).toBe(false);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(core.currentState).toBe(AgentState.Listening);
   });
 
   it("keeps setup readiness pending until a replacement GPU model is ready", async () => {
@@ -274,6 +379,17 @@ describe("Agent worker recovery", () => {
     await core.executeCommandText("scroll down");
     expect(FakeWorker.instances).toHaveLength(1);
     expect(sendToSW.mock.calls.some(([msg]) => (msg as any).type === "PLAN_PRODUCED")).toBe(true);
+  });
+  it("prepares Hosted assist speech without creating any local planner worker", async () => {
+    core.dispose(); FakeWorker.instances = [];
+    await core.initialize(ModelProfile.Hosted, true);
+    expect(FakeWorker.instances).toHaveLength(1);
+    expect(FakeWorker.instances[0]!.url.href).toContain("stt-worker");
+    FakeWorker.instances[0]!.emit({ type: "ready" });
+    await expect(core.loadProfile(ModelProfile.Hosted)).resolves.toBeUndefined();
+    expect(FakeWorker.instances).toHaveLength(1);
+    await expect(core.ensurePlannerReady()).rejects.toThrow("no local planner");
+    expect(sendToSW.mock.calls.some(([message]) => (message as { text?: string }).text === "Voice ready — hosted planning selected")).toBe(true);
   });
 
   it("does not load an AI model for an unresolved Essential request", async () => {

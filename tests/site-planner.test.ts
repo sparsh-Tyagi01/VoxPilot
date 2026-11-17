@@ -27,6 +27,23 @@ it("rejects invalid model tools before they can reach the coordinator", async ()
   e.result({ kind: "act", action: { type: "eval", code: "arbitrary()" }, expected: { kind: "page_changed" } });
   await expect(pending).rejects.toThrow("invalid next-step");
 });
+it("converts compact CPU requests and retains private-value filtering", async () => {
+  const e = engine(); e.llm.backend = "wasm";
+  const pending = decideSiteStep(e.llm, request());
+  const messages = vi.mocked(e.llm.postGenerate).mock.calls[0]![1];
+  expect(messages.length).toBeLessThanOrEqual(8);
+  expect(JSON.stringify(messages)).not.toMatch(/private-fingerprint|private-field-value/);
+  e.result({ tool: "type", target: "e1", value: "shirt" });
+  expect(await pending).toMatchObject({ kind: "act", action: { type: "type", handle: "e1", text: "shirt" } });
+  expect(e.llm.abort).not.toHaveBeenCalled();
+});
+it("rejects malformed CPU decisions without discarding the warm worker", async () => {
+  const e = engine(); e.llm.backend = "wasm";
+  const pending = decideSiteStep(e.llm, request());
+  e.result({ tool: "click", target: "invented" });
+  await expect(pending).rejects.toThrow("invalid target");
+  expect(e.llm.abort).not.toHaveBeenCalled();
+});
 it("cancels a token-stalled decision within the task's remaining budget", async () => {
   vi.useFakeTimers(); const e = engine(); const pending = decideSiteStep(e.llm, { ...request(), remainingMs: 30_000 });
   const rejection = expect(pending).rejects.toThrow("stopped responding");

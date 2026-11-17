@@ -1,4 +1,5 @@
 import type { SiteAction, SiteObservation } from "@shared/site-task.js";
+import { SECRET_INPUT_PATTERN } from "@shared/site-secrets.js";
 export interface SitePolicyResult { allowed: boolean; approval: boolean; reason: string; fingerprint: string; description: string; context: string; destination: string; }
 const normalized = (text: string) => text.replace(/\s+/g, " ").trim();
 /** Unqualified commitment flows remain manual; a model cannot lower this floor. */
@@ -44,7 +45,7 @@ export function checkSitePolicy(action: SiteAction, observation: SiteObservation
   if (["click", "toggle"].includes(action.type) && manualCommitment(target.label ?? "", target.href)) return deny("Complete this commitment step directly on the site. Automated payment, sending and destructive flows are not qualified yet.");
   if (target.disabled || (action.type === "type" && target.readOnly)) return deny("This control is disabled or read-only.");
   if (action.type === "type") {
-    if (/password|file/.test(target.inputType ?? "") || /password|card number|cvv|security code|one.time.code/i.test(target.label ?? "")) return deny("Use the site's secure manual flow or your vault for this field.");
+    if (/password|file/.test(target.inputType ?? "") || SECRET_INPUT_PATTERN.test(target.label ?? "")) return deny("Use the site's secure manual flow or your vault for this field.");
     if (!["input", "textarea"].includes(target.tag) && target.role !== "textbox") return deny("This target is not a supported editable field.");
     result.approval = Boolean(form?.fields.some(field => field.sensitive)) || /email|tel/.test(target.inputType ?? "");
     if (form && new URL(form.action).origin !== origin) return deny("This field belongs to a form on another origin. Complete it manually.");

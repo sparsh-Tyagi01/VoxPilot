@@ -1,10 +1,10 @@
 # VoxPilot 🎙️
 
-> **Autonomous on-device voice AI agent for Chrome** — control any web page by voice, with all speech recognition, reasoning, and speech synthesis running entirely on your device.
+> **Voice browser control for Chrome** — local speech recognition and browser actions, with local or explicitly enabled hosted planning for general tasks.
 
-[![CI](https://github.com/sparsh/voxpilot/actions/workflows/ci.yml/badge.svg)](https://github.com/sparsh/voxpilot/actions)
+[![CI](https://github.com/sparsh-Tyagi01/VoxPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/sparsh-Tyagi01/VoxPilot/actions)
 ![MV3](https://img.shields.io/badge/Manifest-V3-blue)
-![Privacy](https://img.shields.io/badge/data-100%25%20on--device-green)
+![Privacy](https://img.shields.io/badge/hosted%20planning-opt--in-blue)
 ![License](https://img.shields.io/badge/license-MIT-purple)
 
 ---
@@ -23,11 +23,15 @@ The proposed [site-aware agent architecture](docs/SITE_AWARE_AGENT_ARCHITECTURE.
 
 The initial [site-aware task runner](docs/SITE_AGENT_IMPLEMENTATION.md) is available with Assist and larger AI profiles. It observes the current page, asks for missing information, checks each action and inspects the result. Essential remains the lightweight basic-control mode. Run `npm run test:browser` for the controlled Chrome task and popup smoke tests.
 
+**No compatible GPU?** Essential already supports basic voice controls on CPU. **Assist CPU** adds an experimental WASM planner with about 520 MB of cached files. Its current model failed the task-accuracy benchmark; general planning is not production-ready. See [CPU setup, measured failures and limits](docs/CPU_PLANNER.md).
+
+**General tasks without a device GPU:** choose **Hosted assist** in Settings → Model, configure a compatible endpoint/model and optional session API key, then enable sharing. See [setup, architecture, data boundaries and tradeoffs](docs/HOSTED_PLANNER.md). No service account or credential is bundled.
+
 ## What is VoxPilot?
 
-VoxPilot is a Manifest V3 Chrome extension that lets you operate web pages entirely by voice — filling forms, clicking buttons, scrolling, navigating, and running multi-step workflows — without any data ever leaving your device.
+VoxPilot is a Manifest V3 Chrome extension for voice-driven form entry, clicks, scrolling, navigation and bounded site workflows. Local profiles keep planning on-device. Hosted assist sends general commands and selected page context to a service only after it is configured and explicitly enabled.
 
-**Zero cloud. Zero accounts. Zero telemetry.**
+**Local by default. Hosted planning is opt-in. No analytics or telemetry.**
 
 ---
 
@@ -40,20 +44,20 @@ VoxPilot is a Manifest V3 Chrome extension that lets you operate web pages entir
 └──────────────────┬──────────────────────────────────────┘
                    │ chrome.runtime (only path between zones)
        ┌───────────┴───────────┐
-       │  Offscreen Document   │  reasons: USER_MEDIA, AUDIO_PLAYBACK, WORKERS
+       │  Offscreen Document   │  reasons: USER_MEDIA, WORKERS
        │  ┌─────────────────┐  │
        │  │ AudioCapture    │  │  getUserMedia + echo cancellation
        │  │ VAD             │  │  Silero VAD (ONNX)
        │  │ STT Worker      │  │  Whisper tiny/base (ONNX Runtime Web)
-       │  │ LLM Worker      │  │  Llama 3.2 1B via WebLLM (WebGPU)
-       │  │ TTS             │  │  Kokoro / Piper on-device
+       │  │ LLM Worker      │  │  Optional CPU/WASM or WebLLM/WebGPU
+       │  │ TTS             │  │  Local browser SpeechSynthesis voices
        │  │ AgentCore       │  │  State machine · intent router · plan validator
        │  └─────────────────┘  │
        └───────────────────────┘
                    │ via SW relay
        ┌───────────┴───────────┐
-       │  Content Scripts      │  per frame, per tab
-       │  SnapshotBuilder      │  DOM → compact JSON (≤50ms for 5k nodes)
+       │  Content Scripts      │  top frame, selected tab
+       │  SnapshotBuilder      │  DOM → bounded JSON observation
        │  ActionExecutor       │  click/type/scroll/navigate/tab
        │  OverlayManager       │  closed shadow root (page-isolated)
        │    ├── Badges         │  SOM numbered badges (#2563eb)
@@ -68,19 +72,21 @@ Extension Pages:
 
 ---
 
+Hosted requests run in the service worker through the [hosted architecture](docs/HOSTED_PLANNER.md); credentials never enter content or model workers.
+
 ## Features
 
 | Feature | Detail |
 |---------|--------|
-| 🎙️ **Voice control** | Wake on Alt+V or push-to-talk; VAD endpoint detection |
-| 🔒 **100% on-device** | Whisper STT · Llama 3.2 1B · Kokoro TTS — no cloud |
-| ⚡ **Fast path** | Regex-based command router for <1.5s p50 latency |
-| 🧠 **LLM planner** | Constrained JSON output via WebLLM + schema validation |
+| 🎙️ **Voice control** | Toggle with Alt+V or the popup; VAD endpoint detection |
+| 🔒 **Local by default** | Local speech and execution; optional explicit hosted planning |
+| ⚡ **Fast path** | Basic command routing bypasses model inference |
+| 🧠 **LLM planner** | Local or hosted next-step decisions with independent schema/policy validation |
 | 🛡️ **Safety tiers** | R0–R4 risk classification; R3/R4 require explicit confirmation |
 | 🔐 **Encrypted vault** | AES-GCM-256 + PBKDF2 (600k iterations); auto-lock 5 min |
-| ♿ **Accessibility** | WCAG 2.2 AA; screen reader support; keyboard navigation |
+| ♿ **Accessibility** | Labeled controls, live status and keyboard navigation; full accessibility qualification remains |
 | 🏗️ **Framework-aware** | React/Vue/Angular synthetic event strategy ladder |
-| 🔏 **Prompt injection** | Page content sandboxed; LLM never trusts page text as instructions |
+| 🔏 **Prompt injection** | Page content treated as untrusted; independent target, approval and outcome checks |
 
 ---
 
@@ -106,20 +112,22 @@ Extension Pages:
 | Mode | Planner | Speech | Loading policy |
 |---|---|---|---|
 | **Essential (default)** | None | Whisper tiny, CPU/WASM | Speech only; no GPU needed |
+| **Hosted assist (opt-in)** | Configured external service; no device GPU | Whisper tiny | No local planner weights; explicit endpoint and sharing consent |
+| **Assist CPU (experimental)** | Qwen2.5 0.5B q8, CPU/WASM | Whisper tiny | Prepares during setup; task accuracy is not qualified |
 | **Assist** | Optional Llama 3.2 1B | Whisper tiny | Planner loads on the first complex request |
 | **Advanced** | Optional Llama 3.2 3B | Whisper base | Planner loads on demand |
 | **Expert** | Optional Llama 3.1 8B | Whisper base | Explicit choice for capable GPUs |
 
-Idle planners release GPU resources after two minutes. Old stored profile names remain supported. Downloaded weights and initialized inference engines have different lifetimes. Real latency and hardware requirements must be measured; see [implementation status](docs/IMPLEMENTATION_STATUS.md).
+Idle planners release memory after two minutes. Old stored profile names remain supported. Downloaded weights and initialized inference engines have different lifetimes. Real latency and hardware requirements must be measured; see [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
 ---
 
 ## Development Setup
 
 ```bash
-# Prerequisites: Node.js 20.9+, Chrome with WebGPU enabled
+# Prerequisites: Node.js 20.9+, Chrome; WebGPU is needed only for GPU planner profiles
 
-git clone https://github.com/sparsh/voxpilot
+git clone https://github.com/sparsh-Tyagi01/VoxPilot
 cd voxpilot
 
 npm install
@@ -176,5 +184,5 @@ src/
 ## Licence
 
 Code: MIT © 2026 Sparsh  
-Bundled models: [Llama 3.2 Community Licence](https://llama.meta.com/llama3_2/), [Whisper MIT](https://github.com/openai/whisper)
+Optional runtime model licenses: [Llama 3.2 Community Licence](https://llama.meta.com/llama3_2/), [Whisper MIT](https://github.com/openai/whisper)
 

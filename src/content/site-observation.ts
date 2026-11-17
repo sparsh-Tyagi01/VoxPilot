@@ -1,6 +1,7 @@
 import type { SiteElement, SiteForm, SiteObservation } from "@shared/site-task.js";
 import { extractLabel, SnapshotBuilder } from "./snapshot.js";
 import type { HandleRegistry } from "./handles.js";
+import { publicText } from "./public-text.js";
 // Private to the isolated content script. Values are never included in observations,
 // model context, receipts or logs. Weak keys release the comparison state with the form.
 const formVersions = new WeakMap<HTMLFormElement, { values: string; token: string }>();
@@ -18,7 +19,7 @@ export function describeForm(form: HTMLFormElement, handles: HandleRegistry): Si
     fields: controls.filter(el => !el.disabled).map(el => ({ name: el.name.slice(0, 100), type: el.type,
       populated: Boolean(el.value), sensitive: /password|email|tel|file/.test(el.type) || /pass|card|token|secret|auth|session|csrf/i.test(el.name) || /cc-|password|one-time-code/.test(el.autocomplete) })),
   };
-  return { ...info, fingerprint: JSON.stringify([token, form.elements.length, info.action, info.method, info.fields, info.submitLabels, form.textContent?.replace(/\s+/g, " ").trim().slice(0, 600)]) };
+  return { ...info, fingerprint: JSON.stringify([token, form.elements.length, info.action, info.method, info.fields, info.submitLabels, publicText(form, 600)]) };
 }
 interface ObservationCache { forms: Map<HTMLFormElement, SiteForm>; contexts: Map<Element, string>; }
 export function describeSiteTarget(el: Element, handles: HandleRegistry, cache?: ObservationCache): SiteElement {
@@ -28,7 +29,7 @@ export function describeSiteTarget(el: Element, handles: HandleRegistry, cache?:
   if (form && formInfo) cache?.forms.set(form, formInfo);
   const href = el instanceof HTMLAnchorElement ? el.href : undefined;
   const region = el.closest("[data-product-id], .product, article, [role='listitem'], tr, form") ?? el.parentElement;
-  const context = region ? cache?.contexts.get(region) ?? region.textContent?.replace(/\s+/g, " ").trim().slice(0, 600) ?? "" : "";
+  const context = region ? cache?.contexts.get(region) ?? publicText(region, 600) : "";
   if (region) cache?.contexts.set(region, context);
   const label = extractLabel(el) ?? "";
   const tag = el.tagName.toLowerCase();

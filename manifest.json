@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "VoxPilot",
   "short_name": "VoxPilot",
-  "description": "Autonomous on-device voice AI agent for hands-free browser control. 100% private \u2014 all processing runs on your device.",
+  "description": "Voice browser control with local speech recognition, site-aware actions, and optional explicitly enabled hosted planning.",
   "version": "0.1.0",
   "permissions": [
     "offscreen",
@@ -53,26 +53,12 @@
         "src/content/content.ts"
       ],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": false
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://raw.githubusercontent.com https://cdn.jsdelivr.net"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https: http://localhost:* http://127.0.0.1:* https://huggingface.co https://*.huggingface.co https://*.hf.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://raw.githubusercontent.com https://cdn.jsdelivr.net"
   },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "src/offscreen/offscreen.html",
-        "src/onboarding/onboarding.html",
-        "src/settings/settings.html",
-        "onnx/*",
-        "audio-processor.js"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    }
-  ],
   "icons": {
     "16": "src/icons/icon-16.png",
     "48": "src/icons/icon-48.png",

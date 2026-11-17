@@ -5,12 +5,13 @@ const state = { listeningEnabled: true, agentState: "Listening", lastTranscript:
   siteTask: { version: 1, id: "task-1", tabId: 1, origin: "https://shop.example", goal: "Find an item", status: "awaiting_answer", steps: 0, message: "Which size would you like?", question: "Which size?" } } as SessionState;
 Object.assign(window, { chrome: { runtime: {
   id: "fixture", onMessage: { addListener: (listener: typeof receive) => { receive = listener; } },
-  sendMessage: async (message: typeof sent[number]) => { sent.push(message); return message.type === "GET_SESSION_STATE" ? state : message.type === "GET_MODEL_STATUS" ? {} : { ok: true }; },
+  sendMessage: async (message: typeof sent[number]) => { sent.push(message); return message.type === "GET_SESSION_STATE" ? state : message.type === "GET_MODEL_STATUS" ? {} : message.type === "GET_PLANNER_STATUS" ? { profile: "hosted", hostedEnabled: true, origin: "https://planner.example" } : { ok: true }; },
   openOptionsPage: () => {},
 }, tabs: { create: () => {} } } });
 await import("../../src/panel/panel.js");
 await new Promise(resolve => setTimeout(resolve, 20));
 try {
+  if (!document.getElementById("planner-mode")!.textContent?.includes("Hosted planning")) throw new Error("Hosted sharing mode is not visible in the popup");
   if (document.getElementById("task-answer-form")!.hidden) throw new Error("Clarification form not shown");
   const answer = document.getElementById("task-answer") as HTMLInputElement;
   answer.value = "Medium";

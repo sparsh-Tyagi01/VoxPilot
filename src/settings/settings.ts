@@ -1,5 +1,7 @@
 import { normalizeModelProfile } from "@shared/model-profiles.js";
 import { benchmarkSpeech } from "../diagnostics/speech-benchmark.js";
+import { DEFAULT_HOSTED_SETTINGS, type HostedPlannerSettings } from "@shared/hosted-planner.js";
+import { MODEL_PROFILE_CONFIG } from "@shared/constants.js";
 /**
  * @file src/settings/settings.ts
  * @description Settings page logic for VoxPilot.
@@ -107,8 +109,55 @@ async function loadModelSettings(): Promise<void> {
 }
 
 modelProfileSelect.addEventListener("change", async () => {
+  renderHostedVisibility();
   await chrome.storage.local.set({ selected_profile: modelProfileSelect.value });
   chrome.runtime.sendMessage({ type: "PROFILE_CHANGED", profile: modelProfileSelect.value }).catch(() => {});
+});
+
+const hostedForm = document.getElementById("hosted-form") as HTMLFormElement;
+const hostedEndpoint = document.getElementById("hosted-endpoint") as HTMLInputElement;
+const hostedModel = document.getElementById("hosted-model") as HTMLInputElement;
+const hostedKey = document.getElementById("hosted-key") as HTMLInputElement;
+const hostedConsent = document.getElementById("hosted-consent") as HTMLInputElement;
+const hostedStatus = document.getElementById("hosted-status")!;
+const hostedSave = document.getElementById("hosted-save") as HTMLButtonElement;
+const hostedDisable = document.getElementById("hosted-disable") as HTMLButtonElement;
+let savedHosted: HostedPlannerSettings = { ...DEFAULT_HOSTED_SETTINGS };
+function renderHostedVisibility(): void {
+  hostedForm.hidden = modelProfileSelect.value !== "hosted";
+  document.getElementById("profile-help")!.textContent = MODEL_PROFILE_CONFIG[normalizeModelProfile(modelProfileSelect.value)].description;
+}
+async function settingsRequest(message: unknown): Promise<unknown> {
+  const response: unknown = await chrome.runtime.sendMessage(message);
+  if (response && typeof response === "object" && "ok" in response && response.ok === false) throw new Error("error" in response ? String(response.error) : "Settings could not be saved.");
+  return response;
+}
+async function loadHostedSettings(): Promise<void> {
+  const value = await settingsRequest({ type: "GET_HOSTED_SETTINGS" }) as HostedPlannerSettings & { hasApiKey: boolean };
+  savedHosted = { version: 1, enabled: value.enabled, endpoint: value.endpoint, model: value.model };
+  hostedEndpoint.value = value.endpoint; hostedModel.value = value.model; hostedConsent.checked = value.enabled;
+  hostedDisable.disabled = !value.enabled;
+  hostedStatus.textContent = value.enabled ? `Enabled for ${new URL(value.endpoint).origin}. ${value.hasApiKey ? "Session key is set." : "No session key is set; add one if your service requires it."}` : "Disabled. No page context is sent to a hosted planner.";
+}
+for (const field of [hostedEndpoint, hostedModel]) field.addEventListener("input", () => { hostedConsent.checked = false; });
+hostedForm.addEventListener("submit", async event => {
+  event.preventDefault(); if (!hostedForm.reportValidity()) return;
+  hostedSave.disabled = true; hostedDisable.disabled = true; hostedStatus.textContent = "Saving hosted settings…";
+  try {
+    const config: HostedPlannerSettings = { version: 1, enabled: hostedConsent.checked, endpoint: hostedEndpoint.value, model: hostedModel.value };
+    await settingsRequest({ type: "SAVE_HOSTED_SETTINGS", config, apiKey: hostedKey.value });
+    hostedKey.value = "";
+    await loadHostedSettings();
+  } catch (error) { hostedStatus.textContent = error instanceof Error ? error.message : "Hosted settings could not be saved."; }
+  finally { hostedSave.disabled = false; hostedDisable.disabled = !savedHosted.enabled; }
+});
+hostedDisable.addEventListener("click", async () => {
+  hostedSave.disabled = true; hostedDisable.disabled = true;
+  try {
+    await settingsRequest({ type: "SAVE_HOSTED_SETTINGS", config: { ...savedHosted, enabled: false }, forgetKey: true });
+    hostedKey.value = ""; await loadHostedSettings();
+  } catch (error) { hostedStatus.textContent = error instanceof Error ? error.message : "Hosted assist could not be disabled."; }
+  finally { hostedSave.disabled = false; hostedDisable.disabled = !savedHosted.enabled; }
 });
 
 sttThresholdInput.addEventListener("change", async () => {
@@ -277,9 +326,13 @@ document.getElementById("btn-delete-all")?.addEventListener("click", async () =>
   );
   if (confirmed) {
     await lockRuntimeVault();
+    await settingsRequest({ type: "SAVE_HOSTED_SETTINGS", config: { ...DEFAULT_HOSTED_SETTINGS }, forgetKey: true });
+    const state = await chrome.runtime.sendMessage({ type: "GET_SESSION_STATE" }) as { listeningEnabled: boolean };
+    if (state.listeningEnabled) await chrome.runtime.sendMessage({ type: "TOGGLE_LISTENING" });
     vault.lock();
     await chrome.storage.local.clear();
     await chrome.storage.session.clear();
+    for (const name of await caches.keys()) await caches.delete(name);
     window.alert("All data deleted. Please re-run setup.");
     chrome.tabs.create({ url: chrome.runtime.getURL("src/onboarding/onboarding.html") });
   }
@@ -301,7 +354,7 @@ if (aboutVersion) aboutVersion.textContent = manifest.version;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-Promise.all([loadVoiceSettings(), loadModelSettings()]).catch(console.error);
+Promise.all([loadVoiceSettings(), loadModelSettings(), loadHostedSettings()]).then(renderHostedVisibility).catch(error => { hostedStatus.textContent = error instanceof Error ? error.message : "Settings could not be loaded."; });
 
 
 // Diagnostic runs are explicit and use a short local audio file, never microphone capture.

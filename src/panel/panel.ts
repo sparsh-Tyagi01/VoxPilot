@@ -43,6 +43,18 @@ let vaultRequestId: string | null = null;
 let lastDownloadProgress = 0;
 let lastModelPhase = "";
 let siteTask: SiteTaskState | null = null;
+async function renderPlannerMode(): Promise<void> {
+  try {
+    const mode = await send({ type: "GET_PLANNER_STATUS" }) as { profile: string; hostedEnabled: boolean; origin: string };
+    if (!mode || typeof mode.profile !== "string" || typeof mode.hostedEnabled !== "boolean") throw new Error("Planner status unavailable");
+    element("planner-mode").textContent = mode.profile === "hosted"
+      ? mode.hostedEnabled ? `Hosted planning · ${mode.origin}. Speech stays local.` : "Hosted assist needs configuration in Settings. Speech stays local."
+      : "Local planning and speech";
+  } catch { element("planner-mode").textContent = "Planner status unavailable. Check Settings before a general task."; }
+}
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === "local" && (changes["selected_profile"] || changes["hosted_planner"])) void renderPlannerMode();
+});
 const taskSection = element("site-task");
 const taskAnswerForm = element<HTMLFormElement>("task-answer-form");
 const taskAnswer = element<HTMLInputElement>("task-answer");
@@ -317,6 +329,7 @@ document.addEventListener("keydown", event => {
 });
 
 async function initialize(): Promise<void> {
+  void renderPlannerMode();
   const responses = await Promise.allSettled([
     send({ type: "GET_SESSION_STATE" }),
     send({ type: "GET_MODEL_STATUS" }),

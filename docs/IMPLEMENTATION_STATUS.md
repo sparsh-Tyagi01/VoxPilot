@@ -1,11 +1,14 @@
 # Architecture implementation status
 
-Updated 15 November 2026. This tracks work against [the roadmap](ARCHITECTURE_AND_OPTIMIZATION_ROADMAP.md); the entire roadmap is not yet complete.
+Updated 17 November 2026. This tracks work against [the roadmap](ARCHITECTURE_AND_OPTIMIZATION_ROADMAP.md); the entire roadmap is not yet complete.
 
 The [site-aware agent architecture](SITE_AWARE_AGENT_ARCHITECTURE.md) now has an initial runtime implementation: selected-site task sessions, one-step model decisions, form context, independent policy, clarification, approval and UI-evidence checks. See [site-agent implementation and limits](SITE_AGENT_IMPLEMENTATION.md) for use, verification and remaining work. The entire architecture is not yet qualified for general production use.
 
 ## Implemented
 
+- **Optional hosted planning:** a provider-neutral chat-completions client runs in the service worker, with explicit sharing consent, session-only endpoint-bound credentials, bounded requests, hard cancellation, strict decisions and unchanged site approvals. Hosted mode loads no local planner or GPU worker. [Architecture, setup and verification](HOSTED_PLANNER.md).
+
+- **GPU-independent planner backend:** Assist CPU uses a pinned q8 Qwen2.5-0.5B ONNX model through single-thread WASM, with smaller contexts, JSON response termination, strict schema/policy validation and hard worker cancellation. It is an explicit experimental profile; the model failed the three synthetic task checks and is not qualified for production. See [CPU implementation and measured failures](CPU_PLANNER.md).
 - **CPU-first Essential mode:** setup prepares speech recognition without waiting for WebGPU or a planner. Listening adds a bundled CPU speech detector. Unrecognized voice input returns quietly to listening; typed commands show a short text notice. The repeated spoken direct-command tutorial has been removed.
 - **Neural speech detection:** a bundled Silero ONNX model runs in a separate single-thread WASM worker. A bounded queue, stale-frame epochs and a worker deadline prevent unbounded audio buffering. Detection requires speech probability and non-DC audio energy, followed by a minimum voiced duration and endpoint silence. A conservative energy fallback remains available if the detector cannot initialize. Silent/DC/tiny-noise audio is rejected again before Whisper decoding.
 - **On-demand optional planners:** Assist/Advanced/Expert initialize their planner on the first complex request, not every microphone start. Profile aliases are normalized in one shared module.
@@ -31,7 +34,7 @@ Run `npm run check`: TypeScript, ESLint, unit/regression tests, production build
 
 Use a consented 0.3–30 second spoken-command recording under 10 MB for the benchmark. Compare the same recording across machines. Warm p95 from nine runs is a small-sample diagnostic, not production evidence. No benchmark corpus recordings were supplied or invented, and no real hardware latency target is claimed.
 
-An isolated headless Chrome smoke test loaded the production VAD worker, Silero model and matching ONNX WASM/glue entirely from local build assets. It processed 100 silent 512-sample frames; maximum speech probability was approximately 0.043 against the 0.6 threshold. A separate run with 2.115 seconds of locally synthesized English speech reached approximately 0.9997 probability, with 60 positive speech frames. This verifies browser WASM execution on digital silence and a synthetic voice, not microphone accuracy or a representative speech/noise evaluation. The automated check passes 147 regression tests, including silence rejection, voiced endpoint delivery, stale frame rejection, classifier stalls, repeated unmatched voice input, document binding, restart receipts, macro confirmation and vault expiry.
+An isolated headless Chrome smoke test loaded the production VAD worker, Silero model and matching ONNX WASM/glue entirely from local build assets. It processed 100 silent 512-sample frames; maximum speech probability was approximately 0.043 against the 0.6 threshold. A separate run with 2.115 seconds of locally synthesized English speech reached approximately 0.9997 probability, with 60 positive speech frames. This verifies browser WASM execution on digital silence and a synthetic voice, not microphone accuracy or a representative speech/noise evaluation. The automated check passes 247 regression tests, including silence rejection, voiced endpoint delivery, stale frame rejection, classifier stalls, repeated unmatched voice input, document binding, restart receipts, macro confirmation and vault expiry.
 
 ## Remaining roadmap work
 
@@ -44,7 +47,7 @@ An isolated headless Chrome smoke test loaded the production VAD worker, Silero 
 | Full artifact integrity/compatibility inventory and executable WebLLM bundling | Blocked for release: four libraries were retrieved for inspection, but the upstream binary repository's license endpoint was absent. Inspection files are staged outside the repository under `/tmp/voxpilot-model-libraries-review`. They are not bundled. Confirm redistribution rights or build licensed artifacts from source, then pin and package them. Optional WebLLM still uses its existing remote model-library path; store readiness is not claimed. |
 | Vault session ownership and encrypted history option | Partial: short-lived worker-owned vault sessions, explicit invalidation and expiry are implemented. A dedicated offscreen secret owner and encrypted history option remain. Redaction must not be described as encryption. |
 | Durable step receipts and restart reconciliation | Implemented for the latest execution within a browser session. Interrupted work is never replayed; cross-browser-restart persistence and business postconditions are not provided. |
-| Browser-native ASR/AI adapters, extra languages, native companion or remote assist | Not implemented; remain optional later work, with explicit capability/privacy decisions. |
+| Browser-native ASR/AI adapters, extra languages, native companion or remote assist | Hosted assist is implemented behind explicit configuration/consent; real-service qualification and a production gateway remain. Native/browser adapters and extra languages remain future work. |
 | Real Chrome microphone/inference/long-session validation and store review | Required before production release. Unit tests and a build are not substitutes. |
 
 No implementation here establishes “best in class” performance. The next evidence-producing step is to run the benchmark and command fixtures on the target hardware, then select the speech backend and model policies from those results.

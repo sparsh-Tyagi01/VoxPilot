@@ -50,6 +50,7 @@
     .meter { width: 28px; height: 12px; display: flex; align-items: center; gap: 2px; }
     .meter i { width: 3px; height: 3px; border-radius: 2px; background: var(--green); }
     .activity { margin-top: 16px; }
+    .planner-mode { margin: 7px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .transcript { color: var(--text); margin: 0; min-height: 40px; max-height: 80px; overflow-y: auto; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; }
     .transcript.empty { color: var(--muted); }
     .result { margin: 7px 0 0; color: var(--green); overflow-wrap: anywhere; max-height: 85px; overflow-y: auto; font-size: 12px; }
@@ -111,6 +112,7 @@
       <span id="toggle-label">Start listening</span><kbd class="shortcut">Alt+V</kbd>
     </button>
     <div class="listening-note"><span class="meter" id="audio-meter" aria-hidden="true" hidden><i></i><i></i><i></i><i></i><i></i></span><span id="listening-note">Voice control, even with this popup closed.</span></div>
+    <p class="planner-mode" id="planner-mode" aria-live="polite">Checking planner mode…</p>
     <div class="activity" aria-label="Voice command">
       <p class="transcript empty" id="transcript" aria-live="polite">Say “scroll down” or “click Sign in”.</p>
       <p class="result" id="result" aria-live="polite" hidden></p>

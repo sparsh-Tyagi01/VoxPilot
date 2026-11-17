@@ -24,6 +24,7 @@
  */
 
 import { hasUsableSpeech } from "../audio/speech-gate.js";
+import { cachedProviderFiles } from "../provider-cache.js";
 import {
   pipeline,
   env,
@@ -106,6 +107,7 @@ async function loadModel(modelId: string): Promise<void> {
   isLoading = true;
   currentModelId = modelId;
   console.log(`[STT Worker] Loading "${modelId}"…`);
+  const cached = await cachedProviderFiles(modelId, "main", env.remoteHost, env.remotePathTemplate);
 
   // Build the progress callback — maps transformers.js ProgressInfo to our protocol.
   const files = new Map<string, number>();
@@ -120,7 +122,7 @@ async function loadModel(modelId: string): Promise<void> {
     // must not briefly claim 100% before the large weights even start.
     progress = Math.max(progress, Math.min(0.99, [...files.values()].reduce((sum, value) => sum + value, 0) / Math.max(2, files.size)));
     post({ type: "progress", loaded: progress * 100, total: 100, modelId,
-      downloading: report.status === "progress" || report.status === "downloading" });
+      downloading: !cached.has(report.file) && ["download", "downloading", "progress"].includes(report.status) });
   };
 
   try {

@@ -1,0 +1,10 @@
+{
+  "modelId": "onnx-community/Qwen2.5-0.5B-Instruct",
+  "revision": "22942cb7d7ba4cc81bb4673549ca4d4614469b5e",
+  "dtype": "q8",
+  "artifact": "onnx/model_quantized.onnx",
+  "artifactBytes": 512096557,
+  "artifactSha256": "41834041ab1b29eff9fc592f1a29a1844133aea35832ea9fa91682be13016100",
+  "upstreamModel": "Qwen/Qwen2.5-0.5B-Instruct",
+  "upstreamLicense": "Apache-2.0"
+}
